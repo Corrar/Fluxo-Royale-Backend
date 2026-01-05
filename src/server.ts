@@ -359,15 +359,25 @@ app.delete('/users/:id', authenticate, async (req, res) => {
 
 // --- PRODUTOS ---
 
+// CORREÇÃO: Query otimizada para entregar quantity direto e lista flat
 app.get('/products', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT p.*, COALESCE(json_agg(s.*) FILTER (WHERE s.id IS NOT NULL), '[]') as stock 
-      FROM products p 
-      LEFT JOIN stock s ON p.id = s.product_id 
-      WHERE p.active = true 
-      GROUP BY p.id 
-      ORDER BY p.created_at DESC
+      SELECT 
+        p.id,
+        p.sku,
+        p.name,
+        p.description,
+        p.unit,
+        p.unit_price, 
+        p.sales_price,
+        p.min_stock,
+        p.active,
+        COALESCE(s.quantity_on_hand, 0) as quantity
+      FROM products p
+      LEFT JOIN stock s ON p.id = s.product_id
+      WHERE p.active = true
+      ORDER BY p.name ASC
     `);
     res.json(rows);
   } catch (error: any) {
@@ -381,7 +391,7 @@ app.get('/products/low-stock', authenticate, async (req, res) => {
       SELECT 
         p.id, p.sku, p.name, p.unit, p.min_stock, 
         p.purchase_status, p.purchase_note, p.delivery_forecast,
-        COALESCE(s.quantity_on_hand, 0) as quantity_on_hand, 
+        COALESCE(s.quantity_on_hand, 0) as quantity, 
         COALESCE(s.quantity_reserved, 0) as quantity_reserved,
         s.critical_since, 
         (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) as disponivel,
