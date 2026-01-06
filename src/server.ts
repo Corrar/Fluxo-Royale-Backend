@@ -23,7 +23,8 @@ app.use(helmet());
 const allowedOrigins = [
   'http://localhost:5173',       
   'http://localhost:3000',       
-  'https://fluxo-royale.vercel.app'
+  'https://fluxo-royale.vercel.app',
+  'https://fluxoroyale21.vercel.app'
 ];
 
 const corsOptions = {
@@ -359,7 +360,7 @@ app.delete('/users/:id', authenticate, async (req, res) => {
 
 // --- PRODUTOS ---
 
-// CORREÇÃO: Query otimizada para entregar quantity direto e lista flat
+// CORREÇÃO: Lógica Inteligente (Estoque Virtual)
 app.get('/products', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -373,7 +374,16 @@ app.get('/products', authenticate, async (req, res) => {
         p.sales_price,
         p.min_stock,
         p.active,
-        COALESCE(s.quantity_on_hand, 0) as quantity
+        json_build_object(
+          'quantity_on_hand', COALESCE(s.quantity_on_hand, 0),
+          'quantity_reserved', COALESCE(s.quantity_reserved, 0),
+          'quantity_open', (
+             SELECT COALESCE(SUM(ri.quantity_requested), 0)
+             FROM request_items ri
+             JOIN requests r ON ri.request_id = r.id
+             WHERE ri.product_id = p.id AND r.status = 'aberto'
+          )
+        ) as stock
       FROM products p
       LEFT JOIN stock s ON p.id = s.product_id
       WHERE p.active = true
@@ -404,14 +414,15 @@ app.get('/products/low-stock', authenticate, async (req, res) => {
       FROM products p
       LEFT JOIN stock s ON p.id = s.product_id
       WHERE p.min_stock IS NOT NULL 
-        AND (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) < p.min_stock 
         AND p.active = true
+        -- Comparação segura de tipos para min_stock (texto vs número)
+        AND (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) < CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC)
       ORDER BY (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) ASC
     `);
     res.json(rows);
   } catch (error: any) { 
-    console.error(error);
-    res.status(500).json({ error: 'Erro low stock' }); 
+    console.error("ERRO LOW-STOCK:", error);
+    res.status(500).json({ error: 'Erro ao buscar estoque baixo' }); 
   }
 });
 
@@ -946,31 +957,86 @@ app.get('/reports/general', authenticate, async (req, res) => {
   } catch (error: any) { res.status(500).json({ error: 'Erro relatório' }); }
 });
 
+// CORREÇÃO: Cálculo de Mínimo Ignorando Produtos de Teste e Tipagem Correta
 app.post('/stock/calculate-min', authenticate, async (req, res) => {
   const { days } = req.body;
   const period = Number(days);
-  if (!period || period < 7 || period > 365) return res.status(400).json({ error: 'Período inválido' });
+  
+  if (!period || period < 7 || period > 365) {
+    return res.status(400).json({ error: 'Período inválido (entre 7 e 365 dias)' });
+  }
+
   const client = await pool.connect();
+  
   try {
     await client.query('BEGIN');
+    
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - period);
-    const { rows: consumptionData } = await client.query(`SELECT si.product_id, SUM(si.quantity) as total_consumed FROM separation_items si JOIN separations s ON si.separation_id = s.id WHERE s.status = 'concluida' AND s.created_at >= $1 GROUP BY si.product_id`, [cutoffDate]);
-    let updatedCount = 0;
+
+    // 1. Busca consumo + dados atuais do produto para comparação, filtrando produtos de teste
+    const { rows: consumptionData } = await client.query(`
+      SELECT 
+        si.product_id, 
+        p.sku,
+        p.name,
+        COALESCE(p.min_stock, 0) as old_min, -- Pega o mínimo atual
+        SUM(si.quantity) as total_consumed 
+      FROM separation_items si 
+      JOIN separations s ON si.separation_id = s.id 
+      JOIN products p ON si.product_id = p.id 
+      WHERE 
+        s.status = 'concluida' 
+        AND s.created_at >= $1
+        AND p.active = true
+        AND p.name NOT ILIKE '%teste%'  -- Filtro de nome
+        AND p.name NOT ILIKE '%exemplo%' -- Filtro de nome
+        AND p.sku NOT ILIKE 'TESTE%'    -- Filtro de SKU
+      GROUP BY si.product_id, p.sku, p.name, p.min_stock
+    `, [cutoffDate]);
+
+    // CORREÇÃO: Tipagem explícita para evitar o erro "never[]"
+    let updatedProducts: any[] = []; 
+
     for (const item of consumptionData) {
-      const avgDaily = parseFloat(item.total_consumed) / period;
-      const newMinStock = Math.ceil(avgDaily * 7);
-      if (newMinStock > 0) {
+      const total = parseFloat(item.total_consumed);
+      const avgDaily = total / period;
+      
+      // Margem de segurança de 15 dias (Lead Time)
+      const newMinStock = Math.ceil(avgDaily * 15);
+
+      // Só atualiza se houve mudança no valor e se o novo valor é válido
+      if (newMinStock > 0 && newMinStock !== parseFloat(item.old_min)) {
         await client.query('UPDATE products SET min_stock = $1 WHERE id = $2', [newMinStock, item.product_id]);
-        updatedCount++;
+        
+        // Adiciona ao relatório de retorno para o frontend
+        updatedProducts.push({
+          id: item.product_id,
+          sku: item.sku,
+          name: item.name,
+          oldMin: parseFloat(item.old_min),
+          newMin: newMinStock,
+          avgConsumption: parseFloat(avgDaily.toFixed(2))
+        });
       }
     }
+
     await client.query('COMMIT');
-    res.json({ success: true, message: `Cálculo concluído. ${updatedCount} produtos atualizados.` });
+    
+    // Retorna a lista 'updatedProducts' para o frontend mostrar na tabela
+    res.json({ 
+      success: true, 
+      message: `Cálculo concluído. ${updatedProducts.length} produtos alterados.`,
+      updatedProducts: updatedProducts 
+    });
+    
   } catch (error: any) {
     await client.query('ROLLBACK');
+    console.error("Erro no cálculo de mínimo:", error);
     res.status(500).json({ error: error.message });
-  } finally { client.release(); }
+  } finally { 
+    client.release(); 
+  }
 });
 
 app.post('/users/heartbeat', authenticate, async (req, res) => {
