@@ -21,8 +21,8 @@ app.use(helmet());
 
 // --- 2. CONFIGURAÇÃO ROBUSTA DE CORS ---
 const allowedOrigins = [
-  'http://localhost:5173',       
-  'http://localhost:3000',       
+  'http://localhost:5173',        
+  'http://localhost:3000',        
   'https://fluxo-royale.vercel.app',
   'https://fluxoroyale21.vercel.app'
 ];
@@ -59,7 +59,6 @@ io.on('connection', (socket) => {
 
   socket.on('join_room', (role) => {
     socket.join(role);
-    // console.log(`Socket ${socket.id} entrou na sala: ${role}`);
   });
 
   socket.on('disconnect', () => {
@@ -70,7 +69,6 @@ io.on('connection', (socket) => {
 // --- FUNÇÃO AUXILIAR DE LOGS (COM REAL-TIME) ---
 const createLog = async (userId: string | null, action: string, details: object, ip: string) => {
   try {
-    // 1. Insere e retorna o ID
     const insertResult = await pool.query(
       `INSERT INTO audit_logs (user_id, action, details, ip_address) 
        VALUES ($1, $2, $3, $4) RETURNING id`,
@@ -79,7 +77,6 @@ const createLog = async (userId: string | null, action: string, details: object,
 
     const newLogId = insertResult.rows[0].id;
 
-    // 2. Busca o dado completo (com JOIN) para enviar ao frontend formatado
     const fullLogQuery = `
       SELECT 
         a.id, 
@@ -98,7 +95,6 @@ const createLog = async (userId: string | null, action: string, details: object,
     const fullLogResult = await pool.query(fullLogQuery, [newLogId]);
     const newLogData = fullLogResult.rows[0];
 
-    // 3. Emite o evento para quem estiver na sala 'admin'
     io.to('admin').emit('new_audit_log', newLogData);
 
   } catch (err) {
@@ -110,7 +106,7 @@ const createLog = async (userId: string | null, action: string, details: object,
 
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 300, // Aumentado um pouco para evitar bloqueio em uso legítimo intenso
+  max: 300, 
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -144,6 +140,34 @@ const authenticate = (req: any, res: any, next: any) => {
 // ==========================================
 // ROTAS
 // ==========================================
+
+// --- ROTA DE HEARTBEAT (CORRIGIDA) ---
+// O Frontend chama PUT /users/:id/heartbeat
+app.put('/users/:id/heartbeat', authenticate, async (req, res) => {
+  const { id } = req.params;
+  try { 
+    // Atualiza tabela 'users' se você criou as colunas lá
+    await pool.query(`
+      UPDATE users 
+      SET total_minutes = COALESCE(total_minutes, 0) + 1, last_active = NOW() 
+      WHERE id = $1
+    `, [id]);
+    
+    // Opcional: Se 'last_active' estiver em 'profiles', descomente abaixo:
+    /*
+    await pool.query(`
+      UPDATE profiles 
+      SET last_active = NOW() 
+      WHERE id = $1
+    `, [id]);
+    */
+
+    res.json({ success: true }); 
+  } catch (error) { 
+    // console.error("Erro heartbeat:", error); // Opcional logar erro
+    res.json({ success: false }); 
+  }
+});
 
 // --- ROTA DE AUDITORIA (COM FILTROS) ---
 app.get('/admin/logs', authenticate, async (req, res) => {
@@ -327,9 +351,20 @@ app.post('/auth/register', async (req, res) => {
 
 app.get('/users', authenticate, async (req, res) => {
   try {
+    // Busca 'total_minutes' e 'last_active' da tabela 'users'
     const { rows } = await pool.query(`
-      SELECT u.id, u.email, COALESCE(p.name, u.email) as name, COALESCE(p.role, 'setor') as role, COALESCE(p.sector, '-') as sector, u.created_at
-      FROM users u LEFT JOIN profiles p ON u.id = p.id ORDER BY u.created_at DESC
+      SELECT 
+        u.id, 
+        u.email, 
+        COALESCE(p.name, u.email) as name, 
+        COALESCE(p.role, 'setor') as role, 
+        COALESCE(p.sector, '-') as sector, 
+        u.created_at,
+        u.total_minutes,
+        u.last_active
+      FROM users u 
+      LEFT JOIN profiles p ON u.id = p.id 
+      ORDER BY u.created_at DESC
     `);
     res.json(rows);
   } catch (error: any) {
@@ -1037,11 +1072,6 @@ app.post('/stock/calculate-min', authenticate, async (req, res) => {
   } finally { 
     client.release(); 
   }
-});
-
-app.post('/users/heartbeat', authenticate, async (req, res) => {
-  const userId = (req as any).user.id;
-  try { await pool.query(`UPDATE profiles SET total_minutes = COALESCE(total_minutes, 0) + 1, last_active = NOW() WHERE id = $1`, [userId]); res.json({ success: true }); } catch (error) { res.json({ success: false }); }
 });
 
 app.post('/admin/reset-password', authenticate, async (req, res) => {
