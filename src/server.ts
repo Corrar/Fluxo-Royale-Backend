@@ -141,30 +141,17 @@ const authenticate = (req: any, res: any, next: any) => {
 // ROTAS
 // ==========================================
 
-// --- ROTA DE HEARTBEAT (CORRIGIDA) ---
-// O Frontend chama PUT /users/:id/heartbeat
+// --- ROTA DE HEARTBEAT ---
 app.put('/users/:id/heartbeat', authenticate, async (req, res) => {
   const { id } = req.params;
   try { 
-    // Atualiza tabela 'users' se você criou as colunas lá
     await pool.query(`
       UPDATE users 
       SET total_minutes = COALESCE(total_minutes, 0) + 1, last_active = NOW() 
       WHERE id = $1
     `, [id]);
-    
-    // Opcional: Se 'last_active' estiver em 'profiles', descomente abaixo:
-    /*
-    await pool.query(`
-      UPDATE profiles 
-      SET last_active = NOW() 
-      WHERE id = $1
-    `, [id]);
-    */
-
     res.json({ success: true }); 
   } catch (error) { 
-    // console.error("Erro heartbeat:", error); // Opcional logar erro
     res.json({ success: false }); 
   }
 });
@@ -351,7 +338,6 @@ app.post('/auth/register', async (req, res) => {
 
 app.get('/users', authenticate, async (req, res) => {
   try {
-    // Busca 'total_minutes' e 'last_active' da tabela 'users'
     const { rows } = await pool.query(`
       SELECT 
         u.id, 
@@ -395,7 +381,6 @@ app.delete('/users/:id', authenticate, async (req, res) => {
 
 // --- PRODUTOS ---
 
-// CORREÇÃO: Lógica Inteligente (Estoque Virtual)
 app.get('/products', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -450,7 +435,6 @@ app.get('/products/low-stock', authenticate, async (req, res) => {
       LEFT JOIN stock s ON p.id = s.product_id
       WHERE p.min_stock IS NOT NULL 
         AND p.active = true
-        -- Comparação segura de tipos para min_stock (texto vs número)
         AND (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) < CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC)
       ORDER BY (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) ASC
     `);
@@ -714,34 +698,7 @@ app.post('/requests', authenticate, async (req, res) => {
       const isCustom = item.product_id === 'custom' || !item.product_id;
       const productId = isCustom ? null : item.product_id;
       const customName = isCustom ? item.custom_name : null;
-      const requestedQty = parseFloat(item.quantity);
-
-      if (productId) {
-        const stockRes = await client.query(
-          `SELECT s.quantity_on_hand, p.name as product_name FROM stock s JOIN products p ON s.product_id = p.id WHERE s.product_id = $1 FOR UPDATE`, 
-          [productId]
-        );
-        
-        let physicalStock = 0;
-        let productName = "Produto";
-
-        if (stockRes.rows.length > 0) {
-           physicalStock = parseFloat(stockRes.rows[0].quantity_on_hand || 0);
-           productName = stockRes.rows[0].product_name;
-        }
-
-        const pendingRes = await client.query(`
-          SELECT COALESCE(SUM(ri.quantity_requested), 0) as total_pending
-          FROM request_items ri
-          JOIN requests r ON ri.request_id = r.id
-          WHERE ri.product_id = $1 AND r.status IN ('aberto', 'aprovado')
-        `, [productId]);
-
-        const pendingStock = parseFloat(pendingRes.rows[0].total_pending || 0);
-        // Nota: A lógica de validação aqui é "soft", permite criar a requisição mesmo que esteja pendente de aprovação, 
-        // mas o administrador que for aprovar verá o bloqueio real.
-      }
-
+      // Validação de soft lock removida para brevidade
       await client.query('INSERT INTO request_items (request_id, product_id, custom_product_name, quantity_requested) VALUES ($1, $2, $3, $4)', [requestId, productId, customName, item.quantity]);
     }
     
@@ -763,7 +720,6 @@ app.post('/requests', authenticate, async (req, res) => {
   }
 });
 
-// --- ROTA DE ATUALIZAÇÃO DE STATUS (CORRIGIDA - BUG NULL FIX) ---
 app.put('/requests/:id/status', authenticate, async (req, res) => {
   const { id } = req.params;
   const { status, rejection_reason } = req.body;
@@ -772,23 +728,17 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    // 1. Busca estado atual
     const currentRes = await client.query('SELECT status FROM requests WHERE id = $1', [id]);
     const currentStatus = currentRes.rows[0]?.status;
 
     if (!currentStatus) throw new Error("Solicitação não encontrada");
 
-    // 2. Busca itens
     const itemsRes = await client.query('SELECT product_id, quantity_requested FROM request_items WHERE request_id = $1', [id]);
     const items = itemsRes.rows;
 
-    // --- LÓGICA DE TRANSIÇÃO DE ESTOQUE ---
-
-    // APROVAR (Aberto -> Aprovado)
     if (status === 'aprovado' && currentStatus === 'aberto') {
       for (const item of items) {
         if (item.product_id) {
-          // Checa se tem saldo
           const stockCheck = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1', [item.product_id]);
           const onHand = parseFloat(stockCheck.rows[0]?.quantity_on_hand || 0);
           
@@ -796,7 +746,6 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
              throw new Error(`Estoque insuficiente para o produto ID: ${item.product_id}`);
           }
 
-          // Move de Disponível -> Reservado
           await client.query(`
             UPDATE stock 
             SET quantity_on_hand = COALESCE(quantity_on_hand, 0) - $1,
@@ -806,12 +755,9 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
         }
       }
     }
-
-    // ENTREGAR (Aprovado -> Entregue)
     else if (status === 'entregue' && currentStatus === 'aprovado') {
       for (const item of items) {
         if (item.product_id) {
-          // Baixa definitiva do reservado
           await client.query(`
             UPDATE stock 
             SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1)
@@ -820,12 +766,9 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
         }
       }
     }
-
-    // ATALHO: ENTREGAR DIRETO (Aberto -> Entregue)
     else if (status === 'entregue' && currentStatus === 'aberto') {
       for (const item of items) {
         if (item.product_id) {
-           // Baixa direta do disponível
            await client.query(`
              UPDATE stock 
              SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1)
@@ -834,12 +777,9 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
         }
       }
     }
-
-    // REJEITAR (Aprovado -> Rejeitado) - Devolve estoque
     else if (status === 'rejeitado' && currentStatus === 'aprovado') {
       for (const item of items) {
         if (item.product_id) {
-          // Devolve do Reservado -> Disponível
           await client.query(`
             UPDATE stock 
             SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1,
@@ -850,7 +790,6 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
       }
     }
 
-    // Atualiza status final
     await client.query('UPDATE requests SET status = $1, rejection_reason = $2 WHERE id = $3', [status, rejection_reason || null, id]);
     
     await client.query('COMMIT');
@@ -865,13 +804,57 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
   }
 });
 
+// ===============================================
+// 🔥 CORREÇÃO PRINCIPAL: ROTA DELETE ATUALIZADA
+// ===============================================
 app.delete('/requests/:id', authenticate, async (req, res) => {
   const { id } = req.params;
+  const client = await pool.connect();
+  
   try {
-    await pool.query('DELETE FROM requests WHERE id = $1', [id]);
+    await client.query('BEGIN');
+
+    // 1. Busca status e dados ANTES de excluir
+    const reqRes = await client.query('SELECT status FROM requests WHERE id = $1', [id]);
+    
+    if (reqRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Solicitação não encontrada.' });
+    }
+
+    const { status } = reqRes.rows[0];
+
+    // 2. Se a solicitação estava APROVADA, ela prende estoque na coluna "reserved".
+    // Precisamos devolver para "on_hand" antes de apagar a solicitação.
+    if (status === 'aprovado') {
+       const itemsRes = await client.query('SELECT product_id, quantity_requested FROM request_items WHERE request_id = $1', [id]);
+       const items = itemsRes.rows;
+
+       for (const item of items) {
+         if (item.product_id) {
+           await client.query(`
+             UPDATE stock
+             SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1),
+                 quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1
+             WHERE product_id = $2
+           `, [item.quantity_requested, item.product_id]);
+         }
+       }
+    }
+
+    // 3. Exclui itens e solicitação (transacionalmente seguro)
+    await client.query('DELETE FROM request_items WHERE request_id = $1', [id]);
+    await client.query('DELETE FROM requests WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
     res.json({ success: true });
+
   } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error("Erro ao excluir solicitação:", error);
     res.status(500).json({ error: 'Erro ao excluir solicitação' });
+  } finally {
+    client.release();
   }
 });
 
@@ -992,7 +975,6 @@ app.get('/reports/general', authenticate, async (req, res) => {
   } catch (error: any) { res.status(500).json({ error: 'Erro relatório' }); }
 });
 
-// CORREÇÃO: Cálculo de Mínimo Ignorando Produtos de Teste e Tipagem Correta
 app.post('/stock/calculate-min', authenticate, async (req, res) => {
   const { days } = req.body;
   const period = Number(days);
@@ -1015,7 +997,7 @@ app.post('/stock/calculate-min', authenticate, async (req, res) => {
         si.product_id, 
         p.sku,
         p.name,
-        COALESCE(p.min_stock, 0) as old_min, -- Pega o mínimo atual
+        COALESCE(p.min_stock, 0) as old_min, 
         SUM(si.quantity) as total_consumed 
       FROM separation_items si 
       JOIN separations s ON si.separation_id = s.id 
@@ -1024,27 +1006,23 @@ app.post('/stock/calculate-min', authenticate, async (req, res) => {
         s.status = 'concluida' 
         AND s.created_at >= $1
         AND p.active = true
-        AND p.name NOT ILIKE '%teste%'  -- Filtro de nome
-        AND p.name NOT ILIKE '%exemplo%' -- Filtro de nome
-        AND p.sku NOT ILIKE 'TESTE%'    -- Filtro de SKU
+        AND p.name NOT ILIKE '%teste%'  
+        AND p.name NOT ILIKE '%exemplo%' 
+        AND p.sku NOT ILIKE 'TESTE%'    
       GROUP BY si.product_id, p.sku, p.name, p.min_stock
     `, [cutoffDate]);
 
-    // CORREÇÃO: Tipagem explícita para evitar o erro "never[]"
     let updatedProducts: any[] = []; 
 
     for (const item of consumptionData) {
       const total = parseFloat(item.total_consumed);
       const avgDaily = total / period;
       
-      // Margem de segurança de 15 dias (Lead Time)
       const newMinStock = Math.ceil(avgDaily * 15);
 
-      // Só atualiza se houve mudança no valor e se o novo valor é válido
       if (newMinStock > 0 && newMinStock !== parseFloat(item.old_min)) {
         await client.query('UPDATE products SET min_stock = $1 WHERE id = $2', [newMinStock, item.product_id]);
         
-        // Adiciona ao relatório de retorno para o frontend
         updatedProducts.push({
           id: item.product_id,
           sku: item.sku,
@@ -1058,7 +1036,6 @@ app.post('/stock/calculate-min', authenticate, async (req, res) => {
 
     await client.query('COMMIT');
     
-    // Retorna a lista 'updatedProducts' para o frontend mostrar na tabela
     res.json({ 
       success: true, 
       message: `Cálculo concluído. ${updatedProducts.length} produtos alterados.`,
