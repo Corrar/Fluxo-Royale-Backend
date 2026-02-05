@@ -7,7 +7,7 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
-import webpush from 'web-push'; // <--- NOVO: Importar web-push
+import webpush from 'web-push'; 
 
 const app = express();
 
@@ -20,8 +20,7 @@ app.set('trust proxy', 1);
 // Segurança de Headers
 app.use(helmet());
 
-// --- CONFIGURAÇÃO WEB PUSH (NOVO) ---
-// As chaves devem estar no seu .env do Render
+// --- CONFIGURAÇÃO WEB PUSH ---
 const publicVapidKey = process.env.VAPID_PUBLIC_KEY || 'SUA_PUBLIC_KEY_SE_NAO_TIVER_ENV';
 const privateVapidKey = process.env.VAPID_PRIVATE_KEY || 'SUA_PRIVATE_KEY_SE_NAO_TIVER_ENV';
 const vapidSubject = process.env.VAPID_SUBJECT || 'mailto:admin@fluxoroyale.com';
@@ -80,12 +79,9 @@ io.on('connection', (socket) => {
   });
 });
 
-// --- FUNÇÃO AUXILIAR: ENVIAR PUSH NOTIFICATION (NOVO) ---
-// Essa função envia para celulares desligados/em background
+// --- FUNÇÃO AUXILIAR: ENVIAR PUSH NOTIFICATION (CORRIGIDO PARA AGRUPAMENTO) ---
 const sendPushNotificationToRole = async (role: string, title: string, message: string, url: string = '/requests') => {
   try {
-    // 1. Busca todos os usuários que têm esse perfil (role)
-    // Se for 'almoxarife', busca quem é almoxarife ou admin
     let query = `
       SELECT ps.subscription 
       FROM push_subscriptions ps
@@ -93,7 +89,6 @@ const sendPushNotificationToRole = async (role: string, title: string, message: 
       WHERE p.role = $1
     `;
     
-    // Se for notificação pro almoxarife, admins também podem receber (opcional)
     if (role === 'almoxarife') {
        query = `
         SELECT ps.subscription 
@@ -107,23 +102,28 @@ const sendPushNotificationToRole = async (role: string, title: string, message: 
     
     console.log(`📡 Enviando Push para ${rows.length} dispositivos (${role})...`);
 
+    // 🔥 AQUI ESTÁ A LÓGICA DE AGRUPAMENTO
     const payload = JSON.stringify({
       title: title,
       body: message,
       url: url,
-      icon: '/favicon.png'
+      icon: '/favicon.png',
+      // Tag Fixa: Faz a nova notificação substituir a antiga
+      tag: 'fluxo-alert-requests', 
+      // Renotify True: Faz vibrar novamente mesmo sendo uma substituição
+      renotify: true,
+      // Priority High: Tenta acordar o dispositivo (depende do OS)
+      priority: 'high'
     });
 
-    // 2. Dispara para cada inscrição encontrada
     const promises = rows.map(async (row) => {
       try {
-        const sub = row.subscription; // O JSON salvo no banco
+        const sub = row.subscription; 
         await webpush.sendNotification(sub, payload);
       } catch (err: any) {
         if (err.statusCode === 410 || err.statusCode === 404) {
-          // Inscrição expirou (usuário limpou dados), podemos deletar do banco
-          // pool.query("DELETE FROM push_subscriptions WHERE subscription->>'endpoint' = $1", [row.subscription.endpoint]);
-          console.log("Inscrição antiga removida.");
+          // Inscrição expirou, apenas loga (pode implementar delete aqui se quiser)
+          console.log("Inscrição antiga/inválida detectada.");
         } else {
           console.error("Erro no envio do push:", err);
         }
@@ -137,7 +137,7 @@ const sendPushNotificationToRole = async (role: string, title: string, message: 
   }
 };
 
-// ... [MANTENHA A FUNÇÃO createLog IGUAL AQUI] ...
+// ... [CREATE LOG MANTIDO IGUAL] ...
 const createLog = async (userId: string | null, action: string, details: object, ip: string) => {
   try {
     const insertResult = await pool.query(
@@ -173,7 +173,7 @@ const createLog = async (userId: string | null, action: string, details: object,
   }
 };
 
-// ... [SEUS RATE LIMITS E AUTH MIDDLEWARE IGUAIS] ...
+// ... [RATE LIMITS E AUTH MANTIDOS IGUAIS] ...
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300, 
@@ -207,10 +207,10 @@ const authenticate = (req: any, res: any, next: any) => {
 };
 
 // ==========================================
-// ROTAS NOVAS (PUSH NOTIFICATIONS)
+// ROTAS
 // ==========================================
 
-// 🚀 NOVA ROTA: SALVAR INSCRIÇÃO
+// ROTA: SALVAR INSCRIÇÃO
 app.post('/notifications/subscribe', authenticate, async (req, res) => {
   const userId = (req as any).user.id;
   const { subscription } = req.body;
@@ -220,28 +220,18 @@ app.post('/notifications/subscribe', authenticate, async (req, res) => {
   }
 
   try {
-    // Salva no banco (substitui se já existir para esse user, ou adiciona nova)
-    // OBS: Ajuste conforme a estrutura do seu banco. 
-    // Se a tabela push_subscriptions permitir múltiplos devices por user, use INSERT simples.
     await pool.query(
       `INSERT INTO push_subscriptions (user_id, subscription) VALUES ($1, $2)`,
       [userId, JSON.stringify(subscription)]
     );
-
     res.status(201).json({ success: true });
   } catch (error) {
-    console.error("Erro ao salvar inscrição push:", error);
-    // Se der erro de duplicação, ignora (significa que já tá salvo)
+    // Ignora erro de chave duplicada ou similar para não travar o frontend
     res.status(200).json({ success: true }); 
   }
 });
 
-
-// ==========================================
-// ROTAS EXISTENTES (COM UPGRADE DE PUSH)
-// ==========================================
-
-// ... [SUAS ROTAS DE HEARTBEAT, AUDIT, PERMISSIONS MANTENHA IGUAL] ...
+// ... [ROTAS DE USERS, HEARTBEAT, LOGS, PERMISSIONS MANTIDAS IGUAIS] ...
 app.put('/users/:id/heartbeat', authenticate, async (req, res) => {
   const { id } = req.params;
   try { 
@@ -257,7 +247,6 @@ app.put('/users/:id/heartbeat', authenticate, async (req, res) => {
 });
 
 app.get('/admin/logs', authenticate, async (req, res) => {
-  // ... (MANTENHA O CODIGO ORIGINAL) ...
   const requesterId = (req as any).user.id;
   const adminCheck = await pool.query("SELECT role FROM profiles WHERE id = $1", [requesterId]);
   
@@ -363,7 +352,7 @@ app.post('/admin/permissions', authenticate, async (req, res) => {
   }
 });
 
-// --- AUTH E USERS MANTENHA IGUAL ---
+// --- AUTH MANTIDO IGUAL ---
 app.post('/auth/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   try {
@@ -476,7 +465,7 @@ app.delete('/users/:id', authenticate, async (req, res) => {
   }
 });
 
-// --- PRODUTOS MANTENHA IGUAL ---
+// --- PRODUTOS MANTIDO IGUAL ---
 app.get('/products', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -650,7 +639,7 @@ app.delete('/products/:id', authenticate, async (req, res) => {
   }
 });
 
-// --- TAREFAS (TASKBOARD) MANTENHA IGUAL ---
+// --- TASKS MANTIDO IGUAL ---
 app.get('/tasks', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM tasks ORDER BY created_at DESC');
@@ -803,7 +792,7 @@ app.delete('/tasks/:id', authenticate, async (req, res) => {
   }
 });
 
-// --- ESTOQUE MANTENHA IGUAL ---
+// --- ESTOQUE E REQUESTS ---
 app.get('/stock', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(`
