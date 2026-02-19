@@ -219,6 +219,7 @@ app.get('/separations', authenticate, async (req, res) => {
              'name', p.name, 
              'sku', p.sku, 
              'unit', p.unit,
+             'unit_price', p.unit_price,
              'stock', json_build_object(
                 'quantity_on_hand', COALESCE(st.quantity_on_hand, 0), 
                 'quantity_reserved', COALESCE(st.quantity_reserved, 0)
