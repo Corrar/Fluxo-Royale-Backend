@@ -1506,17 +1506,104 @@ app.get('/reports/available-dates', authenticate, async (req, res) => {
   } catch (error: any) { res.status(500).json({ error: 'Erro dates' }); }
 });
 
+// =================================================================
+// 🔥 CORREÇÃO PRINCIPAL: GET /reports/general 
+// =================================================================
 app.get('/reports/general', authenticate, async (req, res) => {
   const { startDate, endDate } = req.query;
   if (!startDate || !endDate) return res.status(400).json({ error: 'Datas obrigatórias' });
+  
   const start = `${startDate} 00:00:00`;
   const end = `${endDate} 23:59:59`;
+  
   try {
-    const entradasRes = await pool.query(`SELECT xi.created_at as data, 'Entrada' as tipo, xl.file_name as origem, p.name as produto, p.sku, p.unit as unidade, xi.quantity as quantidade FROM xml_items xi JOIN products p ON xi.product_id = p.id JOIN xml_logs xl ON xi.xml_log_id = xl.id WHERE xi.created_at >= $1 AND xi.created_at <= $2 ORDER BY xi.created_at DESC`, [start, end]);
-    const separacoesRes = await pool.query(`SELECT s.created_at as data, CASE WHEN s.type='manual' THEN 'Saída - Manual' ELSE 'Saída - Separação' END as tipo, s.destination as destino_setor, p.name as produto, p.sku, p.unit as unidade, si.quantity as quantidade FROM separation_items si JOIN separations s ON si.separation_id = s.id JOIN products p ON si.product_id = p.id WHERE s.created_at >= $1 AND s.created_at <= $2 AND s.status = 'concluida' ORDER BY s.created_at DESC`, [start, end]);
-    const solicitacoesRes = await pool.query(`SELECT r.created_at as data, 'Saída - Solicitação' as tipo, COALESCE(pf.sector, r.sector) as destino_setor, pf.name as solicitante, COALESCE(p.name, ri.custom_product_name) as produto, p.sku, p.unit as unidade, ri.quantity_requested as quantidade, r.status FROM request_items ri JOIN requests r ON ri.request_id = r.id LEFT JOIN products p ON ri.product_id = p.id LEFT JOIN profiles pf ON r.requester_id = pf.id WHERE r.created_at >= $1 AND r.created_at <= $2 AND r.status IN ('aprovado', 'entregue') ORDER BY r.created_at DESC`, [start, end]);
-    res.json({ entradas: entradasRes.rows, saidas_separacoes: separacoesRes.rows, saidas_solicitacoes: solicitacoesRes.rows });
-  } catch (error: any) { res.status(500).json({ error: 'Erro relatório' }); }
+    // 1. Entradas (Mantido)
+    const entradasRes = await pool.query(`
+      SELECT xi.created_at as data, 'Entrada' as tipo, xl.file_name as origem, 
+             p.name as produto, p.sku, p.unit as unidade, xi.quantity as quantidade 
+      FROM xml_items xi 
+      JOIN products p ON xi.product_id = p.id 
+      JOIN xml_logs xl ON xi.xml_log_id = xl.id 
+      WHERE xi.created_at >= $1 AND xi.created_at <= $2 
+      ORDER BY xi.created_at DESC
+    `, [start, end]);
+
+    // 2. Saídas Manuais/Separações (Com unit_price para cálculos financeiros)
+    const separacoesRes = await pool.query(`
+      SELECT s.created_at as data, 
+             CASE WHEN s.type='manual' THEN 'Saída - Manual' ELSE 'Saída - Separação' END as tipo, 
+             s.destination as destino_setor, p.name as produto, p.sku, p.unit as unidade, 
+             si.quantity as quantidade,
+             COALESCE(p.unit_price, 0) as preco_unitario
+      FROM separation_items si 
+      JOIN separations s ON si.separation_id = s.id 
+      JOIN products p ON si.product_id = p.id 
+      WHERE s.created_at >= $1 AND s.created_at <= $2 AND s.status = 'concluida' 
+      ORDER BY s.created_at DESC
+    `, [start, end]);
+
+    // 3. Solicitações (Com unit_price para cálculos financeiros)
+    const solicitacoesRes = await pool.query(`
+      SELECT r.created_at as data, 'Saída - Solicitação' as tipo, 
+             COALESCE(pf.sector, r.sector) as destino_setor, pf.name as solicitante, 
+             COALESCE(p.name, ri.custom_product_name) as produto, p.sku, p.unit as unidade, 
+             ri.quantity_requested as quantidade, r.status,
+             COALESCE(p.unit_price, 0) as preco_unitario
+      FROM request_items ri 
+      JOIN requests r ON ri.request_id = r.id 
+      LEFT JOIN products p ON ri.product_id = p.id 
+      LEFT JOIN profiles pf ON r.requester_id = pf.id 
+      WHERE r.created_at >= $1 AND r.created_at <= $2 AND r.status IN ('aprovado', 'entregue') 
+      ORDER BY r.created_at DESC
+    `, [start, end]);
+
+    // 4. Estoque com Data de Última Movimentação (Para obsoletos e valor total)
+    const estoqueRes = await pool.query(`
+      SELECT 
+          p.name as produto,
+          p.sku,
+          COALESCE(s.quantity_on_hand, 0) as quantidade,
+          COALESCE(p.unit_price, 0) as preco,
+          COALESCE(p.min_stock, 0) as estoque_minimo,
+          (
+              SELECT MAX(mov_date) FROM (
+                  SELECT created_at as mov_date FROM xml_items WHERE product_id = p.id
+                  UNION ALL
+                  SELECT si.created_at as mov_date FROM separation_items si
+                  JOIN separations sep ON si.separation_id = sep.id 
+                  WHERE sep.status = 'concluida' AND si.product_id = p.id
+              ) as movs
+          ) as ultima_movimentacao
+      FROM stock s
+      JOIN products p ON s.product_id = p.id
+      WHERE p.active = true
+    `);
+
+    // 5. Comparativo (Mês Anterior relativo às datas fornecidas)
+    const comparativoRes = await pool.query(`
+      SELECT
+          (SELECT COUNT(*) FROM xml_items xi WHERE xi.created_at >= $1::timestamp - INTERVAL '1 month' AND xi.created_at <= $2::timestamp - INTERVAL '1 month') as entradas_ant,
+          (
+             (SELECT COUNT(*) FROM separation_items si JOIN separations sep ON si.separation_id = sep.id WHERE sep.created_at >= $1::timestamp - INTERVAL '1 month' AND sep.created_at <= $2::timestamp - INTERVAL '1 month' AND sep.status = 'concluida')
+             +
+             (SELECT COUNT(*) FROM request_items ri JOIN requests req ON ri.request_id = req.id WHERE req.created_at >= $1::timestamp - INTERVAL '1 month' AND req.created_at <= $2::timestamp - INTERVAL '1 month' AND req.status IN ('aprovado', 'entregue'))
+          ) as saidas_ant
+    `, [start, end]);
+
+    res.json({ 
+      entradas: entradasRes.rows, 
+      saidas_separacoes: separacoesRes.rows, 
+      saidas_solicitacoes: solicitacoesRes.rows,
+      estoque: estoqueRes.rows,
+      comparativo_mes_anterior: {
+        entradas: parseInt(comparativoRes.rows[0].entradas_ant || 0),
+        saidas: parseInt(comparativoRes.rows[0].saidas_ant || 0)
+      }
+    });
+  } catch (error: any) { 
+    console.error("Erro relatório general:", error);
+    res.status(500).json({ error: 'Erro relatório general' }); 
+  }
 });
 
 app.post('/stock/calculate-min', authenticate, async (req, res) => {
