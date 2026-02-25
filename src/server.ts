@@ -288,14 +288,14 @@ app.put('/separations/:id', authenticate, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. Validação de Segurança: Apenas Admin/Almoxarife podem editar
+    // 1. Validação de Segurança
     const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     const role = userCheck.rows[0]?.role;
     if (role !== 'admin' && role !== 'almoxarife') {
       throw new Error('Apenas almoxarife e admin podem editar pedidos.');
     }
 
-    // 2. Validação de Status: Apenas editar o que não foi finalizado/entregue
+    // 2. Validação de Status
     const sepCheck = await client.query('SELECT status FROM separations WHERE id = $1', [id]);
     if (sepCheck.rows.length === 0) throw new Error('Pedido não encontrado.');
     const currentStatus = sepCheck.rows[0].status;
@@ -303,7 +303,7 @@ app.put('/separations/:id', authenticate, async (req, res) => {
       throw new Error('Apenas pedidos pendentes ou em separação podem ser editados.');
     }
 
-    // 3. Atualizar dados principais do pedido
+    // 3. Atualizar dados principais
     await client.query(
       `UPDATE separations 
        SET production_order = COALESCE($1, production_order), 
@@ -313,33 +313,27 @@ app.put('/separations/:id', authenticate, async (req, res) => {
       [production_order, client_name, destination, id]
     );
 
-    // 4. Buscar os itens que já existem no banco para este pedido
+    // 4. Buscar os itens que já existem
     const existingItemsRes = await client.query('SELECT id, product_id, quantity FROM separation_items WHERE separation_id = $1', [id]);
     const existingItems = existingItemsRes.rows;
 
-    // Criar um mapa dos itens novos que vieram do Frontend para facilitar a busca
     const newItemsMap = new Map(items.map((i: any) => [i.product_id, i]));
 
-    // 5. Sincronizar itens antigos vs novos
+    // 5. Sincronizar itens
     for (const oldItem of existingItems) {
       if (!newItemsMap.has(oldItem.product_id)) {
-        // Cenario A: O item foi REMOVIDO da lista pelo Almoxarife.
-        // Se já existia algo separado (reservado), precisamos devolver ao estoque disponível!
         const separatedQty = parseFloat(oldItem.quantity || 0);
         if (separatedQty > 0) {
+          // CORREÇÃO: Removemos a devolução do "quantity_on_hand". Apenas libertamos o reservado.
           await client.query(
             `UPDATE stock 
-             SET quantity_on_hand = quantity_on_hand + $1, 
-                 quantity_reserved = GREATEST(0, quantity_reserved - $1) 
+             SET quantity_reserved = GREATEST(0, quantity_reserved - $1) 
              WHERE product_id = $2`,
             [separatedQty, oldItem.product_id]
           );
         }
-        // Excluir a linha do item no pedido
         await client.query('DELETE FROM separation_items WHERE id = $1', [oldItem.id]);
       } else {
-        // Cenario B: O item se MANTEVE, vamos atualizar a quantidade SOLICITADA.
-        // CORREÇÃO APLICADA AQUI: Definimos newItem como "any" para evitar o erro TS18046.
         const newItem: any = newItemsMap.get(oldItem.product_id);
         await client.query(
           'UPDATE separation_items SET qty_requested = $1 WHERE id = $2',
@@ -348,11 +342,10 @@ app.put('/separations/:id', authenticate, async (req, res) => {
       }
     }
 
-    // 6. Inserir os NOVOS itens que não existiam antes no pedido
+    // 6. Inserir os NOVOS itens
     for (const item of items) {
       const exists = existingItems.some((old: any) => old.product_id === item.product_id);
       if (!exists) {
-        // Cenario C: Item NOVO. Adiciona com quantity (separado) = 0
         await client.query(
           `INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity) 
            VALUES ($1, $2, $3, 0)`,
@@ -361,12 +354,10 @@ app.put('/separations/:id', authenticate, async (req, res) => {
       }
     }
 
-    // 7. Salvar Log de Auditoria
     await createLog(userId, 'EDIT_SEPARATION', { separationId: id, details: 'Itens editados via painel' }, req.ip || '127.0.0.1');
     
     await client.query('COMMIT');
 
-    // 8. Atualizar painéis abertos
     if ((req as any).io) {
       (req as any).io.emit('separations_update');
     } else {
@@ -383,7 +374,7 @@ app.put('/separations/:id', authenticate, async (req, res) => {
 });
 
 
-// 3. Autorizar/Processar (Reserva e Entrega) - O Coração do Fluxo 2.1
+// 3. Autorizar/Processar (Reserva e Entrega) - CORRIGIDO O ESTOQUE
 app.put('/separations/:id/authorize', authenticate, async (req, res) => {
   const { id } = req.params;
   const { items, action } = req.body; // 'reservar' ou 'entregar'
@@ -404,18 +395,16 @@ app.put('/separations/:id/authorize', authenticate, async (req, res) => {
         await client.query('UPDATE separation_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
 
         if (action === 'reservar' && diff !== 0) {
-          // Lógica de RESERVA: Move do Disponível para o Reservado
+          // CORREÇÃO: Ação de Reservar só aumenta/diminui o RESERVADO. O físico não se mexe!
           if (diff > 0) {
-            const st = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
-            if (parseFloat(st.rows[0]?.quantity_on_hand || 0) < diff) throw new Error(`Estoque insuficiente para o produto ID ${productId}`);
+            const st = await client.query('SELECT (quantity_on_hand - quantity_reserved) as available FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
+            if (parseFloat(st.rows[0]?.available || 0) < diff) throw new Error(`Estoque disponível insuficiente para o produto ID ${productId}`);
           }
-          await client.query(`UPDATE stock SET quantity_on_hand = quantity_on_hand - $1, quantity_reserved = quantity_reserved + $1 WHERE product_id = $2`, [diff, productId]);
+          await client.query(`UPDATE stock SET quantity_reserved = quantity_reserved + $1 WHERE product_id = $2`, [diff, productId]);
         
         } else if (action === 'entregar') {
-          // Lógica de ENTREGA: Baixa do Reservado.
-          // Se entregou MENOS do que estava reservado (oldQty > newQty), a sobra volta pro Disponível.
-          const sobra = oldQty - newQty;
-          await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, quantity_reserved - $1), quantity_on_hand = quantity_on_hand + $2 WHERE product_id = $3`, [oldQty, sobra, productId]);
+          // CORREÇÃO: Na hora de entregar, a mercadoria sai da prateleira. Tira do Físico e liberta a Reserva.
+          await client.query(`UPDATE stock SET quantity_on_hand = GREATEST(0, quantity_on_hand - $1), quantity_reserved = GREATEST(0, quantity_reserved - $2) WHERE product_id = $3`, [newQty, oldQty, productId]);
         }
       }
     }
@@ -479,8 +468,6 @@ app.put('/separations/returns/:returnId', authenticate, async (req, res) => {
 app.delete('/separations/:id', authenticate, async (req, res) => {
   const { id } = req.params;
   try {
-    // Nota: Em um cenário ideal, deveria verificar se há itens reservados antes de deletar e estorná-los.
-    // Assumimos aqui que só se deleta OPs pendentes ou sem reservas ativas.
     await pool.query('DELETE FROM separations WHERE id = $1', [id]);
     io.emit('separations_update');
     res.json({ success: true });
@@ -1260,7 +1247,7 @@ app.post('/requests', authenticate, async (req, res) => {
     
     await client.query('COMMIT');
 
-    // 1. Notifica via Socket (Tempo real se estiver aberto)
+    // 1. Notifica via Socket
     if ((req as any).io) {
         (req as any).io.to('almoxarife').emit('new_request_notification', {
             message: `📢 Nova solicitação do setor: ${sector}`,
@@ -1285,6 +1272,7 @@ app.post('/requests', authenticate, async (req, res) => {
   }
 });
 
+// CORREÇÃO: Rotas de aprovação e entrega de requests usando o novo método.
 app.put('/requests/:id/status', authenticate, async (req, res) => {
   const { id } = req.params;
   const { status, rejection_reason } = req.body;
@@ -1302,36 +1290,39 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
     const items = itemsRes.rows;
 
     if (status === 'aprovado' && currentStatus === 'aberto') {
+      // Aprovação: Apenas RESERVA (não mexe no físico)
       for (const item of items) {
         if (item.product_id) {
-          const stockCheck = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1', [item.product_id]);
-          const onHand = parseFloat(stockCheck.rows[0]?.quantity_on_hand || 0);
+          const stockCheck = await client.query('SELECT (quantity_on_hand - quantity_reserved) as available FROM stock WHERE product_id = $1', [item.product_id]);
+          const available = parseFloat(stockCheck.rows[0]?.available || 0);
           
-          if (onHand < item.quantity_requested) {
-             throw new Error(`Estoque insuficiente para o produto ID: ${item.product_id}`);
+          if (available < item.quantity_requested) {
+             throw new Error(`Estoque disponível insuficiente para o produto ID: ${item.product_id}`);
           }
 
           await client.query(`
             UPDATE stock 
-            SET quantity_on_hand = COALESCE(quantity_on_hand, 0) - $1,
-                quantity_reserved = COALESCE(quantity_reserved, 0) + $1
+            SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1
             WHERE product_id = $2
           `, [item.quantity_requested, item.product_id]);
         }
       }
     }
     else if (status === 'entregue' && currentStatus === 'aprovado') {
+      // Entrega de aprovado: Deduz do físico e limpa a reserva
       for (const item of items) {
         if (item.product_id) {
           await client.query(`
             UPDATE stock 
-            SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1)
+            SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1),
+                quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1)
             WHERE product_id = $2
           `, [item.quantity_requested, item.product_id]);
         }
       }
     }
     else if (status === 'entregue' && currentStatus === 'aberto') {
+      // Entrega direto de aberto: Deduz direto do físico
       for (const item of items) {
         if (item.product_id) {
            await client.query(`
@@ -1343,12 +1334,12 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
       }
     }
     else if (status === 'rejeitado' && currentStatus === 'aprovado') {
+      // Rejeição de algo aprovado: Apenas liberta a reserva
       for (const item of items) {
         if (item.product_id) {
           await client.query(`
             UPDATE stock 
-            SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1,
-                quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1)
+            SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1)
             WHERE product_id = $2
           `, [item.quantity_requested, item.product_id]);
         }
@@ -1362,7 +1353,7 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
 
   } catch (error: any) {
     await client.query('ROLLBACK');
-    const statusCode = error.message.includes('Estoque insuficiente') ? 400 : 500;
+    const statusCode = error.message.includes('Estoque disponível insuficiente') ? 400 : 500;
     res.status(statusCode).json({ error: error.message || 'Erro ao atualizar status' });
   } finally {
     client.release();
@@ -1385,6 +1376,7 @@ app.delete('/requests/:id', authenticate, async (req, res) => {
 
     const { status } = reqRes.rows[0];
 
+    // CORREÇÃO: Se apagar algo aprovado, liberta a reserva.
     if (status === 'aprovado') {
        const itemsRes = await client.query('SELECT product_id, quantity_requested FROM request_items WHERE request_id = $1', [id]);
        const items = itemsRes.rows;
@@ -1393,8 +1385,7 @@ app.delete('/requests/:id', authenticate, async (req, res) => {
          if (item.product_id) {
            await client.query(`
              UPDATE stock 
-             SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1),
-                 quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1
+             SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1)
              WHERE product_id = $2
            `, [item.quantity_requested, item.product_id]);
          }
