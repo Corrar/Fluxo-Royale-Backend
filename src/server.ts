@@ -339,7 +339,8 @@ app.put('/separations/:id', authenticate, async (req, res) => {
         await client.query('DELETE FROM separation_items WHERE id = $1', [oldItem.id]);
       } else {
         // Cenario B: O item se MANTEVE, vamos atualizar a quantidade SOLICITADA.
-        const newItem = newItemsMap.get(oldItem.product_id);
+        // CORREÇÃO APLICADA AQUI: Definimos newItem como "any" para evitar o erro TS18046.
+        const newItem: any = newItemsMap.get(oldItem.product_id);
         await client.query(
           'UPDATE separation_items SET qty_requested = $1 WHERE id = $2',
           [newItem.quantity, oldItem.id]
