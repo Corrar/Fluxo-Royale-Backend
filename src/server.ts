@@ -277,6 +277,111 @@ app.post('/separations', authenticate, async (req, res) => {
   } finally { client.release(); }
 });
 
+// 2.5 Editar Separação Existente (Apenas Almoxarife e Admin)
+app.put('/separations/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const userId = (req as any).user.id;
+  const { production_order, client_name, destination, items } = req.body;
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Validação de Segurança: Apenas Admin/Almoxarife podem editar
+    const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+    const role = userCheck.rows[0]?.role;
+    if (role !== 'admin' && role !== 'almoxarife') {
+      throw new Error('Apenas almoxarife e admin podem editar pedidos.');
+    }
+
+    // 2. Validação de Status: Apenas editar o que não foi finalizado/entregue
+    const sepCheck = await client.query('SELECT status FROM separations WHERE id = $1', [id]);
+    if (sepCheck.rows.length === 0) throw new Error('Pedido não encontrado.');
+    const currentStatus = sepCheck.rows[0].status;
+    if (currentStatus !== 'pendente' && currentStatus !== 'em_separacao') {
+      throw new Error('Apenas pedidos pendentes ou em separação podem ser editados.');
+    }
+
+    // 3. Atualizar dados principais do pedido
+    await client.query(
+      `UPDATE separations 
+       SET production_order = COALESCE($1, production_order), 
+           client_name = COALESCE($2, client_name), 
+           destination = COALESCE($3, destination) 
+       WHERE id = $4`,
+      [production_order, client_name, destination, id]
+    );
+
+    // 4. Buscar os itens que já existem no banco para este pedido
+    const existingItemsRes = await client.query('SELECT id, product_id, quantity FROM separation_items WHERE separation_id = $1', [id]);
+    const existingItems = existingItemsRes.rows;
+
+    // Criar um mapa dos itens novos que vieram do Frontend para facilitar a busca
+    const newItemsMap = new Map(items.map((i: any) => [i.product_id, i]));
+
+    // 5. Sincronizar itens antigos vs novos
+    for (const oldItem of existingItems) {
+      if (!newItemsMap.has(oldItem.product_id)) {
+        // Cenario A: O item foi REMOVIDO da lista pelo Almoxarife.
+        // Se já existia algo separado (reservado), precisamos devolver ao estoque disponível!
+        const separatedQty = parseFloat(oldItem.quantity || 0);
+        if (separatedQty > 0) {
+          await client.query(
+            `UPDATE stock 
+             SET quantity_on_hand = quantity_on_hand + $1, 
+                 quantity_reserved = GREATEST(0, quantity_reserved - $1) 
+             WHERE product_id = $2`,
+            [separatedQty, oldItem.product_id]
+          );
+        }
+        // Excluir a linha do item no pedido
+        await client.query('DELETE FROM separation_items WHERE id = $1', [oldItem.id]);
+      } else {
+        // Cenario B: O item se MANTEVE, vamos atualizar a quantidade SOLICITADA.
+        const newItem = newItemsMap.get(oldItem.product_id);
+        await client.query(
+          'UPDATE separation_items SET qty_requested = $1 WHERE id = $2',
+          [newItem.quantity, oldItem.id]
+        );
+      }
+    }
+
+    // 6. Inserir os NOVOS itens que não existiam antes no pedido
+    for (const item of items) {
+      const exists = existingItems.some((old: any) => old.product_id === item.product_id);
+      if (!exists) {
+        // Cenario C: Item NOVO. Adiciona com quantity (separado) = 0
+        await client.query(
+          `INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity) 
+           VALUES ($1, $2, $3, 0)`,
+          [id, item.product_id, item.quantity]
+        );
+      }
+    }
+
+    // 7. Salvar Log de Auditoria
+    await createLog(userId, 'EDIT_SEPARATION', { separationId: id, details: 'Itens editados via painel' }, req.ip || '127.0.0.1');
+    
+    await client.query('COMMIT');
+
+    // 8. Atualizar painéis abertos
+    if ((req as any).io) {
+      (req as any).io.emit('separations_update');
+    } else {
+      io.emit('separations_update');
+    }
+
+    res.json({ success: true });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+
 // 3. Autorizar/Processar (Reserva e Entrega) - O Coração do Fluxo 2.1
 app.put('/separations/:id/authorize', authenticate, async (req, res) => {
   const { id } = req.params;
