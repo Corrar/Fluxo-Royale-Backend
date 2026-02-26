@@ -324,6 +324,7 @@ app.put('/separations/:id', authenticate, async (req, res) => {
       if (!newItemsMap.has(oldItem.product_id)) {
         const separatedQty = parseFloat(oldItem.quantity || 0);
         if (separatedQty > 0) {
+          // CORREÇÃO: Removemos a devolução do "quantity_on_hand". Apenas libertamos o reservado.
           await client.query(
             `UPDATE stock 
              SET quantity_reserved = GREATEST(0, quantity_reserved - $1) 
@@ -394,6 +395,7 @@ app.put('/separations/:id/authorize', authenticate, async (req, res) => {
         await client.query('UPDATE separation_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
 
         if (action === 'reservar' && diff !== 0) {
+          // CORREÇÃO: Ação de Reservar só aumenta/diminui o RESERVADO. O físico não se mexe!
           if (diff > 0) {
             const st = await client.query('SELECT (quantity_on_hand - quantity_reserved) as available FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
             if (parseFloat(st.rows[0]?.available || 0) < diff) throw new Error(`Estoque disponível insuficiente para o produto ID ${productId}`);
@@ -401,6 +403,7 @@ app.put('/separations/:id/authorize', authenticate, async (req, res) => {
           await client.query(`UPDATE stock SET quantity_reserved = quantity_reserved + $1 WHERE product_id = $2`, [diff, productId]);
         
         } else if (action === 'entregar') {
+          // CORREÇÃO: Na hora de entregar, a mercadoria sai da prateleira. Tira do Físico e liberta a Reserva.
           await client.query(`UPDATE stock SET quantity_on_hand = GREATEST(0, quantity_on_hand - $1), quantity_reserved = GREATEST(0, quantity_reserved - $2) WHERE product_id = $3`, [newQty, oldQty, productId]);
         }
       }
@@ -449,6 +452,7 @@ app.put('/separations/returns/:returnId', authenticate, async (req, res) => {
     await client.query('UPDATE separation_returns SET status = $1 WHERE id = $2', [status, returnId]);
     
     if (status === 'aprovado') {
+      // Devolve ao estoque disponível
       await client.query('UPDATE stock SET quantity_on_hand = quantity_on_hand + $1 WHERE product_id = $2', [ret.rows[0].quantity, ret.rows[0].product_id]);
     }
     await client.query('COMMIT');
@@ -469,6 +473,7 @@ app.delete('/separations/:id', authenticate, async (req, res) => {
     res.json({ success: true });
   } catch (error: any) { res.status(500).json({ error: 'Erro ao excluir' }); }
 });
+
 
 // ==========================================
 // OUTRAS ROTAS (EXISTENTES)
@@ -764,6 +769,7 @@ app.get('/products', authenticate, async (req, res) => {
   }
 });
 
+// 🔴 A CORREÇÃO ENTRA AQUI (REMOÇÃO DO "WHERE p.min_stock IS NOT NULL" e INCLUSÃO DE COALESCE)
 app.get('/products/low-stock', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -782,9 +788,8 @@ app.get('/products/low-stock', authenticate, async (req, res) => {
         ) as demanda_reprimida
       FROM products p
       LEFT JOIN stock s ON p.id = s.product_id
-      WHERE p.min_stock IS NOT NULL 
-        AND p.active = true
-        AND (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) < CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC)
+      WHERE p.active = true
+        AND (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) <= COALESCE(CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC), 0)
       ORDER BY (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) ASC
     `);
     res.json(rows);
@@ -1487,9 +1492,6 @@ app.get('/reports/available-dates', authenticate, async (req, res) => {
   } catch (error: any) { res.status(500).json({ error: 'Erro dates' }); }
 });
 
-// =================================================================
-// 🔥 CORREÇÃO: GET /reports/general (API DE RELATÓRIOS)
-// =================================================================
 app.get('/reports/general', authenticate, async (req, res) => {
   const { startDate, endDate } = req.query;
   if (!startDate || !endDate) return res.status(400).json({ error: 'Datas obrigatórias' });
@@ -1535,7 +1537,6 @@ app.get('/reports/general', authenticate, async (req, res) => {
       ORDER BY r.created_at DESC
     `, [start, end]);
 
-    // 🔴 QUERY BLINDADA COM CASTS PARA EVITAR ERRO 500 DE TYPE MISMATCH 
     const estoqueRes = await pool.query(`
       SELECT 
           p.name as produto, 
