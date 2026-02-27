@@ -251,10 +251,19 @@ app.get('/separations', authenticate, async (req, res) => {
 
 // 2. Criar Nova Separação (Ordem de Produção)
 app.post('/separations', authenticate, async (req, res) => {
+  const userId = (req as any).user.id;
   const { client_name, production_order, destination, items } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    
+    // VERIFICAÇÃO DE SEGURANÇA
+    const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+    const role = userCheck.rows[0]?.role;
+    if (role !== 'admin' && role !== 'almoxarife') {
+      throw new Error('Apenas almoxarife e admin podem criar separações.');
+    }
+
     const sepRes = await client.query(
       `INSERT INTO separations (destination, client_name, production_order, status, type) 
        VALUES ($1, $2, $3, 'pendente', 'op') RETURNING id`,
@@ -268,16 +277,18 @@ app.post('/separations', authenticate, async (req, res) => {
         [separationId, item.product_id, item.quantity]
       );
     }
+    
+    await createLog(userId, 'CREATE_SEPARATION', { separationId, client_name }, req.ip || '127.0.0.1');
     await client.query('COMMIT');
     io.emit('separations_update');
     res.status(201).json({ success: true });
   } catch (error: any) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: error.message });
+    res.status(400).json({ error: error.message });
   } finally { client.release(); }
 });
 
-// 2.5 Editar Separação Existente (Apenas Almoxarife e Admin)
+// 2.5 Editar Separação Existente
 app.put('/separations/:id', authenticate, async (req, res) => {
   const { id } = req.params;
   const userId = (req as any).user.id;
@@ -324,7 +335,6 @@ app.put('/separations/:id', authenticate, async (req, res) => {
       if (!newItemsMap.has(oldItem.product_id)) {
         const separatedQty = parseFloat(oldItem.quantity || 0);
         if (separatedQty > 0) {
-          // CORREÇÃO: Removemos a devolução do "quantity_on_hand". Apenas libertamos o reservado.
           await client.query(
             `UPDATE stock 
              SET quantity_reserved = GREATEST(0, quantity_reserved - $1) 
@@ -374,15 +384,23 @@ app.put('/separations/:id', authenticate, async (req, res) => {
 });
 
 
-// 3. Autorizar/Processar (Reserva e Entrega) - CORRIGIDO O ESTOQUE
+// 3. Autorizar/Processar (Reserva e Entrega)
 app.put('/separations/:id/authorize', authenticate, async (req, res) => {
   const { id } = req.params;
-  const { items, action } = req.body; // 'reservar' ou 'entregar'
+  const { items, action } = req.body; 
   const userId = (req as any).user.id;
   const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
+    
+    // VERIFICAÇÃO DE SEGURANÇA
+    const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+    const role = userCheck.rows[0]?.role;
+    if (role !== 'admin' && role !== 'almoxarife') {
+      throw new Error('Apenas almoxarife e admin podem processar separações.');
+    }
+
     for (const item of items) {
       const oldItem = await client.query('SELECT quantity, product_id FROM separation_items WHERE id = $1', [item.id]);
       if (oldItem.rows.length > 0) {
@@ -391,11 +409,9 @@ app.put('/separations/:id/authorize', authenticate, async (req, res) => {
         const productId = oldItem.rows[0].product_id;
         const diff = newQty - oldQty;
 
-        // Atualiza a quantidade "separada" no item da separação
         await client.query('UPDATE separation_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
 
         if (action === 'reservar' && diff !== 0) {
-          // CORREÇÃO: Ação de Reservar só aumenta/diminui o RESERVADO. O físico não se mexe!
           if (diff > 0) {
             const st = await client.query('SELECT (quantity_on_hand - quantity_reserved) as available FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
             if (parseFloat(st.rows[0]?.available || 0) < diff) throw new Error(`Estoque disponível insuficiente para o produto ID ${productId}`);
@@ -403,7 +419,6 @@ app.put('/separations/:id/authorize', authenticate, async (req, res) => {
           await client.query(`UPDATE stock SET quantity_reserved = quantity_reserved + $1 WHERE product_id = $2`, [diff, productId]);
         
         } else if (action === 'entregar') {
-          // CORREÇÃO: Na hora de entregar, a mercadoria sai da prateleira. Tira do Físico e liberta a Reserva.
           await client.query(`UPDATE stock SET quantity_on_hand = GREATEST(0, quantity_on_hand - $1), quantity_reserved = GREATEST(0, quantity_reserved - $2) WHERE product_id = $3`, [newQty, oldQty, productId]);
         }
       }
@@ -426,7 +441,16 @@ app.put('/separations/:id/authorize', authenticate, async (req, res) => {
 app.post('/separations/:id/return', authenticate, async (req, res) => {
   const { id } = req.params;
   const { items } = req.body;
+  const userId = (req as any).user.id;
+  
   try {
+    // VERIFICAÇÃO DE SEGURANÇA
+    const userCheck = await pool.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+    const role = userCheck.rows[0]?.role;
+    if (role !== 'admin' && role !== 'almoxarife') {
+      return res.status(403).json({ error: 'Apenas almoxarife e admin podem registrar devoluções.' });
+    }
+
     for (const item of items) {
       await pool.query(
         `INSERT INTO separation_returns (separation_id, product_id, quantity, status) VALUES ($1, $2, $3, 'pendente')`,
@@ -441,10 +465,20 @@ app.post('/separations/:id/return', authenticate, async (req, res) => {
 // 5. Aprovar/Rejeitar Devolução
 app.put('/separations/returns/:returnId', authenticate, async (req, res) => {
   const { returnId } = req.params;
-  const { status } = req.body; // 'aprovado' ou 'rejeitado'
+  const { status } = req.body; 
+  const userId = (req as any).user.id;
   const client = await pool.connect();
+  
   try {
     await client.query('BEGIN');
+    
+    // VERIFICAÇÃO DE SEGURANÇA
+    const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+    const role = userCheck.rows[0]?.role;
+    if (role !== 'admin' && role !== 'almoxarife') {
+      throw new Error('Apenas almoxarife e admin podem processar devoluções.');
+    }
+
     const ret = await client.query('SELECT * FROM separation_returns WHERE id = $1 FOR UPDATE', [returnId]);
     
     if (ret.rows.length === 0 || ret.rows[0].status !== 'pendente') throw new Error("Devolução já processada ou inexistente");
@@ -452,9 +486,10 @@ app.put('/separations/returns/:returnId', authenticate, async (req, res) => {
     await client.query('UPDATE separation_returns SET status = $1 WHERE id = $2', [status, returnId]);
     
     if (status === 'aprovado') {
-      // Devolve ao estoque disponível
       await client.query('UPDATE stock SET quantity_on_hand = quantity_on_hand + $1 WHERE product_id = $2', [ret.rows[0].quantity, ret.rows[0].product_id]);
     }
+    
+    await createLog(userId, 'PROCESS_RETURN', { returnId, status }, req.ip || '127.0.0.1');
     await client.query('COMMIT');
     io.emit('separations_update');
     res.json({ success: true });
@@ -467,8 +502,18 @@ app.put('/separations/returns/:returnId', authenticate, async (req, res) => {
 // 6. Excluir Separação
 app.delete('/separations/:id', authenticate, async (req, res) => {
   const { id } = req.params;
+  const userId = (req as any).user.id;
   try {
+    // VERIFICAÇÃO DE SEGURANÇA
+    const userCheck = await pool.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+    const role = userCheck.rows[0]?.role;
+    if (role !== 'admin' && role !== 'almoxarife') {
+      return res.status(403).json({ error: 'Apenas almoxarife e admin podem excluir separações.' });
+    }
+
     await pool.query('DELETE FROM separations WHERE id = $1', [id]);
+    
+    await createLog(userId, 'DELETE_SEPARATION', { separationId: id }, req.ip || '127.0.0.1');
     io.emit('separations_update');
     res.json({ success: true });
   } catch (error: any) { res.status(500).json({ error: 'Erro ao excluir' }); }
@@ -769,7 +814,6 @@ app.get('/products', authenticate, async (req, res) => {
   }
 });
 
-// 🔴 A CORREÇÃO ENTRA AQUI (REMOÇÃO DO "WHERE p.min_stock IS NOT NULL" e INCLUSÃO DE COALESCE)
 app.get('/products/low-stock', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(`
