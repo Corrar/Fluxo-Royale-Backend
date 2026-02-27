@@ -11,6 +11,12 @@ import webpush from 'web-push';
 
 const app = express();
 
+// --- PROTEÇÃO DO BANCO DE DADOS ---
+// Impede que o servidor vá abaixo ("status 1") se o banco de dados fechar a ligação
+pool.on('error', (err, client) => {
+  console.error('⚠️ Erro inesperado no banco de dados (Conexão ociosa):', err.message);
+});
+
 // --- 1. CONFIGURAÇÃO DO SERVIDOR HTTP + SOCKET.IO ---
 const httpServer = createServer(app);
 
