@@ -1114,21 +1114,24 @@ app.delete('/tasks/:id', authenticate, async (req, res) => {
 // ROTAS: QUADRO DE TAREFAS - ELÉTRICA
 // ==========================================
 
-// Função auxiliar para validar permissão da Elétrica via RBAC
+// Função auxiliar para validar permissão da Elétrica via RBAC ou Setor
 const checkEletricaPermission = async (userId: string) => {
-  // 1. Descobre qual é o cargo (role) do usuário
-  const { rows } = await pool.query('SELECT role FROM profiles WHERE id = $1', [userId]);
-  const role = rows[0]?.role;
+  const { rows } = await pool.query('SELECT role, sector FROM profiles WHERE id = $1', [userId]);
+  const user = rows[0];
 
-  if (!role) return false;
+  if (!user) return false;
   
-  // 2. Se for admin, passe livre!
-  if (role === 'admin') return true;
+  // 1. Se for admin, passe livre!
+  if (user.role === 'admin') return true;
+
+  // 2. Se for especificamente do setor de elétrica, passe livre!
+  const sector = user.sector?.toLowerCase();
+  if (sector === 'elétrica' || sector === 'eletrica') return true;
   
-  // 3. Verifica se o cargo do usuário tem a permissão específica na tabela
+  // 3. Se for outro cargo/setor, verifica se tem a permissão RBAC explícita (ex: Gerentes)
   const permCheck = await pool.query(
     'SELECT 1 FROM role_permissions WHERE role = $1 AND page_key = $2', 
-    [role, 'tarefas_eletrica']
+    [user.role, 'tarefas_eletrica']
   );
   
   return permCheck.rows.length > 0;
