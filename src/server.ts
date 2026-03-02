@@ -1110,6 +1110,148 @@ app.delete('/tasks/:id', authenticate, async (req, res) => {
   }
 });
 
+// ==========================================
+// ROTAS: QUADRO DE TAREFAS - ELÉTRICA
+// ==========================================
+
+// Função auxiliar para validar permissão da Elétrica via RBAC
+const checkEletricaPermission = async (userId: string) => {
+  // 1. Descobre qual é o cargo (role) do usuário
+  const { rows } = await pool.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+  const role = rows[0]?.role;
+
+  if (!role) return false;
+  
+  // 2. Se for admin, passe livre!
+  if (role === 'admin') return true;
+  
+  // 3. Verifica se o cargo do usuário tem a permissão específica na tabela
+  const permCheck = await pool.query(
+    'SELECT 1 FROM role_permissions WHERE role = $1 AND page_key = $2', 
+    [role, 'tarefas_eletrica']
+  );
+  
+  return permCheck.rows.length > 0;
+};
+
+app.get('/eletrica-tasks', authenticate, async (req, res) => {
+  const userId = (req as any).user.id;
+  const hasAccess = await checkEletricaPermission(userId);
+  if (!hasAccess) return res.status(403).json({ error: 'Acesso negado ao quadro de elétrica.' });
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM eletrica_tasks ORDER BY created_at DESC');
+    
+    const formattedRows = rows.map((task: any) => ({
+      ...task,
+      checklist: task.checklist || [],
+      tags: task.tags || [],
+      imageUrl: task.image_url,
+      dueDate: task.due_date,
+      createdAt: task.created_at,
+      completedAt: task.completed_at
+    }));
+    
+    res.json(formattedRows);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Erro ao buscar tarefas da elétrica' });
+  }
+});
+
+app.post('/eletrica-tasks', authenticate, async (req, res) => {
+  const userId = (req as any).user.id;
+  const hasAccess = await checkEletricaPermission(userId);
+  if (!hasAccess) return res.status(403).json({ error: 'Sem permissão para criar tarefas na elétrica.' });
+
+  const { title, description, category, priority, checklist, tags, imageUrl, dueDate } = req.body;
+  
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO eletrica_tasks (title, description, category, priority, checklist, tags, image_url, due_date) 
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [title, description, category || 'blue', priority, JSON.stringify(checklist || []), JSON.stringify(tags || []), imageUrl || null, dueDate || null]
+    );
+
+    const newTask = {
+      ...rows[0],
+      checklist: rows[0].checklist || [],
+      tags: rows[0].tags || [],
+      imageUrl: rows[0].image_url,
+      dueDate: rows[0].due_date,
+      createdAt: rows[0].created_at,
+      completedAt: rows[0].completed_at
+    };
+
+    if ((req as any).io) (req as any).io.emit('eletrica_tasks_updated'); 
+    res.status(201).json(newTask);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Erro ao criar tarefa na elétrica' });
+  }
+});
+
+app.put('/eletrica-tasks/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const userId = (req as any).user.id;
+  const hasAccess = await checkEletricaPermission(userId);
+  if (!hasAccess) return res.status(403).json({ error: 'Sem permissão para editar tarefas na elétrica.' });
+
+  const { title, description, category, priority, checklist, completed, tags, imageUrl, dueDate } = req.body;
+
+  try {
+    const fields: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+
+    if (title !== undefined) { fields.push(`title = $${idx++}`); values.push(title); }
+    if (description !== undefined) { fields.push(`description = $${idx++}`); values.push(description); }
+    if (category !== undefined) { fields.push(`category = $${idx++}`); values.push(category); }
+    if (priority !== undefined) { fields.push(`priority = $${idx++}`); values.push(priority); }
+    if (checklist !== undefined) { fields.push(`checklist = $${idx++}`); values.push(JSON.stringify(checklist)); }
+    if (tags !== undefined) { fields.push(`tags = $${idx++}`); values.push(JSON.stringify(tags)); }
+    if (imageUrl !== undefined) { fields.push(`image_url = $${idx++}`); values.push(imageUrl); }
+    if (dueDate !== undefined) { fields.push(`due_date = $${idx++}`); values.push(dueDate); }
+    
+    if (completed !== undefined) {
+       fields.push(`completed = $${idx++}`); values.push(completed);
+       if (completed) {
+           fields.push(`completed_at = NOW()`);
+       } else {
+           fields.push(`completed_at = NULL`);
+       }
+    }
+
+    values.push(id);
+    if (fields.length === 0) return res.status(400).json({ error: 'Nenhum campo para atualizar' });
+
+    const { rows } = await pool.query(`UPDATE eletrica_tasks SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
+    if (rows.length === 0) return res.status(404).json({ error: 'Tarefa não encontrada' });
+
+    if ((req as any).io) (req as any).io.emit('eletrica_tasks_updated');
+    res.json(rows[0]);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Erro ao atualizar tarefa' });
+  }
+});
+
+app.delete('/eletrica-tasks/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const userId = (req as any).user.id;
+  const hasAccess = await checkEletricaPermission(userId);
+  if (!hasAccess) return res.status(403).json({ error: 'Sem permissão para excluir tarefas na elétrica.' });
+
+  try {
+    await pool.query('DELETE FROM eletrica_tasks WHERE id = $1', [id]);
+    if ((req as any).io) (req as any).io.emit('eletrica_tasks_updated');
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Erro ao excluir tarefa' });
+  }
+});
+
+// ==========================================
+// OUTRAS ROTAS (ESTOQUE, RELATÓRIOS, ETC)
+// ==========================================
+
 app.get('/stock', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(`
