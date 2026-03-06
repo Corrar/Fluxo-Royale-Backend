@@ -94,7 +94,9 @@ const sendPushNotificationToRole = async (role: string, title: string, message: 
       JOIN profiles p ON ps.user_id::uuid = p.id
       WHERE p.role = $1
     `;
+    let params: any[] = [role];
     
+    // Se for almoxarife, envia para almoxarifes e admins
     if (role === 'almoxarife') {
        query = `
         SELECT ps.subscription 
@@ -102,9 +104,20 @@ const sendPushNotificationToRole = async (role: string, title: string, message: 
         JOIN profiles p ON ps.user_id::uuid = p.id
         WHERE p.role IN ('almoxarife', 'admin')
        `;
+       params = [];
+    } 
+    // Se for compras, envia para compras e admins
+    else if (role === 'compras') {
+       query = `
+        SELECT ps.subscription 
+        FROM push_subscriptions ps
+        JOIN profiles p ON ps.user_id::uuid = p.id
+        WHERE p.role IN ('compras', 'admin')
+       `;
+       params = [];
     }
 
-    const { rows } = await pool.query(query, role === 'almoxarife' ? [] : [role]);
+    const { rows } = await pool.query(query, params);
     
     console.log(`📡 Enviando Push para ${rows.length} dispositivos (${role})...`);
 
@@ -1345,9 +1358,18 @@ app.post('/manual-entry', authenticate, async (req, res) => {
     if ((req as any).io) {
         (req as any).io.to('compras').emit('new_request_notification', {
             message: '📦 Nova entrada de mercadoria registrada!',
-            action: 'Ver Estoque'
+            action: 'Ver Estoque',
+            type: 'entrada' // Importante para o frontend filtrar duplicados
         });
     }
+
+    // Aciona a notificação PUSH
+    sendPushNotificationToRole(
+      'compras', 
+      'Nova Entrada de Estoque', 
+      'O Almoxarifado acabou de registrar uma nova entrada de mercadorias no sistema.', 
+      '/stock'
+    );
 
     res.status(201).json({ success: true });
   } catch (error: any) {
