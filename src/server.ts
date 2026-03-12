@@ -540,6 +540,188 @@ app.delete('/separations/:id', authenticate, async (req, res) => {
 
 
 // ==========================================
+// ROTAS DE VIAGENS (TRAVEL ORDERS) - NOVO FLUXO
+// ==========================================
+
+// 1. Listar Viagens (Pendentes e Concluídas)
+app.get('/travel-orders', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT t.*,
+        (SELECT json_agg(json_build_object(
+          'id', ti.id,
+          'product_id', ti.product_id,
+          'quantity_out', ti.quantity_out,
+          'quantity_returned', ti.quantity_returned,
+          'status', ti.status,
+          'products', json_build_object(
+             'name', p.name,
+             'sku', p.sku,
+             'unit', p.unit
+          )
+        )) FROM travel_order_items ti
+           JOIN products p ON ti.product_id = p.id
+           WHERE ti.travel_order_id = t.id
+        ) as items
+      FROM travel_orders t
+      ORDER BY t.status ASC, t.created_at DESC
+    `);
+    // O ORDER BY traz as 'pending' primeiro, depois as mais recentes
+    res.json(rows);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Erro ao buscar viagens' });
+  }
+});
+
+// 2. Criar Nova Viagem (A Ida) - Apenas Reserva! Físico intacto.
+app.post('/travel-orders', authenticate, async (req, res) => {
+  const userId = (req as any).user.id;
+  const { technicians, city, items } = req.body;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    
+    // Insere o cabeçalho da viagem
+    const toRes = await client.query(
+      `INSERT INTO travel_orders (technicians, city, status, created_by) VALUES ($1, $2, 'pending', $3) RETURNING id`,
+      [technicians, city, userId]
+    );
+    const travelOrderId = toRes.rows[0].id;
+
+    for (const item of items) {
+      // 1. Salva o item na viagem
+      await client.query(
+        `INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3)`,
+        [travelOrderId, item.product_id, item.quantity]
+      );
+      
+      // 2. A MÁGICA: Aumenta o 'quantity_reserved' (Isso bloqueia o disponível, mas mantém o físico intacto)
+      await client.query(
+        `UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2`,
+        [item.quantity, item.product_id]
+      );
+    }
+    
+    await createLog(userId, 'CREATE_TRAVEL_ORDER', { travelOrderId, technicians, city }, req.ip || '127.0.0.1');
+    await client.query('COMMIT');
+    
+    if ((req as any).io) {
+      (req as any).io.emit('travel_orders_update');
+      (req as any).io.emit('stock_updated'); // Emite pra tabela de estoque atualizar na hora
+    }
+    
+    res.status(201).json({ id: travelOrderId, success: true });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { 
+    client.release(); 
+  }
+});
+
+// 3. Fazer o Confronto (A Volta) - Limpa Reserva e Baixa o Físico do que faltou
+app.post('/travel-orders/:id/reconcile', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const { returnedItems } = req.body; // Array esperado do Front: { product_id, returnedQuantity }
+  const userId = (req as any).user.id;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Valida o status da Viagem (FOR UPDATE bloqueia a linha no NeonDB para evitar duplo clique)
+    const toCheck = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
+    if (toCheck.rows.length === 0) throw new Error('Viagem não encontrada.');
+    if (toCheck.rows[0].status === 'reconciled') throw new Error('Esta viagem já passou por acerto.');
+
+    // Busca o que levaram originalmente
+    const currentItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
+    const currentItems = currentItemsRes.rows;
+
+    const returnedMap = new Map(returnedItems.map((i: any) => [i.product_id, i]));
+
+    for (const oldItem of currentItems) {
+      const returnedData: any = returnedMap.get(oldItem.product_id);
+      const returnedQty = returnedData ? Number(returnedData.returnedQuantity) : 0;
+      const qtyOut = Number(oldItem.quantity_out);
+      const missing = qtyOut - returnedQty; // Se levou 5 e voltou 2, missing = 3.
+
+      // Define se fechou (ok), faltou (missing) ou sobrou (extra)
+      let itemStatus = 'ok';
+      if (missing > 0) itemStatus = 'missing';
+      if (missing < 0) itemStatus = 'extra';
+
+      // 1. Atualiza a tabela da viagem com o que voltou
+      await client.query(
+        `UPDATE travel_order_items SET quantity_returned = $1, status = $2 WHERE id = $3`,
+        [returnedQty, itemStatus, oldItem.id]
+      );
+
+      // 2. LÓGICA DE ESTOQUE (A Volta)
+      // Primeiro: Limpamos TODA a reserva que foi feita na Ida para este item
+      await client.query(
+        `UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`,
+        [qtyOut, oldItem.product_id]
+      );
+
+      // 3. O que faltou (foi consumido na obra)? Damos baixa definitiva do FÍSICO!
+      if (missing > 0) {
+          await client.query(
+            `UPDATE stock SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1) WHERE product_id = $2`,
+            [missing, oldItem.product_id]
+          );
+      }
+      
+      // 4. Se ele trouxe MAIS do que levou (Extra/Sobra que achou na mala do carro), adicionamos ao físico
+      if (missing < 0) {
+          const extra = Math.abs(missing);
+          await client.query(
+            `UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`,
+            [extra, oldItem.product_id]
+          );
+      }
+    }
+
+    // 5. Lida com itens NOVOS que os técnicos trouxeram mas que NEM estavam na lista de saída
+    for (const retItem of returnedItems) {
+        const wasInOriginal = currentItems.some(old => old.product_id === retItem.product_id);
+        if (!wasInOriginal && retItem.returnedQuantity > 0) {
+            // Insere na viagem como um item 'extra'
+            await client.query(
+              `INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out, quantity_returned, status) VALUES ($1, $2, 0, $3, 'extra')`,
+              [id, retItem.product_id, retItem.returnedQuantity]
+            );
+            // Adiciona ao estoque físico
+            await client.query(
+              `UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`,
+              [retItem.returnedQuantity, retItem.product_id]
+            );
+        }
+    }
+
+    // Finaliza a viagem
+    await client.query(`UPDATE travel_orders SET status = 'reconciled', updated_at = NOW() WHERE id = $1`, [id]);
+    await createLog(userId, 'RECONCILE_TRAVEL_ORDER', { travelOrderId: id }, req.ip || '127.0.0.1');
+
+    await client.query('COMMIT');
+    
+    if ((req as any).io) {
+      (req as any).io.emit('travel_orders_update');
+      (req as any).io.emit('stock_updated'); // Atualiza a tabela de estoque em tempo real para todos!
+    }
+
+    res.json({ success: true });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally { 
+    client.release(); 
+  }
+});
+
+
+// ==========================================
 // OUTRAS ROTAS (EXISTENTES)
 // ==========================================
 
@@ -1342,7 +1524,7 @@ app.post('/manual-entry', authenticate, async (req, res) => {
   const { items } = req.body;
   const client = await pool.connect();
   try {
-    if (!items || !Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "Sem itens." });
+    if (!items || !Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "Sem items." });
 
     await client.query('BEGIN');
     const logRes = await client.query("INSERT INTO xml_logs (file_name, success, total_items) VALUES ($1, $2, $3) RETURNING id", [`Entrada Manual - ${new Date().toLocaleDateString('pt-BR')}`, true, items.length]);
@@ -1359,11 +1541,10 @@ app.post('/manual-entry', authenticate, async (req, res) => {
         (req as any).io.to('compras').emit('new_request_notification', {
             message: '📦 Nova entrada de mercadoria registrada!',
             action: 'Ver Estoque',
-            type: 'entrada' // Importante para o frontend filtrar duplicados
+            type: 'entrada' 
         });
     }
 
-    // Aciona a notificação PUSH
     sendPushNotificationToRole(
       'compras', 
       'Nova Entrada de Estoque', 
