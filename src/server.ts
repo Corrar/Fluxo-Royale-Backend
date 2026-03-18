@@ -720,6 +720,150 @@ app.post('/travel-orders/:id/reconcile', authenticate, async (req, res) => {
   }
 });
 
+// 4. Editar Viagem (Apenas Pendentes)
+app.put('/travel-orders/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const { technicians, city, items } = req.body;
+  const userId = (req as any).user.id;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const orderRes = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
+    if (orderRes.rows.length === 0) throw new Error('Viagem não encontrada.');
+    if (orderRes.rows[0].status === 'reconciled') throw new Error('Não é possível editar uma viagem já concluída.');
+
+    // Atualiza cabeçalho
+    await client.query(
+      'UPDATE travel_orders SET technicians = $1, city = $2 WHERE id = $3',
+      [technicians, city, id]
+    );
+
+    // Busca itens antigos
+    const oldItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
+    const oldItems = oldItemsRes.rows;
+    const newItemsMap = new Map(items.map((i: any) => [i.product_id, i]));
+
+    // Sincroniza e ajusta reserva no estoque
+    for (const oldItem of oldItems) {
+      if (!newItemsMap.has(oldItem.product_id)) {
+        // Se o item foi removido do carrinho: libera a reserva
+        await client.query(
+          'UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2',
+          [oldItem.quantity_out, oldItem.product_id]
+        );
+        await client.query('DELETE FROM travel_order_items WHERE id = $1', [oldItem.id]);
+      } else {
+        // Se o item continua: ajusta a diferença de quantidade
+        const newItem: any = newItemsMap.get(oldItem.product_id);
+        const diff = Number(newItem.quantity) - Number(oldItem.quantity_out);
+        if (diff !== 0) {
+           await client.query(
+             'UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2',
+             [diff, oldItem.product_id]
+           );
+           await client.query(
+             'UPDATE travel_order_items SET quantity_out = $1 WHERE id = $2',
+             [newItem.quantity, oldItem.id]
+           );
+        }
+      }
+    }
+
+    // Insere itens que foram adicionados como novos na edição
+    for (const item of items) {
+      const exists = oldItems.some(old => old.product_id === item.product_id);
+      if (!exists) {
+        await client.query(
+          'INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3)',
+          [id, item.product_id, item.quantity]
+        );
+        await client.query(
+          'UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2',
+          [item.quantity, item.product_id]
+        );
+      }
+    }
+
+    await createLog(userId, 'EDIT_TRAVEL_ORDER', { travelOrderId: id }, req.ip || '127.0.0.1');
+    await client.query('COMMIT');
+
+    if ((req as any).io) {
+      (req as any).io.emit('travel_orders_update');
+      (req as any).io.emit('stock_updated');
+    }
+
+    res.json({ success: true });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// 5. Excluir Viagem (Pendente ou Concluída)
+app.delete('/travel-orders/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const userId = (req as any).user.id;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Busca informações da viagem e bloqueia a linha
+    const orderRes = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
+    if (orderRes.rows.length === 0) throw new Error('Viagem não encontrada.');
+    const status = orderRes.rows[0].status;
+
+    // Busca os itens da viagem
+    const itemsRes = await client.query('SELECT product_id, quantity_out, quantity_returned FROM travel_order_items WHERE travel_order_id = $1', [id]);
+    const items = itemsRes.rows;
+
+    // Reverte o estoque baseado no status da viagem
+    for (const item of items) {
+      const qtyOut = Number(item.quantity_out || 0);
+      const qtyRet = Number(item.quantity_returned || 0);
+
+      if (status === 'pending') {
+        // Viagem em andamento: apenas libertamos o estoque que estava reservado
+        await client.query(
+          `UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`,
+          [qtyOut, item.product_id]
+        );
+      } else if (status === 'reconciled') {
+        // Viagem concluída: a reserva já tinha sido limpa, mas o físico (quantity_on_hand) foi alterado!
+        // A lógica de reversão perfeita: Adicionamos o que levou, e retiramos o que retornou.
+        await client.query(
+          `UPDATE stock SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1 + $2) WHERE product_id = $3`,
+          [qtyRet, qtyOut, item.product_id]
+        );
+      }
+    }
+
+    // Finalmente, apaga os itens e o registo da viagem
+    await client.query('DELETE FROM travel_order_items WHERE travel_order_id = $1', [id]);
+    await client.query('DELETE FROM travel_orders WHERE id = $1', [id]);
+
+    await createLog(userId, 'DELETE_TRAVEL_ORDER', { travelOrderId: id, status }, req.ip || '127.0.0.1');
+    await client.query('COMMIT');
+
+    // Emite o aviso para todos atualizarem os ecrãs
+    if ((req as any).io) {
+      (req as any).io.emit('travel_orders_update');
+      (req as any).io.emit('stock_updated');
+    }
+
+    res.json({ success: true });
+  } catch (err: any) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 
 // ==========================================
 // OUTRAS ROTAS (EXISTENTES)
@@ -747,7 +891,7 @@ app.post('/notifications/subscribe', authenticate, async (req, res) => {
 
 // HEARTBEAT
 app.put('/users/:id/heartbeat', authenticate, async (req, res) => {
-  const { id } = req.params;
+  const { id } = params;
   try { 
     await pool.query(`
       UPDATE users 
