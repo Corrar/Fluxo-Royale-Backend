@@ -891,7 +891,7 @@ app.post('/notifications/subscribe', authenticate, async (req, res) => {
 
 // HEARTBEAT
 app.put('/users/:id/heartbeat', authenticate, async (req, res) => {
-  const { id } = params;
+  const { id } = req.params;
   try { 
     await pool.query(`
       UPDATE users 
