@@ -2027,6 +2027,65 @@ app.get('/dashboard/stats', authenticate, async (req, res) => {
   }
 });
 
+// ==========================================
+// EXTRATO UNIFICADO (RECENT TRANSACTIONS)
+// ==========================================
+app.get('/transactions/recent', authenticate, async (req, res) => {
+  try {
+    // Usamos UNION ALL para juntar Entradas, Saídas e Solicitações numa única lista cronológica
+    const query = `
+      -- 1. ENTRADAS (Compras/Manuais)
+      SELECT 
+        xi.id::text as id, 
+        'in' as type, 
+        p.name as product_name, 
+        xi.quantity as amount, 
+        xi.created_at 
+      FROM xml_items xi
+      JOIN products p ON xi.product_id = p.id
+
+      UNION ALL
+
+      -- 2. SAÍDAS (Ordens de Produção e Saídas Manuais)
+      SELECT 
+        si.id::text as id, 
+        'out' as type, 
+        p.name as product_name, 
+        si.quantity as amount, 
+        s.created_at 
+      FROM separation_items si
+      JOIN separations s ON si.separation_id = s.id
+      JOIN products p ON si.product_id = p.id
+      WHERE s.status = 'concluida'
+
+      UNION ALL
+
+      -- 3. SAÍDAS (Solicitações dos Setores Aprovadas/Entregues)
+      SELECT 
+        ri.id::text as id, 
+        'out' as type, 
+        COALESCE(p.name, ri.custom_product_name) as product_name, 
+        ri.quantity_requested as amount, 
+        r.created_at 
+      FROM request_items ri
+      JOIN requests r ON ri.request_id = r.id
+      LEFT JOIN products p ON ri.product_id = p.id
+      WHERE r.status IN ('aprovado', 'entregue')
+
+      -- Ordena tudo do mais recente para o mais antigo e limita aos últimos 15
+      ORDER BY created_at DESC
+      LIMIT 15;
+    `;
+
+    const { rows } = await pool.query(query);
+    res.json(rows);
+
+  } catch (error: any) {
+    console.error("Erro ao buscar transações recentes:", error);
+    res.status(500).json({ error: 'Erro ao buscar extrato' });
+  }
+});
+
 app.get('/reports/available-dates', authenticate, async (req, res) => {
   try {
     const result = await pool.query(`SELECT MIN(data) as min_date, MAX(data) as max_date FROM (SELECT created_at as data FROM xml_items UNION ALL SELECT created_at as data FROM separations WHERE status = 'concluida' UNION ALL SELECT created_at as data FROM requests WHERE status IN ('aprovado', 'entregue')) as all_dates`);
