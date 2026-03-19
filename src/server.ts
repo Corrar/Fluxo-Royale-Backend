@@ -1597,22 +1597,65 @@ app.delete('/eletrica-tasks/:id', authenticate, async (req, res) => {
 app.get('/stock', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT s.*, json_build_object(
-        'id', p.id, 
-        'name', p.name, 
-        'sku', p.sku, 
-        'unit', p.unit, 
-        'min_stock', p.min_stock, 
-        'unit_price', p.unit_price, 
-        'sales_price', p.sales_price,
-        'tags', p.tags
-      ) as products 
-      FROM stock s JOIN products p ON s.product_id = p.id 
+      SELECT s.*, 
+        json_build_object(
+          'id', p.id, 
+          'name', p.name, 
+          'sku', p.sku, 
+          'unit', p.unit, 
+          'min_stock', p.min_stock, 
+          'unit_price', p.unit_price, 
+          'sales_price', p.sales_price,
+          'tags', p.tags
+        ) as products,
+        (
+          -- Subquery para rastrear pedidos (requests) que seguram este produto
+          SELECT COALESCE(json_agg(json_build_object(
+            'request_id', r.id,
+            'sector', COALESCE(pf.sector, r.sector),
+            'quantity', ri.quantity_requested
+          )), '[]'::json)
+          FROM request_items ri
+          JOIN requests r ON ri.request_id = r.id
+          LEFT JOIN profiles pf ON r.requester_id = pf.id
+          WHERE ri.product_id = s.product_id 
+            AND r.status IN ('aberto', 'aprovado')
+        ) as active_reservations
+      FROM stock s 
+      JOIN products p ON s.product_id = p.id 
       WHERE p.active = true
       ORDER BY s.created_at DESC
     `);
+    
+    // Processamento extra caso haja reservas também em "travel_orders" (Viagens Pendentes)
+    // Para manter a subquery acima rápida, fazemos este append no JS (se tiver viagens)
+    const travelRes = await pool.query(`
+       SELECT ti.product_id, t.id as request_id, t.city as sector, ti.quantity_out as quantity
+       FROM travel_order_items ti
+       JOIN travel_orders t ON ti.travel_order_id = t.id
+       WHERE t.status = 'pending'
+    `);
+    
+    if (travelRes.rows.length > 0) {
+       rows.forEach(stockItem => {
+          const tripsHoldingThisItem = travelRes.rows.filter(tr => tr.product_id === stockItem.product_id);
+          if (tripsHoldingThisItem.length > 0) {
+             // Anexa as viagens pendentes à lista de reservas ativas
+             stockItem.active_reservations = [
+               ...stockItem.active_reservations, 
+               ...tripsHoldingThisItem.map(tr => ({
+                 request_id: `Viagem #${tr.request_id}`, // Identificador visual
+                 sector: `Viagem: ${tr.sector}`,
+                 quantity: tr.quantity
+               }))
+             ];
+          }
+       });
+    }
+
     res.json(rows);
   } catch (error: any) {
+    console.error("Erro no rastreio de estoque:", error);
     res.status(500).json({ error: 'Erro ao buscar estoque' });
   }
 });
@@ -1620,7 +1663,7 @@ app.get('/stock', authenticate, async (req, res) => {
 app.put('/stock/:id', authenticate, async (req, res) => {
   const userId = (req as any).user.id;
   const { id } = req.params;
-  const { quantity_on_hand } = req.body;
+  const { quantity_on_hand, quantity_reserved } = req.body;
   
   try {
     const userCheck = await pool.query('SELECT role, sector FROM profiles WHERE id = $1', [userId]);
@@ -1645,16 +1688,37 @@ app.put('/stock/:id', authenticate, async (req, res) => {
        }
     }
 
-    const oldStock = await pool.query('SELECT quantity_on_hand, product_id FROM stock WHERE id = $1', [id]);
-    await pool.query('UPDATE stock SET quantity_on_hand = $1 WHERE id = $2', [quantity_on_hand, id]);
+    const oldStock = await pool.query('SELECT quantity_on_hand, quantity_reserved, product_id FROM stock WHERE id = $1', [id]);
     
-    if (oldStock.rows.length > 0) {
-       await createLog(userId, 'UPDATE_STOCK', { 
-         stock_id: id, 
-         product_id: oldStock.rows[0].product_id,
-         old_qty: oldStock.rows[0].quantity_on_hand,
-         new_qty: quantity_on_hand 
-       }, req.ip || '127.0.0.1');
+    // Monta o UPDATE dependendo se enviou físico ou reservado
+    let updateFields = [];
+    let values = [];
+    let index = 1;
+    
+    if (quantity_on_hand !== undefined) {
+      updateFields.push(`quantity_on_hand = $${index++}`);
+      values.push(quantity_on_hand);
+    }
+    
+    if (quantity_reserved !== undefined) {
+      updateFields.push(`quantity_reserved = $${index++}`);
+      values.push(quantity_reserved);
+    }
+    
+    if (updateFields.length > 0) {
+      values.push(id);
+      await pool.query(`UPDATE stock SET ${updateFields.join(', ')} WHERE id = $${index}`, values);
+      
+      if (oldStock.rows.length > 0) {
+         await createLog(userId, 'UPDATE_STOCK', { 
+           stock_id: id, 
+           product_id: oldStock.rows[0].product_id,
+           old_qty: oldStock.rows[0].quantity_on_hand,
+           new_qty: quantity_on_hand,
+           old_reserved: oldStock.rows[0].quantity_reserved,
+           new_reserved: quantity_reserved
+         }, req.ip || '127.0.0.1');
+      }
     }
 
     res.json({ success: true });
