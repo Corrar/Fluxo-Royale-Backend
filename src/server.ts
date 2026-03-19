@@ -1691,8 +1691,8 @@ app.put('/stock/:id', authenticate, async (req, res) => {
     const oldStock = await pool.query('SELECT quantity_on_hand, quantity_reserved, product_id FROM stock WHERE id = $1', [id]);
     
     // Monta o UPDATE dependendo se enviou físico ou reservado
-    let updateFields = [];
-    let values = [];
+    let updateFields: string[] = [];
+    let values: any[] = [];
     let index = 1;
     
     if (quantity_on_hand !== undefined) {
