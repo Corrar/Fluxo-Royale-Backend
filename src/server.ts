@@ -402,6 +402,7 @@ app.put('/separations/:id', authenticate, async (req, res) => {
   }
 });
 
+
 // 3. Autorizar/Processar (Reserva e Entrega)
 app.put('/separations/:id/authorize', authenticate, async (req, res) => {
   const { id } = req.params;
@@ -1122,9 +1123,12 @@ app.delete('/users/:id', authenticate, async (req, res) => {
   }
 });
 
-// --- PRODUTOS ---
+// ==========================================
+// 🚀 ROTA /PRODUCTS (OTIMIZADA - FIM DO THUNDERING HERD)
+// ==========================================
 app.get('/products', authenticate, async (req, res) => {
   try {
+    // A query agora é O(1) e tira a carga massiva do banco de dados!
     const { rows } = await pool.query(`
       SELECT 
         p.id,
@@ -1139,13 +1143,7 @@ app.get('/products', authenticate, async (req, res) => {
         p.active,
         json_build_object(
           'quantity_on_hand', COALESCE(s.quantity_on_hand, 0),
-          'quantity_reserved', COALESCE(s.quantity_reserved, 0),
-          'quantity_open', (
-             SELECT COALESCE(SUM(ri.quantity_requested), 0)
-             FROM request_items ri
-             JOIN requests r ON ri.request_id = r.id
-             WHERE ri.product_id = p.id AND r.status = 'aberto'
-          )
+          'quantity_reserved', COALESCE(s.quantity_reserved, 0)
         ) as stock
       FROM products p
       LEFT JOIN stock s ON p.id = s.product_id
@@ -1452,21 +1450,17 @@ app.delete('/tasks/:id', authenticate, async (req, res) => {
 // ROTAS: QUADRO DE TAREFAS - ELÉTRICA
 // ==========================================
 
-// Função auxiliar para validar permissão da Elétrica via RBAC ou Setor
 const checkEletricaPermission = async (userId: string) => {
   const { rows } = await pool.query('SELECT role, sector FROM profiles WHERE id = $1', [userId]);
   const user = rows[0];
 
   if (!user) return false;
   
-  // 1. Se for admin, passe livre!
   if (user.role === 'admin') return true;
 
-  // 2. Se for especificamente do setor de elétrica, passe livre!
   const sector = user.sector?.toLowerCase();
   if (sector === 'elétrica' || sector === 'eletrica') return true;
   
-  // 3. Se for outro cargo/setor, verifica se tem a permissão RBAC explícita (ex: Gerentes)
   const permCheck = await pool.query(
     'SELECT 1 FROM role_permissions WHERE role = $1 AND page_key = $2', 
     [user.role, 'tarefas_eletrica']
@@ -1608,7 +1602,6 @@ app.get('/stock', authenticate, async (req, res) => {
           'tags', p.tags
         ) as products,
         (
-          -- Subquery para rastrear pedidos (requests) que seguram este produto
           SELECT COALESCE(json_agg(json_build_object(
             'request_id', r.id,
             'sector', COALESCE(pf.sector, r.sector),
@@ -1626,8 +1619,6 @@ app.get('/stock', authenticate, async (req, res) => {
       ORDER BY s.created_at DESC
     `);
     
-    // Processamento extra caso haja reservas também em "travel_orders" (Viagens Pendentes)
-    // Para manter a subquery acima rápida, fazemos este append no JS (se tiver viagens)
     const travelRes = await pool.query(`
        SELECT ti.product_id, t.id as request_id, t.city as sector, ti.quantity_out as quantity
        FROM travel_order_items ti
@@ -1639,11 +1630,10 @@ app.get('/stock', authenticate, async (req, res) => {
        rows.forEach(stockItem => {
           const tripsHoldingThisItem = travelRes.rows.filter(tr => tr.product_id === stockItem.product_id);
           if (tripsHoldingThisItem.length > 0) {
-             // Anexa as viagens pendentes à lista de reservas ativas
              stockItem.active_reservations = [
                ...stockItem.active_reservations, 
                ...tripsHoldingThisItem.map(tr => ({
-                 request_id: `Viagem #${tr.request_id}`, // Identificador visual
+                 request_id: `Viagem #${tr.request_id}`, 
                  sector: `Viagem: ${tr.sector}`,
                  quantity: tr.quantity
                }))
@@ -1689,7 +1679,6 @@ app.put('/stock/:id', authenticate, async (req, res) => {
 
     const oldStock = await pool.query('SELECT quantity_on_hand, quantity_reserved, product_id FROM stock WHERE id = $1', [id]);
     
-    // Monta o UPDATE dependendo se enviou físico ou reservado
     let updateFields: string[] = [];
     let values: any[] = [];
     let index = 1;
@@ -1824,7 +1813,7 @@ app.get('/my-requests', authenticate, async (req, res) => {
 });
 
 // ==========================================
-// ROTA MODIFICADA: CRIAR SOLICITAÇÃO (RESERVA IMEDIATA)
+// ROTA: CRIAR SOLICITAÇÃO (RESERVA IMEDIATA)
 // ==========================================
 app.post('/requests', authenticate, async (req, res) => {
   const userId = (req as any).user.id;
@@ -1847,7 +1836,6 @@ app.post('/requests', authenticate, async (req, res) => {
       
       // RESERVA IMEDIATA DE ESTOQUE
       if (productId) {
-        // Bloqueia a linha da tabela para evitar Duplos Cliques/Concorrência (FOR UPDATE)
         const stockCheck = await client.query(
           'SELECT (quantity_on_hand - quantity_reserved) as available FROM stock WHERE product_id = $1 FOR UPDATE', 
           [productId]
@@ -1858,7 +1846,6 @@ app.post('/requests', authenticate, async (req, res) => {
            throw new Error(`Estoque disponível insuficiente para o produto ID: ${productId}`);
         }
 
-        // Aumenta os Reservados. NÃO toca nos físicos!
         await client.query(`
           UPDATE stock 
           SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1
@@ -1874,7 +1861,6 @@ app.post('/requests', authenticate, async (req, res) => {
     
     await client.query('COMMIT');
 
-    // Busca o Request Completo para enviar no Socket e a Tela do Almoxarife piscar sem reload
     const fullReqQuery = `
       SELECT r.*, json_build_object('name', p.name, 'sector', p.sector) as requester,
       (SELECT json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'custom_product_name', ri.custom_product_name, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END))
@@ -1893,9 +1879,9 @@ app.post('/requests', authenticate, async (req, res) => {
             id: requestId
         });
         
-        (req as any).io.to('almoxarife').emit('new_request', fullRequest); // Injeta o Card no Almoxarife
-        (req as any).io.emit('refresh_requests'); // Atualiza os históricos
-        (req as any).io.emit('refresh_stock'); // Diminui o disponível na tela de quem estiver com app aberto
+        (req as any).io.to('almoxarife').emit('new_request', fullRequest);
+        (req as any).io.emit('refresh_requests');
+        (req as any).io.emit('refresh_stock');
     }
 
     sendPushNotificationToRole(
@@ -1914,9 +1900,8 @@ app.post('/requests', authenticate, async (req, res) => {
   }
 });
 
-
 // ==========================================
-// ROTA MODIFICADA: ATUALIZAR STATUS DE SOLICITAÇÃO (ACERTO DE ESTOQUE)
+// ROTA: ATUALIZAR STATUS DE SOLICITAÇÃO (ACERTO DE ESTOQUE)
 // ==========================================
 app.put('/requests/:id/status', authenticate, async (req, res) => {
   const { id } = req.params;
@@ -1926,7 +1911,6 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    // Busca status atual com bloqueio FOR UPDATE
     const currentRes = await client.query('SELECT status FROM requests WHERE id = $1 FOR UPDATE', [id]);
     const currentStatus = currentRes.rows[0]?.status;
 
@@ -1935,10 +1919,6 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
     const itemsRes = await client.query('SELECT product_id, quantity_requested FROM request_items WHERE request_id = $1', [id]);
     const items = itemsRes.rows;
 
-    // Lógica de Abate ou Liberação baseada no status:
-    
-    // 1. SE FOI ENTREGUE (O Almoxarife despachou a mercadoria)
-    // -> O produto sai da Reserva e Sai do Físico
     if (status === 'entregue' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
       for (const item of items) {
         if (item.product_id) {
@@ -1951,8 +1931,6 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
         }
       }
     }
-    // 2. SE FOI REJEITADO
-    // -> O produto volta para a prateleira virtual (Sai da Reserva)
     else if (status === 'rejeitado' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
       for (const item of items) {
         if (item.product_id) {
@@ -1964,13 +1942,11 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
         }
       }
     }
-    // 3. Se foi 'Aprovado' (Apenas mudo o status visual, o estoque já está reservado)
 
     await client.query('UPDATE requests SET status = $1, rejection_reason = $2 WHERE id = $3', [status, rejection_reason || null, id]);
     
     await client.query('COMMIT');
 
-    // Avisa todos para atualizar a tela
     if ((req as any).io) {
         (req as any).io.emit('refresh_requests');
         (req as any).io.emit('refresh_stock');
@@ -1986,9 +1962,8 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
   }
 });
 
-
 // ==========================================
-// ROTA MODIFICADA: EXCLUIR SOLICITAÇÃO
+// ROTA: EXCLUIR SOLICITAÇÃO
 // ==========================================
 app.delete('/requests/:id', authenticate, async (req, res) => {
   const { id } = req.params;
@@ -2006,7 +1981,6 @@ app.delete('/requests/:id', authenticate, async (req, res) => {
 
     const { status } = reqRes.rows[0];
 
-    // Se o pedido ainda não foi entregue, precisamos devolver o stock reservado.
     if (status === 'aberto' || status === 'aprovado') {
        const itemsRes = await client.query('SELECT product_id, quantity_requested FROM request_items WHERE request_id = $1', [id]);
        const items = itemsRes.rows;
