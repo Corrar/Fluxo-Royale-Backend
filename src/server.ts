@@ -1870,7 +1870,7 @@ app.post('/requests', authenticate, async (req, res) => {
         FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items
       FROM requests r LEFT JOIN profiles p ON r.requester_id = p.id WHERE r.id = $1
     `;
-    const { rows: fullReqRows } = await pool.query(fullReqQuery, [requestId]);
+    const { rows: fullReqRows } = await client.query(fullReqQuery, [requestId]);
     const fullRequest = fullReqRows[0];
 
     // TEMPO REAL E DEDUPLICAÇÃO
@@ -1887,7 +1887,7 @@ app.post('/requests', authenticate, async (req, res) => {
         // Envia para o array de roles ao mesmo tempo
         (req as any).io.to(['almoxarife', 'admin']).emit('new_request_notification', notificationData);
         (req as any).io.to(['almoxarife', 'admin']).emit('new_request', fullRequest);
-        (req as any).io.emit('refresh_requests');
+        // (req as any).io.emit('refresh_requests'); // <-- EFEITO MANADA REMOVIDO!
         (req as any).io.emit('refresh_stock');
     }
 
