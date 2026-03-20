@@ -86,7 +86,7 @@ io.on('connection', (socket) => {
 });
 
 // --- FUNÇÃO AUXILIAR: ENVIAR PUSH NOTIFICATION ---
-const sendPushNotificationToRole = async (role: string, title: string, message: string, url: string = '/requests') => {
+const sendPushNotificationToRole = async (role: string, title: string, message: string, url: string = '/requests', uniqueId?: string) => {
   try {
     let query = `
       SELECT ps.subscription 
@@ -121,12 +121,15 @@ const sendPushNotificationToRole = async (role: string, title: string, message: 
     
     console.log(`📡 Enviando Push para ${rows.length} dispositivos (${role})...`);
 
+    // 🔥 Adicionado o uniqueId para garantir a deduplicação de alertas
+    const notificationTag = uniqueId ? `fluxo-alert-${uniqueId}` : `fluxo-alert-${Date.now()}`;
+
     const payload = JSON.stringify({
       title: title,
       body: message,
       url: url,
       icon: '/favicon.png',
-      tag: 'fluxo-alert-requests', 
+      tag: notificationTag, 
       renotify: true,
       priority: 'high'
     });
@@ -1870,16 +1873,20 @@ app.post('/requests', authenticate, async (req, res) => {
     const { rows: fullReqRows } = await pool.query(fullReqQuery, [requestId]);
     const fullRequest = fullReqRows[0];
 
-    // TEMPO REAL
+    // TEMPO REAL E DEDUPLICAÇÃO
+    const uniqueNotificationId = `req-${requestId}-${Date.now()}`;
+
     if ((req as any).io) {
-        (req as any).io.to('almoxarife').emit('new_request_notification', {
+        const notificationData = {
+            id: uniqueNotificationId,
             message: `📢 Nova solicitação do setor: ${sector}`,
             action: 'Ver Pedidos',
-            type: 'solicitacao',
-            id: requestId
-        });
-        
-        (req as any).io.to('almoxarife').emit('new_request', fullRequest);
+            type: 'solicitacao'
+        };
+
+        // Envia para o array de roles ao mesmo tempo
+        (req as any).io.to(['almoxarife', 'admin']).emit('new_request_notification', notificationData);
+        (req as any).io.to(['almoxarife', 'admin']).emit('new_request', fullRequest);
         (req as any).io.emit('refresh_requests');
         (req as any).io.emit('refresh_stock');
     }
@@ -1887,7 +1894,9 @@ app.post('/requests', authenticate, async (req, res) => {
     sendPushNotificationToRole(
       'almoxarife', 
       'Nova Solicitação!', 
-      `O setor ${sector} fez um novo pedido.`
+      `O setor ${sector} fez um novo pedido.`,
+      '/requests',
+      uniqueNotificationId
     );
     
     res.status(201).json({ success: true, id: requestId });
