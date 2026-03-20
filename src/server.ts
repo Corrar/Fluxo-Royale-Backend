@@ -402,7 +402,6 @@ app.put('/separations/:id', authenticate, async (req, res) => {
   }
 });
 
-
 // 3. Autorizar/Processar (Reserva e Entrega)
 app.put('/separations/:id/authorize', authenticate, async (req, res) => {
   const { id } = req.params;
@@ -1824,6 +1823,9 @@ app.get('/my-requests', authenticate, async (req, res) => {
   }
 });
 
+// ==========================================
+// ROTA MODIFICADA: CRIAR SOLICITAÇÃO (RESERVA IMEDIATA)
+// ==========================================
 app.post('/requests', authenticate, async (req, res) => {
   const userId = (req as any).user.id;
   const { sector, items } = req.body;
@@ -1843,17 +1845,57 @@ app.post('/requests', authenticate, async (req, res) => {
       const productId = isCustom ? null : item.product_id;
       const customName = isCustom ? item.custom_name : null;
       
-      await client.query('INSERT INTO request_items (request_id, product_id, custom_product_name, quantity_requested) VALUES ($1, $2, $3, $4)', [requestId, productId, customName, item.quantity]);
+      // RESERVA IMEDIATA DE ESTOQUE
+      if (productId) {
+        // Bloqueia a linha da tabela para evitar Duplos Cliques/Concorrência (FOR UPDATE)
+        const stockCheck = await client.query(
+          'SELECT (quantity_on_hand - quantity_reserved) as available FROM stock WHERE product_id = $1 FOR UPDATE', 
+          [productId]
+        );
+        const available = parseFloat(stockCheck.rows[0]?.available || 0);
+        
+        if (available < item.quantity) {
+           throw new Error(`Estoque disponível insuficiente para o produto ID: ${productId}`);
+        }
+
+        // Aumenta os Reservados. NÃO toca nos físicos!
+        await client.query(`
+          UPDATE stock 
+          SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1
+          WHERE product_id = $2
+        `, [item.quantity, productId]);
+      }
+
+      await client.query(
+        'INSERT INTO request_items (request_id, product_id, custom_product_name, quantity_requested) VALUES ($1, $2, $3, $4)', 
+        [requestId, productId, customName, item.quantity]
+      );
     }
     
     await client.query('COMMIT');
 
+    // Busca o Request Completo para enviar no Socket e a Tela do Almoxarife piscar sem reload
+    const fullReqQuery = `
+      SELECT r.*, json_build_object('name', p.name, 'sector', p.sector) as requester,
+      (SELECT json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'custom_product_name', ri.custom_product_name, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END))
+        FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items
+      FROM requests r LEFT JOIN profiles p ON r.requester_id = p.id WHERE r.id = $1
+    `;
+    const { rows: fullReqRows } = await pool.query(fullReqQuery, [requestId]);
+    const fullRequest = fullReqRows[0];
+
+    // TEMPO REAL
     if ((req as any).io) {
         (req as any).io.to('almoxarife').emit('new_request_notification', {
             message: `📢 Nova solicitação do setor: ${sector}`,
             action: 'Ver Pedidos',
-            type: 'solicitacao'
+            type: 'solicitacao',
+            id: requestId
         });
+        
+        (req as any).io.to('almoxarife').emit('new_request', fullRequest); // Injeta o Card no Almoxarife
+        (req as any).io.emit('refresh_requests'); // Atualiza os históricos
+        (req as any).io.emit('refresh_stock'); // Diminui o disponível na tela de quem estiver com app aberto
     }
 
     sendPushNotificationToRole(
@@ -1862,15 +1904,20 @@ app.post('/requests', authenticate, async (req, res) => {
       `O setor ${sector} fez um novo pedido.`
     );
     
-    res.status(201).json({ success: true });
+    res.status(201).json({ success: true, id: requestId });
   } catch (error: any) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: `Erro Técnico: ${error.message}` }); 
+    const statusCode = error.message.includes('Estoque disponível insuficiente') ? 400 : 500;
+    res.status(statusCode).json({ error: `Erro Técnico: ${error.message}` }); 
   } finally {
     client.release();
   }
 });
 
+
+// ==========================================
+// ROTA MODIFICADA: ATUALIZAR STATUS DE SOLICITAÇÃO (ACERTO DE ESTOQUE)
+// ==========================================
 app.put('/requests/:id/status', authenticate, async (req, res) => {
   const { id } = req.params;
   const { status, rejection_reason } = req.body;
@@ -1879,7 +1926,8 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    const currentRes = await client.query('SELECT status FROM requests WHERE id = $1', [id]);
+    // Busca status atual com bloqueio FOR UPDATE
+    const currentRes = await client.query('SELECT status FROM requests WHERE id = $1 FOR UPDATE', [id]);
     const currentStatus = currentRes.rows[0]?.status;
 
     if (!currentStatus) throw new Error("Solicitação não encontrada");
@@ -1887,25 +1935,11 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
     const itemsRes = await client.query('SELECT product_id, quantity_requested FROM request_items WHERE request_id = $1', [id]);
     const items = itemsRes.rows;
 
-    if (status === 'aprovado' && currentStatus === 'aberto') {
-      for (const item of items) {
-        if (item.product_id) {
-          const stockCheck = await client.query('SELECT (quantity_on_hand - quantity_reserved) as available FROM stock WHERE product_id = $1', [item.product_id]);
-          const available = parseFloat(stockCheck.rows[0]?.available || 0);
-          
-          if (available < item.quantity_requested) {
-             throw new Error(`Estoque disponível insuficiente para o produto ID: ${item.product_id}`);
-          }
-
-          await client.query(`
-            UPDATE stock 
-            SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1
-            WHERE product_id = $2
-          `, [item.quantity_requested, item.product_id]);
-        }
-      }
-    }
-    else if (status === 'entregue' && currentStatus === 'aprovado') {
+    // Lógica de Abate ou Liberação baseada no status:
+    
+    // 1. SE FOI ENTREGUE (O Almoxarife despachou a mercadoria)
+    // -> O produto sai da Reserva e Sai do Físico
+    if (status === 'entregue' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
       for (const item of items) {
         if (item.product_id) {
           await client.query(`
@@ -1917,18 +1951,9 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
         }
       }
     }
-    else if (status === 'entregue' && currentStatus === 'aberto') {
-      for (const item of items) {
-        if (item.product_id) {
-           await client.query(`
-             UPDATE stock 
-             SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1)
-             WHERE product_id = $2
-           `, [item.quantity_requested, item.product_id]);
-        }
-      }
-    }
-    else if (status === 'rejeitado' && currentStatus === 'aprovado') {
+    // 2. SE FOI REJEITADO
+    // -> O produto volta para a prateleira virtual (Sai da Reserva)
+    else if (status === 'rejeitado' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
       for (const item of items) {
         if (item.product_id) {
           await client.query(`
@@ -1939,21 +1964,32 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
         }
       }
     }
+    // 3. Se foi 'Aprovado' (Apenas mudo o status visual, o estoque já está reservado)
 
     await client.query('UPDATE requests SET status = $1, rejection_reason = $2 WHERE id = $3', [status, rejection_reason || null, id]);
     
     await client.query('COMMIT');
+
+    // Avisa todos para atualizar a tela
+    if ((req as any).io) {
+        (req as any).io.emit('refresh_requests');
+        (req as any).io.emit('refresh_stock');
+    }
+
     res.json({ success: true });
 
   } catch (error: any) {
     await client.query('ROLLBACK');
-    const statusCode = error.message.includes('Estoque disponível insuficiente') ? 400 : 500;
-    res.status(statusCode).json({ error: error.message || 'Erro ao atualizar status' });
+    res.status(500).json({ error: error.message || 'Erro ao atualizar status' });
   } finally {
     client.release();
   }
 });
 
+
+// ==========================================
+// ROTA MODIFICADA: EXCLUIR SOLICITAÇÃO
+// ==========================================
 app.delete('/requests/:id', authenticate, async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
@@ -1961,7 +1997,7 @@ app.delete('/requests/:id', authenticate, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    const reqRes = await client.query('SELECT status FROM requests WHERE id = $1', [id]);
+    const reqRes = await client.query('SELECT status FROM requests WHERE id = $1 FOR UPDATE', [id]);
     
     if (reqRes.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -1970,7 +2006,8 @@ app.delete('/requests/:id', authenticate, async (req, res) => {
 
     const { status } = reqRes.rows[0];
 
-    if (status === 'aprovado') {
+    // Se o pedido ainda não foi entregue, precisamos devolver o stock reservado.
+    if (status === 'aberto' || status === 'aprovado') {
        const itemsRes = await client.query('SELECT product_id, quantity_requested FROM request_items WHERE request_id = $1', [id]);
        const items = itemsRes.rows;
 
@@ -1989,6 +2026,12 @@ app.delete('/requests/:id', authenticate, async (req, res) => {
     await client.query('DELETE FROM requests WHERE id = $1', [id]);
 
     await client.query('COMMIT');
+
+    if ((req as any).io) {
+        (req as any).io.emit('refresh_requests');
+        (req as any).io.emit('refresh_stock');
+    }
+
     res.json({ success: true });
 
   } catch (error: any) {
