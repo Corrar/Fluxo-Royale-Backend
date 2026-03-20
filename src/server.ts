@@ -154,10 +154,10 @@ const sendPushNotificationToRole = async (role: string, title: string, message: 
   }
 };
 
-// --- LOGS DE AUDITORIA ---
-const createLog = async (userId: string | null, action: string, details: object, ip: string) => {
+// 🛠️ CORREÇÃO DE DEADLOCK: O parâmetro 'dbClient' permite reutilizar a conexão da transação!
+const createLog = async (userId: string | null, action: string, details: object, ip: string, dbClient: any = pool) => {
   try {
-    const insertResult = await pool.query(
+    const insertResult = await dbClient.query(
       `INSERT INTO audit_logs (user_id, action, details, ip_address) 
         VALUES ($1, $2, $3, $4) RETURNING id`,
       [userId, action, JSON.stringify(details), ip]
@@ -180,7 +180,7 @@ const createLog = async (userId: string | null, action: string, details: object,
       WHERE a.id = $1
     `;
     
-    const fullLogResult = await pool.query(fullLogQuery, [newLogId]);
+    const fullLogResult = await dbClient.query(fullLogQuery, [newLogId]);
     const newLogData = fullLogResult.rows[0];
 
     io.to('admin').emit('new_audit_log', newLogData);
@@ -279,7 +279,6 @@ app.post('/separations', authenticate, async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    // VERIFICAÇÃO DE SEGURANÇA
     const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     const role = userCheck.rows[0]?.role;
     if (role !== 'admin' && role !== 'almoxarife') {
@@ -300,12 +299,12 @@ app.post('/separations', authenticate, async (req, res) => {
       );
     }
     
-    await createLog(userId, 'CREATE_SEPARATION', { separationId, client_name }, req.ip || '127.0.0.1');
+    await createLog(userId, 'CREATE_SEPARATION', { separationId, client_name }, req.ip || '127.0.0.1', client);
     await client.query('COMMIT');
     io.emit('separations_update');
     res.status(201).json({ success: true });
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(400).json({ error: error.message });
   } finally { client.release(); }
 });
@@ -315,20 +314,17 @@ app.put('/separations/:id', authenticate, async (req, res) => {
   const { id } = req.params;
   const userId = (req as any).user.id;
   const { production_order, client_name, destination, items } = req.body;
-
   const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
 
-    // 1. Validação de Segurança
     const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     const role = userCheck.rows[0]?.role;
     if (role !== 'admin' && role !== 'almoxarife') {
       throw new Error('Apenas almoxarife e admin podem editar pedidos.');
     }
 
-    // 2. Validação de Status
     const sepCheck = await client.query('SELECT status FROM separations WHERE id = $1', [id]);
     if (sepCheck.rows.length === 0) throw new Error('Pedido não encontrado.');
     const currentStatus = sepCheck.rows[0].status;
@@ -336,7 +332,6 @@ app.put('/separations/:id', authenticate, async (req, res) => {
       throw new Error('Apenas pedidos pendentes ou em separação podem ser editados.');
     }
 
-    // 3. Atualizar dados principais
     await client.query(
       `UPDATE separations 
        SET production_order = COALESCE($1, production_order), 
@@ -346,48 +341,37 @@ app.put('/separations/:id', authenticate, async (req, res) => {
       [production_order, client_name, destination, id]
     );
 
-    // 4. Buscar os itens que já existem
     const existingItemsRes = await client.query('SELECT id, product_id, quantity FROM separation_items WHERE separation_id = $1', [id]);
     const existingItems = existingItemsRes.rows;
-
     const newItemsMap = new Map(items.map((i: any) => [i.product_id, i]));
 
-    // 5. Sincronizar itens
     for (const oldItem of existingItems) {
       if (!newItemsMap.has(oldItem.product_id)) {
         const separatedQty = parseFloat(oldItem.quantity || 0);
         if (separatedQty > 0) {
           await client.query(
-            `UPDATE stock 
-             SET quantity_reserved = GREATEST(0, quantity_reserved - $1) 
-             WHERE product_id = $2`,
+            `UPDATE stock SET quantity_reserved = GREATEST(0, quantity_reserved - $1) WHERE product_id = $2`,
             [separatedQty, oldItem.product_id]
           );
         }
         await client.query('DELETE FROM separation_items WHERE id = $1', [oldItem.id]);
       } else {
         const newItem: any = newItemsMap.get(oldItem.product_id);
-        await client.query(
-          'UPDATE separation_items SET qty_requested = $1 WHERE id = $2',
-          [newItem.quantity, oldItem.id]
-        );
+        await client.query('UPDATE separation_items SET qty_requested = $1 WHERE id = $2', [newItem.quantity, oldItem.id]);
       }
     }
 
-    // 6. Inserir os NOVOS itens
     for (const item of items) {
       const exists = existingItems.some((old: any) => old.product_id === item.product_id);
       if (!exists) {
         await client.query(
-          `INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity) 
-           VALUES ($1, $2, $3, 0)`,
+          `INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity) VALUES ($1, $2, $3, 0)`,
           [id, item.product_id, item.quantity]
         );
       }
     }
 
-    await createLog(userId, 'EDIT_SEPARATION', { separationId: id, details: 'Itens editados via painel' }, req.ip || '127.0.0.1');
-    
+    await createLog(userId, 'EDIT_SEPARATION', { separationId: id, details: 'Itens editados via painel' }, req.ip || '127.0.0.1', client);
     await client.query('COMMIT');
 
     if ((req as any).io) {
@@ -395,10 +379,9 @@ app.put('/separations/:id', authenticate, async (req, res) => {
     } else {
       io.emit('separations_update');
     }
-
     res.json({ success: true });
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(400).json({ error: error.message });
   } finally {
     client.release();
@@ -416,7 +399,6 @@ app.put('/separations/:id/authorize', authenticate, async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    // VERIFICAÇÃO DE SEGURANÇA
     const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     const role = userCheck.rows[0]?.role;
     if (role !== 'admin' && role !== 'almoxarife') {
@@ -449,12 +431,12 @@ app.put('/separations/:id/authorize', authenticate, async (req, res) => {
     const newStatus = action === 'entregar' ? 'entregue' : 'em_separacao';
     await client.query(`UPDATE separations SET status = $1 ${action === 'entregar' ? ', sent_at = NOW()' : ''} WHERE id = $2`, [newStatus, id]);
     
-    await createLog(userId, 'UPDATE_SEPARATION', { separationId: id, action }, req.ip || '127.0.0.1');
+    await createLog(userId, 'UPDATE_SEPARATION', { separationId: id, action }, req.ip || '127.0.0.1', client);
     await client.query('COMMIT');
     io.emit('separations_update');
     res.json({ success: true });
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(400).json({ error: error.message });
   } finally { client.release(); }
 });
@@ -466,7 +448,6 @@ app.post('/separations/:id/return', authenticate, async (req, res) => {
   const userId = (req as any).user.id;
   
   try {
-    // VERIFICAÇÃO DE SEGURANÇA
     const userCheck = await pool.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     const role = userCheck.rows[0]?.role;
     if (role !== 'admin' && role !== 'almoxarife') {
@@ -494,7 +475,6 @@ app.put('/separations/returns/:returnId', authenticate, async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    // VERIFICAÇÃO DE SEGURANÇA
     const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     const role = userCheck.rows[0]?.role;
     if (role !== 'admin' && role !== 'almoxarife') {
@@ -511,12 +491,12 @@ app.put('/separations/returns/:returnId', authenticate, async (req, res) => {
       await client.query('UPDATE stock SET quantity_on_hand = quantity_on_hand + $1 WHERE product_id = $2', [ret.rows[0].quantity, ret.rows[0].product_id]);
     }
     
-    await createLog(userId, 'PROCESS_RETURN', { returnId, status }, req.ip || '127.0.0.1');
+    await createLog(userId, 'PROCESS_RETURN', { returnId, status }, req.ip || '127.0.0.1', client);
     await client.query('COMMIT');
     io.emit('separations_update');
     res.json({ success: true });
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(400).json({ error: error.message });
   } finally { client.release(); }
 });
@@ -526,7 +506,6 @@ app.delete('/separations/:id', authenticate, async (req, res) => {
   const { id } = req.params;
   const userId = (req as any).user.id;
   try {
-    // VERIFICAÇÃO DE SEGURANÇA
     const userCheck = await pool.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     const role = userCheck.rows[0]?.role;
     if (role !== 'admin' && role !== 'almoxarife') {
@@ -534,7 +513,6 @@ app.delete('/separations/:id', authenticate, async (req, res) => {
     }
 
     await pool.query('DELETE FROM separations WHERE id = $1', [id]);
-    
     await createLog(userId, 'DELETE_SEPARATION', { separationId: id }, req.ip || '127.0.0.1');
     io.emit('separations_update');
     res.json({ success: true });
@@ -569,7 +547,6 @@ app.get('/travel-orders', authenticate, async (req, res) => {
       FROM travel_orders t
       ORDER BY t.status ASC, t.created_at DESC
     `);
-    // O ORDER BY traz as 'pending' primeiro, depois as mais recentes
     res.json(rows);
   } catch (err: any) {
     res.status(500).json({ error: 'Erro ao buscar viagens' });
@@ -585,7 +562,6 @@ app.post('/travel-orders', authenticate, async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    // Insere o cabeçalho da viagem
     const toRes = await client.query(
       `INSERT INTO travel_orders (technicians, city, status, created_by) VALUES ($1, $2, 'pending', $3) RETURNING id`,
       [technicians, city, userId]
@@ -593,30 +569,27 @@ app.post('/travel-orders', authenticate, async (req, res) => {
     const travelOrderId = toRes.rows[0].id;
 
     for (const item of items) {
-      // 1. Salva o item na viagem
       await client.query(
         `INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3)`,
         [travelOrderId, item.product_id, item.quantity]
       );
-      
-      // 2. A MÁGICA: Aumenta o 'quantity_reserved' (Isso bloqueia o disponível, mas mantém o físico intacto)
       await client.query(
         `UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2`,
         [item.quantity, item.product_id]
       );
     }
     
-    await createLog(userId, 'CREATE_TRAVEL_ORDER', { travelOrderId, technicians, city }, req.ip || '127.0.0.1');
+    await createLog(userId, 'CREATE_TRAVEL_ORDER', { travelOrderId, technicians, city }, req.ip || '127.0.0.1', client);
     await client.query('COMMIT');
     
     if ((req as any).io) {
       (req as any).io.emit('travel_orders_update');
-      (req as any).io.emit('stock_updated'); // Emite pra tabela de estoque atualizar na hora
+      (req as any).io.emit('stock_updated'); 
     }
     
     res.status(201).json({ id: travelOrderId, success: true });
   } catch (err: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: err.message });
   } finally { 
     client.release(); 
@@ -626,19 +599,17 @@ app.post('/travel-orders', authenticate, async (req, res) => {
 // 3. Fazer o Confronto (A Volta) - Limpa Reserva e Baixa o Físico do que faltou
 app.post('/travel-orders/:id/reconcile', authenticate, async (req, res) => {
   const { id } = req.params;
-  const { returnedItems } = req.body; // Array esperado do Front: { product_id, returnedQuantity }
+  const { returnedItems } = req.body; 
   const userId = (req as any).user.id;
   const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
 
-    // Valida o status da Viagem (FOR UPDATE bloqueia a linha no NeonDB para evitar duplo clique)
     const toCheck = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
     if (toCheck.rows.length === 0) throw new Error('Viagem não encontrada.');
     if (toCheck.rows[0].status === 'reconciled') throw new Error('Esta viagem já passou por acerto.');
 
-    // Busca o que levaram originalmente
     const currentItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
     const currentItems = currentItemsRes.rows;
 
@@ -648,27 +619,22 @@ app.post('/travel-orders/:id/reconcile', authenticate, async (req, res) => {
       const returnedData: any = returnedMap.get(oldItem.product_id);
       const returnedQty = returnedData ? Number(returnedData.returnedQuantity) : 0;
       const qtyOut = Number(oldItem.quantity_out);
-      const missing = qtyOut - returnedQty; // Se levou 5 e voltou 2, missing = 3.
+      const missing = qtyOut - returnedQty;
 
-      // Define se fechou (ok), faltou (missing) ou sobrou (extra)
       let itemStatus = 'ok';
       if (missing > 0) itemStatus = 'missing';
       if (missing < 0) itemStatus = 'extra';
 
-      // 1. Atualiza a tabela da viagem com o que voltou
       await client.query(
         `UPDATE travel_order_items SET quantity_returned = $1, status = $2 WHERE id = $3`,
         [returnedQty, itemStatus, oldItem.id]
       );
 
-      // 2. LÓGICA DE ESTOQUE (A Volta)
-      // Primeiro: Limpamos TODA a reserva que foi feita na Ida para este item
       await client.query(
         `UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`,
         [qtyOut, oldItem.product_id]
       );
 
-      // 3. O que faltou (foi consumido na obra)? Damos baixa definitiva do FÍSICO!
       if (missing > 0) {
           await client.query(
             `UPDATE stock SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1) WHERE product_id = $2`,
@@ -676,7 +642,6 @@ app.post('/travel-orders/:id/reconcile', authenticate, async (req, res) => {
           );
       }
       
-      // 4. Se ele trouxe MAIS do que levou (Extra/Sobra que achou na mala do carro), adicionamos ao físico
       if (missing < 0) {
           const extra = Math.abs(missing);
           await client.query(
@@ -686,16 +651,13 @@ app.post('/travel-orders/:id/reconcile', authenticate, async (req, res) => {
       }
     }
 
-    // 5. Lida com itens NOVOS que os técnicos trouxeram mas que NEM estavam na lista de saída
     for (const retItem of returnedItems) {
         const wasInOriginal = currentItems.some(old => old.product_id === retItem.product_id);
         if (!wasInOriginal && retItem.returnedQuantity > 0) {
-            // Insere na viagem como um item 'extra'
             await client.query(
               `INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out, quantity_returned, status) VALUES ($1, $2, 0, $3, 'extra')`,
               [id, retItem.product_id, retItem.returnedQuantity]
             );
-            // Adiciona ao estoque físico
             await client.query(
               `UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`,
               [retItem.returnedQuantity, retItem.product_id]
@@ -703,20 +665,19 @@ app.post('/travel-orders/:id/reconcile', authenticate, async (req, res) => {
         }
     }
 
-    // Finaliza a viagem
     await client.query(`UPDATE travel_orders SET status = 'reconciled', updated_at = NOW() WHERE id = $1`, [id]);
-    await createLog(userId, 'RECONCILE_TRAVEL_ORDER', { travelOrderId: id }, req.ip || '127.0.0.1');
+    await createLog(userId, 'RECONCILE_TRAVEL_ORDER', { travelOrderId: id }, req.ip || '127.0.0.1', client);
 
     await client.query('COMMIT');
     
     if ((req as any).io) {
       (req as any).io.emit('travel_orders_update');
-      (req as any).io.emit('stock_updated'); // Atualiza a tabela de estoque em tempo real para todos!
+      (req as any).io.emit('stock_updated');
     }
 
     res.json({ success: true });
   } catch (err: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: err.message });
   } finally { 
     client.release(); 
@@ -737,28 +698,23 @@ app.put('/travel-orders/:id', authenticate, async (req, res) => {
     if (orderRes.rows.length === 0) throw new Error('Viagem não encontrada.');
     if (orderRes.rows[0].status === 'reconciled') throw new Error('Não é possível editar uma viagem já concluída.');
 
-    // Atualiza cabeçalho
     await client.query(
       'UPDATE travel_orders SET technicians = $1, city = $2 WHERE id = $3',
       [technicians, city, id]
     );
 
-    // Busca itens antigos
     const oldItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
     const oldItems = oldItemsRes.rows;
     const newItemsMap = new Map(items.map((i: any) => [i.product_id, i]));
 
-    // Sincroniza e ajusta reserva no estoque
     for (const oldItem of oldItems) {
       if (!newItemsMap.has(oldItem.product_id)) {
-        // Se o item foi removido do carrinho: libera a reserva
         await client.query(
           'UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2',
           [oldItem.quantity_out, oldItem.product_id]
         );
         await client.query('DELETE FROM travel_order_items WHERE id = $1', [oldItem.id]);
       } else {
-        // Se o item continua: ajusta a diferença de quantidade
         const newItem: any = newItemsMap.get(oldItem.product_id);
         const diff = Number(newItem.quantity) - Number(oldItem.quantity_out);
         if (diff !== 0) {
@@ -774,7 +730,6 @@ app.put('/travel-orders/:id', authenticate, async (req, res) => {
       }
     }
 
-    // Insere itens que foram adicionados como novos na edição
     for (const item of items) {
       const exists = oldItems.some(old => old.product_id === item.product_id);
       if (!exists) {
@@ -789,7 +744,7 @@ app.put('/travel-orders/:id', authenticate, async (req, res) => {
       }
     }
 
-    await createLog(userId, 'EDIT_TRAVEL_ORDER', { travelOrderId: id }, req.ip || '127.0.0.1');
+    await createLog(userId, 'EDIT_TRAVEL_ORDER', { travelOrderId: id }, req.ip || '127.0.0.1', client);
     await client.query('COMMIT');
 
     if ((req as any).io) {
@@ -799,7 +754,7 @@ app.put('/travel-orders/:id', authenticate, async (req, res) => {
 
     res.json({ success: true });
   } catch (err: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
@@ -815,29 +770,23 @@ app.delete('/travel-orders/:id', authenticate, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Busca informações da viagem e bloqueia a linha
     const orderRes = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
     if (orderRes.rows.length === 0) throw new Error('Viagem não encontrada.');
     const status = orderRes.rows[0].status;
 
-    // Busca os itens da viagem
     const itemsRes = await client.query('SELECT product_id, quantity_out, quantity_returned FROM travel_order_items WHERE travel_order_id = $1', [id]);
     const items = itemsRes.rows;
 
-    // Reverte o estoque baseado no status da viagem
     for (const item of items) {
       const qtyOut = Number(item.quantity_out || 0);
       const qtyRet = Number(item.quantity_returned || 0);
 
       if (status === 'pending') {
-        // Viagem em andamento: apenas libertamos o estoque que estava reservado
         await client.query(
           `UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`,
           [qtyOut, item.product_id]
         );
       } else if (status === 'reconciled') {
-        // Viagem concluída: a reserva já tinha sido limpa, mas o físico (quantity_on_hand) foi alterado!
-        // A lógica de reversão perfeita: Adicionamos o que levou, e retiramos o que retornou.
         await client.query(
           `UPDATE stock SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1 + $2) WHERE product_id = $3`,
           [qtyRet, qtyOut, item.product_id]
@@ -845,14 +794,12 @@ app.delete('/travel-orders/:id', authenticate, async (req, res) => {
       }
     }
 
-    // Finalmente, apaga os itens e o registo da viagem
     await client.query('DELETE FROM travel_order_items WHERE travel_order_id = $1', [id]);
     await client.query('DELETE FROM travel_orders WHERE id = $1', [id]);
 
-    await createLog(userId, 'DELETE_TRAVEL_ORDER', { travelOrderId: id, status }, req.ip || '127.0.0.1');
+    await createLog(userId, 'DELETE_TRAVEL_ORDER', { travelOrderId: id, status }, req.ip || '127.0.0.1', client);
     await client.query('COMMIT');
 
-    // Emite o aviso para todos atualizarem os ecrãs
     if ((req as any).io) {
       (req as any).io.emit('travel_orders_update');
       (req as any).io.emit('stock_updated');
@@ -860,7 +807,7 @@ app.delete('/travel-orders/:id', authenticate, async (req, res) => {
 
     res.json({ success: true });
   } catch (err: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
@@ -999,14 +946,15 @@ app.post('/admin/permissions', authenticate, async (req, res) => {
     for (const page of permissions) {
       await client.query('INSERT INTO role_permissions (role, page_key) VALUES ($1, $2)', [role, page]);
     }
+    
+    await createLog(requesterId, 'UPDATE_PERMISSIONS', { role_target: role, count: permissions.length }, req.ip || '127.0.0.1', client);
     await client.query('COMMIT');
     
-    await createLog(requesterId, 'UPDATE_PERMISSIONS', { role_target: role, count: permissions.length }, req.ip || '127.0.0.1');
     io.to(role).emit('permissions_updated', permissions);
 
     res.json({ success: true });
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: 'Erro ao salvar permissões' });
   } finally {
     client.release();
@@ -1076,7 +1024,7 @@ app.post('/auth/register', async (req, res) => {
     await client.query('COMMIT');
     res.status(201).json({ success: true });
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: error.message });
   } finally {
     client.release();
@@ -1127,11 +1075,10 @@ app.delete('/users/:id', authenticate, async (req, res) => {
 });
 
 // ==========================================
-// 🚀 ROTA /PRODUCTS (OTIMIZADA - FIM DO THUNDERING HERD)
+// 🚀 ROTA /PRODUCTS 
 // ==========================================
 app.get('/products', authenticate, async (req, res) => {
   try {
-    // A query agora é O(1) e tira a carga massiva do banco de dados!
     const { rows } = await pool.query(`
       SELECT 
         p.id,
@@ -1215,12 +1162,12 @@ app.post('/products', authenticate, async (req, res) => {
       await client.query("INSERT INTO xml_items (xml_log_id, product_id, quantity) VALUES ($1, $2, $3)", [logRes.rows[0].id, newProduct.id, initialQty]);
     }
     
+    await createLog(userId, 'CREATE_PRODUCT', { sku, name, initialQty }, req.ip || '127.0.0.1', client);
     await client.query('COMMIT');
-    await createLog(userId, 'CREATE_PRODUCT', { sku, name, initialQty }, req.ip || '127.0.0.1');
 
     res.status(201).json(newProduct);
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: error.message });
   } finally {
     client.release();
@@ -1258,12 +1205,12 @@ app.put('/products/:id', authenticate, async (req, res) => {
       await client.query('UPDATE stock SET quantity_on_hand = $1 WHERE product_id = $2', [parseFloat(quantity), id]);
     }
     
+    await createLog(userId, 'UPDATE_PRODUCT', { id, name, changes: req.body }, req.ip || '127.0.0.1', client);
     await client.query('COMMIT');
-    await createLog(userId, 'UPDATE_PRODUCT', { id, name, changes: req.body }, req.ip || '127.0.0.1');
 
     res.json(rows[0]);
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: error.message });
   } finally {
     client.release();
@@ -1753,7 +1700,7 @@ app.post('/manual-entry', authenticate, async (req, res) => {
 
     res.status(201).json({ success: true });
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: error.message || "Erro na entrada" });
   } finally {
     client.release();
@@ -1778,7 +1725,7 @@ app.post('/manual-withdrawal', authenticate, async (req, res) => {
     await client.query('COMMIT');
     res.status(201).json({ success: true });
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: error.message || "Erro na saída" });
   } finally {
     client.release();
@@ -1870,10 +1817,11 @@ app.post('/requests', authenticate, async (req, res) => {
         FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items
       FROM requests r LEFT JOIN profiles p ON r.requester_id = p.id WHERE r.id = $1
     `;
+    
+    // CORREÇÃO CRÍTICA: Usa o 'client.query' em vez do pool.query para evitar deadlock
     const { rows: fullReqRows } = await client.query(fullReqQuery, [requestId]);
     const fullRequest = fullReqRows[0];
 
-    // TEMPO REAL E DEDUPLICAÇÃO
     const uniqueNotificationId = `req-${requestId}-${Date.now()}`;
 
     if ((req as any).io) {
@@ -1884,11 +1832,9 @@ app.post('/requests', authenticate, async (req, res) => {
             type: 'solicitacao'
         };
 
-        // Envia para o array de roles ao mesmo tempo
         (req as any).io.to(['almoxarife', 'admin']).emit('new_request_notification', notificationData);
         (req as any).io.to(['almoxarife', 'admin']).emit('new_request', fullRequest);
-        // (req as any).io.emit('refresh_requests'); // <-- EFEITO MANADA REMOVIDO!
-        (req as any).io.emit('refresh_stock');
+        (req as any).io.emit('refresh_stock'); // Atualiza só o stock para não forçar todo mundo a recarregar a lista de requests ao mesmo tempo
     }
 
     sendPushNotificationToRole(
@@ -1901,7 +1847,7 @@ app.post('/requests', authenticate, async (req, res) => {
     
     res.status(201).json({ success: true, id: requestId });
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     const statusCode = error.message.includes('Estoque disponível insuficiente') ? 400 : 500;
     res.status(statusCode).json({ error: `Erro Técnico: ${error.message}` }); 
   } finally {
@@ -1964,7 +1910,7 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
     res.json({ success: true });
 
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: error.message || 'Erro ao atualizar status' });
   } finally {
     client.release();
@@ -2018,11 +1964,39 @@ app.delete('/requests/:id', authenticate, async (req, res) => {
     res.json({ success: true });
 
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     console.error("Erro ao excluir solicitação:", error);
     res.status(500).json({ error: 'Erro ao excluir solicitação' });
   } finally {
     client.release();
+  }
+});
+
+// 🛠️ CORREÇÃO CRÍTICA: Dashboard Stats unificado em 1 única Query para não entupir a DB
+app.get('/dashboard/stats', authenticate, async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        (SELECT COUNT(*) FROM products WHERE active = true) as total_products,
+        (SELECT COUNT(*) FROM products p LEFT JOIN stock s ON p.id = s.product_id WHERE p.min_stock IS NOT NULL AND (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) < CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC) AND p.active = true) as low_stock,
+        (SELECT COUNT(*) FROM requests) as total_requests,
+        (SELECT COUNT(*) FROM requests WHERE status = 'aberto') as open_requests,
+        (SELECT COUNT(*) FROM separations WHERE type = 'op' OR type = 'default') as total_separations,
+        (SELECT COALESCE(SUM(s.quantity_on_hand * CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC)), 0) FROM stock s JOIN products p ON s.product_id = p.id WHERE p.active = true) as total_value
+    `;
+    const { rows } = await pool.query(query);
+    const s = rows[0];
+
+    res.json({
+      totalProducts: parseInt(s.total_products || '0'),
+      lowStock: parseInt(s.low_stock || '0'),
+      totalRequests: parseInt(s.total_requests || '0'),
+      openRequests: parseInt(s.open_requests || '0'),
+      totalSeparations: parseInt(s.total_separations || '0'),
+      totalValue: parseFloat(s.total_value || '0'),
+    });
+  } catch (error: any) { 
+    res.status(500).json({ error: 'Erro stats' }); 
   }
 });
 
@@ -2085,35 +2059,6 @@ app.get('/reports/managerial', authenticate, async (req, res) => {
   } catch (error: any) {
     console.error(error);
     res.status(500).json({ error: 'Erro ao gerar dados gerenciais' });
-  }
-});
-
-app.get('/dashboard/stats', authenticate, async (req, res) => {
-  try {
-    const productsRes = await pool.query('SELECT COUNT(*) FROM products WHERE active = true');
-    const lowStockRes = await pool.query(`SELECT COUNT(*) FROM products p LEFT JOIN stock s ON p.id = s.product_id WHERE p.min_stock IS NOT NULL AND (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) < CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC) AND p.active = true`);
-    const requestsRes = await pool.query('SELECT COUNT(*) FROM requests');
-    const openRequestsRes = await pool.query("SELECT COUNT(*) FROM requests WHERE status = 'aberto'");
-    const separationsRes = await pool.query("SELECT COUNT(*) FROM separations WHERE type = 'op' OR type = 'default'");
-    
-    const stockItemsRes = await pool.query(`SELECT s.quantity_on_hand, p.unit_price FROM stock s JOIN products p ON s.product_id = p.id WHERE p.active = true`);
-    let totalValueCalculated = 0;
-    stockItemsRes.rows.forEach((item: any) => {
-        const qtd = parseFloat(item.quantity_on_hand);
-        const preco = parseFloat(item.unit_price);
-        if (!isNaN(qtd) && !isNaN(preco)) totalValueCalculated += qtd * preco;
-    });
-
-    res.json({
-      totalProducts: parseInt(productsRes.rows[0].count),
-      lowStock: parseInt(lowStockRes.rows[0].count),
-      totalRequests: parseInt(requestsRes.rows[0].count),
-      openRequests: parseInt(openRequestsRes.rows[0].count),
-      totalSeparations: parseInt(separationsRes.rows[0].count),
-      totalValue: totalValueCalculated,
-    });
-  } catch (error: any) { 
-    res.status(500).json({ error: 'Erro stats' }); 
   }
 });
 
@@ -2338,7 +2283,7 @@ app.post('/stock/calculate-min', authenticate, async (req, res) => {
     });
     
   } catch (error: any) {
-    await client.query('ROLLBACK');
+    try { await client.query('ROLLBACK'); } catch(e) {}
     console.error("Erro no cálculo de mínimo:", error);
     res.status(500).json({ error: error.message });
   } finally { 
@@ -2349,17 +2294,24 @@ app.post('/stock/calculate-min', authenticate, async (req, res) => {
 app.post('/admin/reset-password', authenticate, async (req, res) => {
   const { userId, newPassword } = req.body;
   const requesterId = (req as any).user.id;
-  const adminCheck = await pool.query("SELECT role FROM profiles WHERE id = $1", [requesterId]);
-  if (adminCheck.rows[0]?.role !== 'admin') return res.status(403).json({ error: 'Apenas admins.' });
+  
+  const client = await pool.connect();
   try {
+    const adminCheck = await client.query("SELECT role FROM profiles WHERE id = $1", [requesterId]);
+    if (adminCheck.rows[0]?.role !== 'admin') return res.status(403).json({ error: 'Apenas admins.' });
+    
     const salt = await bcrypt.genSalt(10);
     const encryptedPassword = await bcrypt.hash(newPassword, salt);
-    await pool.query('UPDATE users SET encrypted_password = $1 WHERE id = $2', [encryptedPassword, userId]);
+    await client.query('UPDATE users SET encrypted_password = $1 WHERE id = $2', [encryptedPassword, userId]);
     
-    await createLog(requesterId, 'RESET_PASSWORD', { target_user_id: userId }, req.ip || '127.0.0.1');
+    await createLog(requesterId, 'RESET_PASSWORD', { target_user_id: userId }, req.ip || '127.0.0.1', client);
 
     res.json({ success: true, message: 'Senha redefinida.' });
-  } catch (error: any) { res.status(500).json({ error: 'Erro reset' }); }
+  } catch (error: any) { 
+    res.status(500).json({ error: 'Erro reset' }); 
+  } finally {
+    client.release();
+  }
 });
 
 const PORT = process.env.PORT || 3000;
