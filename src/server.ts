@@ -17,6 +17,16 @@ pool.on('error', (err, client) => {
   console.error('⚠️ Erro inesperado no banco de dados (Conexão ociosa):', err.message);
 });
 
+// --- 🚨 MONITOR DO POOL DE CONEXÕES (RAIO-X) 🚨 ---
+setInterval(() => {
+  console.log(`[DB POOL] Total: ${pool.totalCount} | Em Uso: ${pool.totalCount - pool.idleCount} | Livres: ${pool.idleCount} | Na Fila de Espera: ${pool.waitingCount}`);
+  
+  if (pool.waitingCount > 0) {
+    console.warn("⚠️ ALERTA: O Banco de Dados está engasgado! Há conexões na fila esperando para serem processadas.");
+  }
+}, 5000);
+// --------------------------------------------------
+
 // --- 1. CONFIGURAÇÃO DO SERVIDOR HTTP + SOCKET.IO ---
 const httpServer = createServer(app);
 
@@ -1589,37 +1599,37 @@ app.delete('/eletrica-tasks/:id', authenticate, async (req, res) => {
 // OUTRAS ROTAS (ESTOQUE, RELATÓRIOS, ETC)
 // ==========================================
 
+// 🛠️ CORREÇÃO: Rota de Stock otimizada com CTE e JSON_AGG otimizado
 app.get('/stock', authenticate, async (req, res) => {
   try {
-    const { rows } = await pool.query(`
+    const query = `
+      WITH ActiveReservations AS (
+        SELECT ri.product_id, json_agg(json_build_object(
+          'request_id', r.id,
+          'sector', COALESCE(pf.sector, r.sector),
+          'quantity', ri.quantity_requested
+        )) as reservations
+        FROM request_items ri
+        JOIN requests r ON ri.request_id = r.id
+        LEFT JOIN profiles pf ON r.requester_id = pf.id
+        WHERE r.status IN ('aberto', 'aprovado')
+        GROUP BY ri.product_id
+      )
       SELECT s.*, 
         json_build_object(
-          'id', p.id, 
-          'name', p.name, 
-          'sku', p.sku, 
-          'unit', p.unit, 
-          'min_stock', p.min_stock, 
-          'unit_price', p.unit_price, 
-          'sales_price', p.sales_price,
-          'tags', p.tags
+          'id', p.id, 'name', p.name, 'sku', p.sku, 'unit', p.unit, 
+          'min_stock', p.min_stock, 'unit_price', p.unit_price, 
+          'sales_price', p.sales_price, 'tags', p.tags
         ) as products,
-        (
-          SELECT COALESCE(json_agg(json_build_object(
-            'request_id', r.id,
-            'sector', COALESCE(pf.sector, r.sector),
-            'quantity', ri.quantity_requested
-          )), '[]'::json)
-          FROM request_items ri
-          JOIN requests r ON ri.request_id = r.id
-          LEFT JOIN profiles pf ON r.requester_id = pf.id
-          WHERE ri.product_id = s.product_id 
-            AND r.status IN ('aberto', 'aprovado')
-        ) as active_reservations
+        COALESCE(ar.reservations, '[]'::json) as active_reservations
       FROM stock s 
       JOIN products p ON s.product_id = p.id 
+      LEFT JOIN ActiveReservations ar ON ar.product_id = s.product_id
       WHERE p.active = true
-      ORDER BY s.created_at DESC
-    `);
+      ORDER BY s.created_at DESC;
+    `;
+    
+    const { rows } = await pool.query(query);
     
     const travelRes = await pool.query(`
        SELECT ti.product_id, t.id as request_id, t.city as sector, ti.quantity_out as quantity
