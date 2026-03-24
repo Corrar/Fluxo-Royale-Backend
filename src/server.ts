@@ -129,7 +129,9 @@ const sendPushNotificationToRole = async (role: string, title: string, message: 
 
     const { rows } = await pool.query(query, params);
     
-    console.log(`📡 Enviando Push para ${rows.length} dispositivos (${role})...`);
+    console.log(`📡 Preparando o envio de Push para ${rows.length} dispositivos (${role})...`);
+
+    if (rows.length === 0) return;
 
     // 🔥 Adicionado o uniqueId para garantir a deduplicação de alertas
     const notificationTag = uniqueId ? `fluxo-alert-${uniqueId}` : `fluxo-alert-${Date.now()}`;
@@ -144,20 +146,36 @@ const sendPushNotificationToRole = async (role: string, title: string, message: 
       priority: 'high'
     });
 
-    const promises = rows.map(async (row) => {
-      try {
-        const sub = row.subscription; 
-        await webpush.sendNotification(sub, payload);
-      } catch (err: any) {
-        if (err.statusCode === 410 || err.statusCode === 404) {
-          console.log("Inscrição antiga/inválida detectada.");
-        } else {
-          console.error("Erro no envio do push:", err);
-        }
-      }
-    });
+    // 🛠️ CORREÇÃO: Sistema de Lotes (Batches) para evitar sobrecarga de Sockets e ECONNRESET
+    const CHUNK_SIZE = 50; // Quantidade de notificações processadas em simultâneo
 
-    await Promise.all(promises);
+    for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+      // Pega um pedaço da matriz (ex: 0 a 50, depois 50 a 100...)
+      const chunk = rows.slice(i, i + CHUNK_SIZE);
+      
+      const promises = chunk.map(async (row) => {
+        try {
+          const sub = row.subscription; 
+          await webpush.sendNotification(sub, payload);
+        } catch (err: any) {
+          // O Google/Browser responde com 410 ou 404 se a inscrição expirou ou o browser foi fechado
+          if (err.statusCode === 410 || err.statusCode === 404) {
+             try {
+                // LIMPEZA AUTOMÁTICA: Apaga o lixo da base de dados para nunca mais tentar enviar para aqui
+                await pool.query('DELETE FROM push_subscriptions WHERE subscription::text = $1', [JSON.stringify(row.subscription)]);
+                console.log("🧹 Inscrição antiga/fantasma removida da base de dados.");
+             } catch(e) {}
+          } else {
+            console.error("Erro isolado no envio do push:", err.message);
+          }
+        }
+      });
+
+      // Aguarda que as 50 notificações terminem de enviar antes de passar para o próximo ciclo
+      await Promise.all(promises);
+    }
+
+    console.log(`✅ Push enviado com sucesso!`);
 
   } catch (error) {
     console.error("Falha geral no envio de Push:", error);
@@ -882,7 +900,7 @@ app.delete('/travel-orders/:id', authenticate, async (req, res) => {
 // OUTRAS ROTAS (EXISTENTES)
 // ==========================================
 
-// ROTA: SALVAR INSCRIÇÃO
+// ROTA: SALVAR INSCRIÇÃO (Com prevenção de Duplicados)
 app.post('/notifications/subscribe', authenticate, async (req, res) => {
   const userId = (req as any).user.id;
   const { subscription } = req.body;
@@ -892,10 +910,17 @@ app.post('/notifications/subscribe', authenticate, async (req, res) => {
   }
 
   try {
+    const subStr = JSON.stringify(subscription);
+    
+    // 1. Apaga a inscrição exata se ela já existir na base de dados (evita duplicação)
+    await pool.query('DELETE FROM push_subscriptions WHERE subscription::text = $1', [subStr]);
+    
+    // 2. Insere a nova associação limpa
     await pool.query(
       `INSERT INTO push_subscriptions (user_id, subscription) VALUES ($1, $2)`,
-      [userId, JSON.stringify(subscription)]
+      [userId, subStr]
     );
+    
     res.status(201).json({ success: true });
   } catch (error) {
     res.status(200).json({ success: true }); 
