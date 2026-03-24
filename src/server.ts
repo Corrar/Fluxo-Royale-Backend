@@ -1788,16 +1788,38 @@ app.post('/manual-withdrawal', authenticate, async (req, res) => {
 app.get('/requests', authenticate, async (req, res) => {
   try {
     const query = `
-      SELECT r.*, json_build_object('name', p.name, 'sector', p.sector) as requester,
-      (SELECT COALESCE(json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'custom_product_name', ri.custom_product_name, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END)), '[]'::json)
-        FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items
-      FROM requests r LEFT JOIN profiles p ON r.requester_id = p.id 
-      WHERE r.status IN ('aberto', 'aprovado') OR r.created_at >= NOW() - INTERVAL '30 days'
-      ORDER BY r.created_at DESC LIMIT 200
+      WITH FilteredRequests AS (
+          SELECT * FROM requests 
+          WHERE status IN ('aberto', 'aprovado') OR created_at >= NOW() - INTERVAL '30 days'
+          ORDER BY created_at DESC 
+          LIMIT 200
+      )
+      SELECT 
+          r.*, 
+          json_build_object('name', p.name, 'sector', p.sector) as requester,
+          COALESCE(ri_agg.items, '[]'::json) as request_items
+      FROM FilteredRequests r
+      LEFT JOIN profiles p ON r.requester_id = p.id
+      LEFT JOIN (
+          SELECT ri.request_id, json_agg(
+              json_build_object(
+                  'id', ri.id, 
+                  'quantity_requested', ri.quantity_requested, 
+                  'custom_product_name', ri.custom_product_name, 
+                  'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END
+              )
+          ) as items
+          FROM request_items ri
+          LEFT JOIN products pr ON ri.product_id = pr.id
+          WHERE ri.request_id IN (SELECT id FROM FilteredRequests)
+          GROUP BY ri.request_id
+      ) ri_agg ON ri_agg.request_id = r.id
+      ORDER BY r.created_at DESC;
     `;
     const { rows } = await pool.query(query);
     res.json(rows);
   } catch (error: any) {
+    console.error("Erro GET /requests:", error);
     res.status(500).json({ error: 'Erro ao buscar solicitações' });
   }
 });
@@ -1807,15 +1829,36 @@ app.get('/my-requests', authenticate, async (req, res) => {
   const userId = (req as any).user.id;
   try {
     const query = `
-      SELECT r.*, (SELECT COALESCE(json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'custom_product_name', ri.custom_product_name, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END)), '[]'::json)
-        FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items
-      FROM requests r WHERE r.requester_id = $1 
-      AND (r.status IN ('aberto', 'aprovado') OR r.created_at >= NOW() - INTERVAL '30 days')
-      ORDER BY r.created_at DESC LIMIT 200
+      WITH FilteredRequests AS (
+          SELECT * FROM requests 
+          WHERE requester_id = $1 AND (status IN ('aberto', 'aprovado') OR created_at >= NOW() - INTERVAL '30 days')
+          ORDER BY created_at DESC 
+          LIMIT 200
+      )
+      SELECT 
+          r.*, 
+          COALESCE(ri_agg.items, '[]'::json) as request_items
+      FROM FilteredRequests r
+      LEFT JOIN (
+          SELECT ri.request_id, json_agg(
+              json_build_object(
+                  'id', ri.id, 
+                  'quantity_requested', ri.quantity_requested, 
+                  'custom_product_name', ri.custom_product_name, 
+                  'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END
+              )
+          ) as items
+          FROM request_items ri
+          LEFT JOIN products pr ON ri.product_id = pr.id
+          WHERE ri.request_id IN (SELECT id FROM FilteredRequests)
+          GROUP BY ri.request_id
+      ) ri_agg ON ri_agg.request_id = r.id
+      ORDER BY r.created_at DESC;
     `;
     const { rows } = await pool.query(query, [userId]);
     res.json(rows);
   } catch (error: any) {
+    console.error("Erro GET /my-requests:", error);
     res.status(500).json({ error: 'Erro ao buscar minhas solicitações' });
   }
 });
