@@ -1784,13 +1784,16 @@ app.post('/manual-withdrawal', authenticate, async (req, res) => {
   }
 });
 
+// 🛠️ CORREÇÃO: Aplicado filtro de data e limite para evitar esgotamento do banco
 app.get('/requests', authenticate, async (req, res) => {
   try {
     const query = `
       SELECT r.*, json_build_object('name', p.name, 'sector', p.sector) as requester,
-      (SELECT json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'custom_product_name', ri.custom_product_name, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END))
+      (SELECT COALESCE(json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'custom_product_name', ri.custom_product_name, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END)), '[]'::json)
         FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items
-      FROM requests r LEFT JOIN profiles p ON r.requester_id = p.id ORDER BY r.created_at DESC
+      FROM requests r LEFT JOIN profiles p ON r.requester_id = p.id 
+      WHERE r.status IN ('aberto', 'aprovado') OR r.created_at >= NOW() - INTERVAL '30 days'
+      ORDER BY r.created_at DESC LIMIT 200
     `;
     const { rows } = await pool.query(query);
     res.json(rows);
@@ -1799,13 +1802,16 @@ app.get('/requests', authenticate, async (req, res) => {
   }
 });
 
+// 🛠️ CORREÇÃO: Aplicado filtro de data e limite
 app.get('/my-requests', authenticate, async (req, res) => {
   const userId = (req as any).user.id;
   try {
     const query = `
-      SELECT r.*, (SELECT json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'custom_product_name', ri.custom_product_name, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END))
+      SELECT r.*, (SELECT COALESCE(json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'custom_product_name', ri.custom_product_name, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END)), '[]'::json)
         FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items
-      FROM requests r WHERE r.requester_id = $1 ORDER BY r.created_at DESC
+      FROM requests r WHERE r.requester_id = $1 
+      AND (r.status IN ('aberto', 'aprovado') OR r.created_at >= NOW() - INTERVAL '30 days')
+      ORDER BY r.created_at DESC LIMIT 200
     `;
     const { rows } = await pool.query(query, [userId]);
     res.json(rows);
@@ -1831,7 +1837,14 @@ app.post('/requests', authenticate, async (req, res) => {
     );
     const requestId = reqRes.rows[0].id;
 
-    for (const item of items) {
+    // 🛠️ CORREÇÃO DEADLOCK: Ordenamos os itens por product_id para bloquear o banco sempre na mesma ordem
+    const sortedItems = [...items].sort((a, b) => {
+       if (!a.product_id) return 1;
+       if (!b.product_id) return -1;
+       return String(a.product_id).localeCompare(String(b.product_id));
+    });
+
+    for (const item of sortedItems) {
       const isCustom = item.product_id === 'custom' || !item.product_id;
       const productId = isCustom ? null : item.product_id;
       const customName = isCustom ? item.custom_name : null;
@@ -1865,7 +1878,7 @@ app.post('/requests', authenticate, async (req, res) => {
 
     const fullReqQuery = `
       SELECT r.*, json_build_object('name', p.name, 'sector', p.sector) as requester,
-      (SELECT json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'custom_product_name', ri.custom_product_name, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END))
+      (SELECT COALESCE(json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'custom_product_name', ri.custom_product_name, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit) ELSE NULL END)), '[]'::json)
         FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items
       FROM requests r LEFT JOIN profiles p ON r.requester_id = p.id WHERE r.id = $1
     `;
@@ -1923,7 +1936,8 @@ app.put('/requests/:id/status', authenticate, async (req, res) => {
 
     if (!currentStatus) throw new Error("Solicitação não encontrada");
 
-    const itemsRes = await client.query('SELECT product_id, quantity_requested FROM request_items WHERE request_id = $1', [id]);
+    // 🛠️ CORREÇÃO DEADLOCK: Lemos os request_items com ORDER BY para atualizar em cascata perfeitamente
+    const itemsRes = await client.query('SELECT product_id, quantity_requested FROM request_items WHERE request_id = $1 ORDER BY product_id', [id]);
     const items = itemsRes.rows;
 
     if (status === 'entregue' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
@@ -1989,7 +2003,8 @@ app.delete('/requests/:id', authenticate, async (req, res) => {
     const { status } = reqRes.rows[0];
 
     if (status === 'aberto' || status === 'aprovado') {
-       const itemsRes = await client.query('SELECT product_id, quantity_requested FROM request_items WHERE request_id = $1', [id]);
+       // 🛠️ CORREÇÃO DEADLOCK: Lemos os request_items com ORDER BY
+       const itemsRes = await client.query('SELECT product_id, quantity_requested FROM request_items WHERE request_id = $1 ORDER BY product_id', [id]);
        const items = itemsRes.rows;
 
        for (const item of items) {
