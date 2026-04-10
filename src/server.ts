@@ -18,11 +18,11 @@ import separationsRouter from './routes/separations.routes';
 import travelsRouter from './routes/travels.routes';
 import replenishmentsRouter from './routes/replenishments.routes';
 import systemRouter from './routes/system.routes'; 
-// As 4 rotas que faltavam!
 import tasksRouter from './routes/tasks.routes';
 import eletricaTasksRouter from './routes/eletrica-tasks.routes';
 import remindersRouter from './routes/reminders.routes';
 import officeRouter from './routes/office.routes';
+import permissionsRouter from './routes/permissions.routes';
 
 const app = express();
 
@@ -75,6 +75,7 @@ startExpireRequestsJob();
 // Autenticação e Perfis
 app.use('/auth', authRouter);
 app.use('/users', usersRouter);
+app.use('/admin/permissions', permissionsRouter);
 
 // Core do ERP (Produtos, Stock, Pedidos)
 app.use('/products', productsRouter);
