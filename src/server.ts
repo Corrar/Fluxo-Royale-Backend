@@ -17,7 +17,12 @@ import stockRouter from './routes/stock.routes';
 import separationsRouter from './routes/separations.routes';
 import travelsRouter from './routes/travels.routes';
 import replenishmentsRouter from './routes/replenishments.routes';
-import systemRouter from './routes/system.routes'; // Tarefas, Lembretes, Logs, Relatórios
+import systemRouter from './routes/system.routes'; 
+// As 4 rotas que faltavam!
+import tasksRouter from './routes/tasks.routes';
+import eletricaTasksRouter from './routes/eletrica-tasks.routes';
+import remindersRouter from './routes/reminders.routes';
+import officeRouter from './routes/office.routes';
 
 const app = express();
 
@@ -28,8 +33,22 @@ app.use(express.json());
 app.use(globalLimiter);
 
 // Configuração de CORS (ajusta os URLs conforme a tua necessidade)
+const allowedOrigins = [
+  'http://localhost:5173',        
+  'http://localhost:3000',        
+  'https://fluxo-royale.vercel.app',
+  'https://fluxoroyale21.vercel.app'
+];
+
 const corsOptions = {
-  origin: ['http://localhost:5173', 'https://fluxo-royale.vercel.app', 'https://fluxoroyale21.vercel.app'],
+  origin: function (origin: any, callback: any) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) return callback(null, true);
+    if (origin.startsWith('http://localhost') || origin.startsWith('http://192.168.')) {
+        return callback(null, true);
+    }
+    return callback(new Error('Bloqueio CORS: Origem não permitida'), false);
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
@@ -52,20 +71,43 @@ startExpireRequestsJob();
 // ==========================================
 // 🚀 REGISTO DE ROTAS (API ENDPOINTS)
 // ==========================================
+
+// Autenticação e Perfis
 app.use('/auth', authRouter);
 app.use('/users', usersRouter);
+
+// Core do ERP (Produtos, Stock, Pedidos)
 app.use('/products', productsRouter);
 app.use('/requests', requestsRouter);
 app.use('/stock', stockRouter);
+
+// Movimentações Avançadas
 app.use('/separations', separationsRouter);
 app.use('/travel-orders', travelsRouter);
 app.use('/replenishments', replenishmentsRouter);
-app.use('/system', systemRouter); 
+
+// Tarefas, Lembretes e Escritório
+app.use('/tasks', tasksRouter);
+app.use('/eletrica-tasks', eletricaTasksRouter);
+app.use('/reminders', remindersRouter);
+app.use('/office', officeRouter);
+
+// Sistema (Relatórios, Logs, Dashboards) - Mapeado na raiz '/' para manter compatibilidade
+app.use('/', systemRouter); 
 
 // Atalhos de retro-compatibilidade (para não quebrar o frontend atual)
 app.post('/manual-entry', stockRouter);
 app.post('/manual-withdrawal', stockRouter);
-app.get('/my-requests', (req, res, next) => { req.url = '/my'; requestsRouter(req, res, next); });
+
+app.get('/my-requests', (req, res, next) => { 
+    req.url = '/my'; 
+    requestsRouter(req, res, next); 
+});
+
+app.post('/notifications/subscribe', (req, res, next) => { 
+    req.url = '/subscribe-push'; 
+    officeRouter(req, res, next); 
+});
 
 // 4. Ligar o Servidor
 const PORT = process.env.PORT || 3000;
