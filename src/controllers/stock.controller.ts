@@ -48,7 +48,12 @@ export const updateStock = async (req: Request, res: Response) => {
     }
 
     const oldStock = await pool.query('SELECT quantity_on_hand, quantity_reserved, product_id FROM stock WHERE id = $1', [id]);
-    let fields = [], values = [], index = 1;
+    
+    // 🛡️ CORREÇÃO TYPESCRIPT APLICADA:
+    let fields: string[] = []; 
+    let values: any[] = []; 
+    let index = 1;
+    
     if (quantity_on_hand !== undefined) { fields.push(`quantity_on_hand = $${index++}`); values.push(quantity_on_hand); }
     if (quantity_reserved !== undefined) { fields.push(`quantity_reserved = $${index++}`); values.push(quantity_reserved); }
     
