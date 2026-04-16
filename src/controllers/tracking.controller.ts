@@ -5,8 +5,11 @@ import { pool } from '../db';
 const WONCA_API_KEY = "bNamHEjNg2ibpZgOkZDNHuGbuoVhvMap-X_MZKDK20U";
 const API_LIMIT = 1000;
 
-const trackingCache = new Map<string, { data: any, timestamp: number }>();
-const CACHE_TTL = 1000 * 60 * 15; // 15 minutos
+// =======================================================
+// CACHE: Definido para 2 horas (em segundos)
+// 60 segundos * 60 minutos * 2 horas = 7200 segundos
+// =======================================================
+const CACHE_TTL_SECONDS = 7200; 
 
 export const trackPackage = async (req: Request, res: Response) => {
     const { code } = req.params;
@@ -17,7 +20,7 @@ export const trackPackage = async (req: Request, res: Response) => {
 
     try {
         // =======================================================
-        // 1. GESTÃO DE LIMITES DA API
+        // 1. GESTÃO DE LIMITES DA API (Mantido do original)
         // =======================================================
         let usageCount = 0;
         const client = await pool.connect();
@@ -44,12 +47,29 @@ export const trackPackage = async (req: Request, res: Response) => {
         }
 
         // =======================================================
-        // 2. VERIFICAÇÃO DO CACHE DA MEMÓRIA
+        // 2. VERIFICAÇÃO DO CACHE NO BANCO DE DADOS
         // =======================================================
-        const cached = trackingCache.get(code);
-        if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
-            console.log(`[Tracking] Código ${code} no Cache! ⚡`);
-            return res.status(200).json({ ...cached.data, usage: { count: usageCount, limit: API_LIMIT } });
+        try {
+            // Pedimos os dados e também calculamos a "idade" do registro em segundos diretamente no Postgres
+            const cacheRes = await pool.query(`
+                SELECT data, EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - updated_at)) AS age_seconds 
+                FROM tracking_cache 
+                WHERE code = $1
+            `, [code]);
+
+            if (cacheRes.rows.length > 0) {
+                const row = cacheRes.rows[0];
+                
+                // Se a idade for menor que as nossas 2 horas, o cache é válido!
+                if (row.age_seconds < CACHE_TTL_SECONDS) {
+                    console.log(`[Tracking] Código ${code} resgatado do Banco de Dados! (Válido por 2h) ⚡`);
+                    return res.status(200).json({ ...row.data, usage: { count: usageCount, limit: API_LIMIT } });
+                } else {
+                    console.log(`[Tracking] Cache para ${code} expirou. Buscando dados novos...`);
+                }
+            }
+        } catch (dbCacheErr) {
+            console.log('[Tracking] Erro ao tentar ler o cache do Banco de Dados:', dbCacheErr);
         }
 
         let eventosFormatados: any[] = [];
@@ -132,7 +152,6 @@ export const trackPackage = async (req: Request, res: Response) => {
                                 }
                             }
 
-                            // SOLUÇÃO DO TYPESCRIPT AQUI: A variável agora é do tipo "any" em vez de estritamente "null"
                             let destinoFinal: any = null;
                             
                             if (evt.unidadeDestino && evt.unidadeDestino.endereco) {
@@ -204,14 +223,26 @@ export const trackPackage = async (req: Request, res: Response) => {
         }
 
         // =======================================================
-        // RESPOSTA FINAL
+        // RESPOSTA FINAL E SALVAMENTO NO BANCO DE DADOS
         // =======================================================
         if (!encontrouDados || eventosFormatados.length === 0) {
             return res.status(200).json({ eventos: [], usage: { count: usageCount, limit: API_LIMIT } });
         }
 
         const resultFinal = { eventos: eventosFormatados };
-        trackingCache.set(code, { data: resultFinal, timestamp: Date.now() });
+        
+        // Vamos guardar ou atualizar os dados no nosso banco usando UPSERT
+        try {
+            await pool.query(`
+                INSERT INTO tracking_cache (code, data, updated_at) 
+                VALUES ($1, $2, CURRENT_TIMESTAMP) 
+                ON CONFLICT (code) DO UPDATE 
+                SET data = EXCLUDED.data, updated_at = CURRENT_TIMESTAMP
+            `, [code, JSON.stringify(resultFinal)]);
+            console.log(`[Tracking] Cache do código ${code} salvo/atualizado no DB! 💾`);
+        } catch (saveErr: any) {
+            console.error('[Tracking] Falha ao salvar no banco de dados:', saveErr.message);
+        }
 
         return res.status(200).json({ ...resultFinal, usage: { count: usageCount, limit: API_LIMIT } });
 
