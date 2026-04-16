@@ -2,12 +2,11 @@ import { Request, Response } from 'express';
 import axios from 'axios';
 import { pool } from '../db';
 
-// Chave fornecida pelo usuário
 const WONCA_API_KEY = "bNamHEjNg2ibpZgOkZDNHuGbuoVhvMap-X_MZKDK20U";
 const API_LIMIT = 1000;
 
 const trackingCache = new Map<string, { data: any, timestamp: number }>();
-const CACHE_TTL = 1000 * 60 * 15; // 15 minutos
+const CACHE_TTL = 1000 * 60 * 15;
 
 export const trackPackage = async (req: Request, res: Response) => {
     const { code } = req.params;
@@ -18,7 +17,7 @@ export const trackPackage = async (req: Request, res: Response) => {
 
     try {
         // =======================================================
-        // 1. GESTÃO DE LIMITES DA API (1000 requisições por mês)
+        // 1. GESTÃO DE LIMITES DA API (1000 requisições)
         // =======================================================
         let usageCount = 0;
         const client = await pool.connect();
@@ -57,72 +56,83 @@ export const trackPackage = async (req: Request, res: Response) => {
         let encontrouDados = false;
 
         // =======================================================
-        // TENTATIVA 1: WONCA LABS (API Oficial - Método POST)
+        // TENTATIVA 1: WONCA LABS (POST)
         // =======================================================
         if (usageCount < API_LIMIT) {
             try {
-                console.log(`[Tracking] Consultando Wonca Labs (POST) para: ${code}`);
+                console.log(`[Tracking] Consultando Wonca Labs para: ${code}`);
                 
                 const url = `https://api-labs.wonca.com.br/wonca.labs.v1.LabsService/Track`;
                 
                 const resWonca = await axios.post(url, 
-                    { code: code }, // Corpo da requisição conforme a documentação
+                    { code: code }, 
                     {
                         headers: { 
                             'Content-Type': 'application/json',
-                            'Authorization': `Apikey ${WONCA_API_KEY}` // Formato Apikey conforme doc
+                            'Authorization': `Apikey ${WONCA_API_KEY}`
                         },
                         timeout: 10000
                     }
                 );
 
-                // Se a API respondeu, incrementa o uso
                 if (resWonca.status === 200) {
+                    const data = resWonca.data;
+                    
+                    // IMPRESSÃO DE SEGURANÇA (Para podermos ver o JSON se falhar)
+                    console.log(`[Tracking] RAW DATA WONCA (${code}):`, JSON.stringify(data, null, 2));
+
                     const incClient = await pool.connect();
                     try {
                         await incClient.query(`UPDATE api_usage SET request_count = request_count + 1 WHERE api_name = 'seu_rastreio'`);
                         usageCount += 1;
                     } catch (e) {} finally { incClient.release(); }
 
-                    // A Wonca Labs geralmente retorna um objeto com os eventos diretamente ou dentro de um campo 'events'
-                    // Vamos adaptar para o formato que o seu Frontend já espera.
-                    const data = resWonca.data;
+                    // CAÇADOR INTELIGENTE DE EVENTOS
+                    let rawEvents: any[] = [];
                     
-                    // Nota: Se a estrutura de resposta da Wonca Labs mudar, ajustamos aqui.
-                    // Baseado no histórico dessas APIs, o campo costuma ser 'eventos' ou 'events'
-                    const rawEvents = data.eventos || data.events || data.historico || [];
+                    if (Array.isArray(data)) rawEvents = data;
+                    else if (data.events && Array.isArray(data.events)) rawEvents = data.events;
+                    else if (data.eventos && Array.isArray(data.eventos)) rawEvents = data.eventos;
+                    else if (data.historico && Array.isArray(data.historico)) rawEvents = data.historico;
+                    else if (data.tracking && data.tracking.events) rawEvents = data.tracking.events;
+                    else if (data.data && data.data.events) rawEvents = data.data.events;
+                    else if (data.response && data.response.events) rawEvents = data.response.events;
+                    else if (data.track && data.track.events) rawEvents = data.track.events;
 
-                    if (Array.isArray(rawEvents) && rawEvents.length > 0) {
+                    if (rawEvents.length > 0) {
                         eventosFormatados = rawEvents.map((evt: any) => {
-                            let cidadeStr = evt.local || evt.location || "Desconhecido";
-                            let ufStr = "";
+                            // Suporta formatos PT e EN
+                            let cidadeStr = evt.local || evt.location || evt.cidade || evt.city || "Desconhecido";
+                            let ufStr = evt.uf || evt.state || "";
                             if (cidadeStr.includes('/')) {
                                 const parts = cidadeStr.split('/');
                                 cidadeStr = parts[0].trim();
                                 ufStr = parts[1].trim();
                             }
 
+                            const dest = evt.destino || evt.destination;
+
                             return {
-                                descricao: evt.descricao || evt.status || "Status atualizado",
-                                dtHrCriado: evt.data || evt.date || evt.dataHora || new Date().toISOString(),
+                                descricao: evt.descricao || evt.status || evt.description || evt.action || "Status atualizado",
+                                dtHrCriado: evt.data || evt.date || evt.dataHora || evt.trackedAt || evt.createdAt || new Date().toISOString(),
                                 unidade: { 
                                     tipo: "Local", 
                                     endereco: { cidade: cidadeStr, uf: ufStr } 
                                 },
-                                unidadeDestino: evt.destino ? { 
+                                unidadeDestino: dest ? { 
                                     tipo: "Destino", 
-                                    endereco: { cidade: evt.destino, uf: "" } 
+                                    endereco: { cidade: dest, uf: "" } 
                                 } : null
                             };
                         });
                         encontrouDados = true;
-                        console.log(`[Tracking] Sucesso na Wonca Labs para o código: ${code}`);
+                        console.log(`[Tracking] Mapeamento feito com Sucesso na Wonca!`);
+                    } else {
+                        console.log(`[Tracking] O JSON da Wonca chegou, mas não encontramos a lista de eventos dentro dele.`);
                     }
                 }
             } catch (error: any) { 
                 console.log(`[Tracking] Falha na Wonca Labs: ${error.message}`); 
-                // Se der erro 403/401, o token ou a URL podem estar errados
-                if (error.response) console.log('[Tracking] Erro Detalhado:', error.response.data);
             }
         }
 
