@@ -109,8 +109,9 @@ export const trackPackage = async (req: Request, res: Response) => {
                 if (resRastreio.status === 200 && resRastreio.data?.success) {
                     const data = resRastreio.data;
                     
-                    // Se for conta paga, usa o 'historico'. Se for grátis, usa o 'eventoMaisRecente' e converte num Array.
-                    let baseEventos = [];
+                    // CORREÇÃO AQUI: TS exigia o "any[]" para saber o formato do array
+                    let baseEventos: any[] = []; 
+                    
                     if (data.historico && data.historico.length > 0) {
                         baseEventos = data.historico;
                     } else if (data.eventoMaisRecente) {
@@ -119,11 +120,11 @@ export const trackPackage = async (req: Request, res: Response) => {
 
                     if (baseEventos.length > 0) {
                         eventosFormatados = baseEventos.map((evt: any) => ({
-                            descricao: evt.descricao || "Status atualizado",
-                            dtHrCriado: evt.data || new Date().toISOString(),
+                            descricao: evt.descricao || evt.status || "Status atualizado",
+                            dtHrCriado: evt.data || evt.dtHrCriado || evt.dataHora || new Date().toISOString(),
                             unidade: { 
                                 tipo: "Local", 
-                                endereco: { cidade: evt.local || "Desconhecido", uf: "" } 
+                                endereco: { cidade: evt.local || evt.cidade || "Desconhecido", uf: evt.uf || "" } 
                             },
                             unidadeDestino: evt.destino ? { tipo: "Destino", endereco: { cidade: evt.destino, uf: "" } } : null
                         }));
