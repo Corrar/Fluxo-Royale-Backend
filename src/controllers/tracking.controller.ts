@@ -46,6 +46,39 @@ export const trackPackage = async (req: Request, res: Response) => {
             return res.status(200).json({ ...cached.data, usage: { count: usageCount, limit: 50 } });
         }
 
+        // =======================================================
+        // MODO DE TESTE PARA O FRONTEND (Pode apagar no futuro)
+        // =======================================================
+        if (code === 'TESTE123BR') {
+            console.log('[Tracking] MODO DE TESTE ATIVADO! Gerando pacote falso.');
+            return res.status(200).json({
+                usage: { count: usageCount, limit: 50 },
+                eventos: [
+                    {
+                        descricao: "Objeto entregue ao destinatário",
+                        dtHrCriado: new Date().toISOString(),
+                        unidade: { tipo: "Unidade de Distribuição", endereco: { cidade: "Adamantina", uf: "SP" } }
+                    },
+                    {
+                        descricao: "Objeto saiu para entrega ao destinatário",
+                        dtHrCriado: new Date(Date.now() - 4000000).toISOString(),
+                        unidade: { tipo: "Unidade de Distribuição", endereco: { cidade: "Adamantina", uf: "SP" } }
+                    },
+                    {
+                        descricao: "Objeto em trânsito - por favor aguarde",
+                        dtHrCriado: new Date(Date.now() - 86400000).toISOString(),
+                        unidade: { tipo: "Unidade de Tratamento", endereco: { cidade: "Bauru", uf: "SP" } },
+                        unidadeDestino: { tipo: "Unidade de Distribuição", endereco: { cidade: "Adamantina", uf: "SP" } }
+                    },
+                    {
+                        descricao: "Objeto postado",
+                        dtHrCriado: new Date(Date.now() - 172800000).toISOString(),
+                        unidade: { tipo: "Agência dos Correios", endereco: { cidade: "São Paulo", uf: "SP" } }
+                    }
+                ]
+            });
+        }
+
         let eventosFormatados: any[] = [];
         let encontrouDados = false;
 
