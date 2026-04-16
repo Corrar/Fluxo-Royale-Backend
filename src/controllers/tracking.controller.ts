@@ -2,8 +2,9 @@ import { Request, Response } from 'express';
 import axios from 'axios';
 import { pool } from '../db';
 
-// A sua chave de API gerada no Dashboard do Seu Rastreio
-const SEU_RASTREIO_TOKEN = "sr_live_o8afqByB4GIqDCgQruI-kOzMuiKOLCRlYQf5r7QhmFE";
+// A sua Nova Chave Profissional (Wonca Labs / Site Rastreio)
+const WONCA_API_KEY = "bNamHEjNg2ibpZgOkZDNHuGbuoVhvMap-X_MZKDK20U";
+const API_LIMIT = 1000;
 
 const trackingCache = new Map<string, { data: any, timestamp: number }>();
 const CACHE_TTL = 1000 * 60 * 15; // 15 minutos
@@ -16,7 +17,9 @@ export const trackPackage = async (req: Request, res: Response) => {
     }
 
     try {
-        // 1. GESTÃO DE LIMITES DA API (50 requisições por mês)
+        // =======================================================
+        // 1. GESTÃO DE LIMITES DA API (1000 requisições por mês)
+        // =======================================================
         let usageCount = 0;
         const client = await pool.connect();
         try {
@@ -32,6 +35,9 @@ export const trackPackage = async (req: Request, res: Response) => {
                 } else {
                     usageCount = usage.request_count;
                 }
+            } else {
+                // Se a tabela não tiver a linha, insere a primeira vez
+                await client.query(`INSERT INTO api_usage (api_name, request_count, last_reset) VALUES ('seu_rastreio', 0, CURRENT_TIMESTAMP)`);
             }
         } catch (dbErr) {
             console.log('[Tracking] Erro ao ler limite DB:', dbErr);
@@ -39,66 +45,35 @@ export const trackPackage = async (req: Request, res: Response) => {
             client.release(); 
         }
 
+        // =======================================================
         // 2. VERIFICAÇÃO DO CACHE DA MEMÓRIA
+        // =======================================================
         const cached = trackingCache.get(code);
         if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
             console.log(`[Tracking] Código ${code} no Cache! ⚡`);
-            return res.status(200).json({ ...cached.data, usage: { count: usageCount, limit: 50 } });
-        }
-
-        // =======================================================
-        // MODO DE TESTE PARA O FRONTEND (Pode apagar no futuro)
-        // =======================================================
-        if (code === 'TESTE123BR') {
-            console.log('[Tracking] MODO DE TESTE ATIVADO! Gerando pacote falso.');
-            return res.status(200).json({
-                usage: { count: usageCount, limit: 50 },
-                eventos: [
-                    {
-                        descricao: "Objeto entregue ao destinatário",
-                        dtHrCriado: new Date().toISOString(),
-                        unidade: { tipo: "Unidade de Distribuição", endereco: { cidade: "Adamantina", uf: "SP" } }
-                    },
-                    {
-                        descricao: "Objeto saiu para entrega ao destinatário",
-                        dtHrCriado: new Date(Date.now() - 4000000).toISOString(),
-                        unidade: { tipo: "Unidade de Distribuição", endereco: { cidade: "Adamantina", uf: "SP" } }
-                    },
-                    {
-                        descricao: "Objeto em trânsito - por favor aguarde",
-                        dtHrCriado: new Date(Date.now() - 86400000).toISOString(),
-                        unidade: { tipo: "Unidade de Tratamento", endereco: { cidade: "Bauru", uf: "SP" } },
-                        unidadeDestino: { tipo: "Unidade de Distribuição", endereco: { cidade: "Adamantina", uf: "SP" } }
-                    },
-                    {
-                        descricao: "Objeto postado",
-                        dtHrCriado: new Date(Date.now() - 172800000).toISOString(),
-                        unidade: { tipo: "Agência dos Correios", endereco: { cidade: "São Paulo", uf: "SP" } }
-                    }
-                ]
-            });
+            return res.status(200).json({ ...cached.data, usage: { count: usageCount, limit: API_LIMIT } });
         }
 
         let eventosFormatados: any[] = [];
         let encontrouDados = false;
 
         // =======================================================
-        // INTEGRAÇÃO OFICIAL: SEU RASTREIO API
+        // TENTATIVA 1: WONCA LABS (Site Rastreio) - Até 1000 Usos
         // =======================================================
-        if (usageCount < 50) {
+        if (usageCount < API_LIMIT) {
             try {
-                console.log(`[Tracking] Consultando Seu Rastreio para: ${code}`);
+                console.log(`[Tracking] Consultando Wonca Labs para: ${code}`);
                 
-                // URL Base oficial. (Se a sua loja tiver um slug configurado, troque o "api" pelo seu slug)
-                const url = `https://api.seurastreio.com.br/api/public/rastreio/${code}`;
+                // Endpoints corporativos da Wonca/Site Rastreio
+                const url = `https://api.siterastreio.com.br/api/public/rastreio/${code}`;
                 
                 const resRastreio = await axios.get(url, {
-                    headers: { 'Authorization': `Bearer ${SEU_RASTREIO_TOKEN}` },
-                    validateStatus: () => true, // Não quebra no 404
+                    headers: { 'Authorization': `Bearer ${WONCA_API_KEY}` },
+                    validateStatus: () => true,
                     timeout: 8000
                 });
 
-                // Atualiza contagem de uso no banco
+                // Atualiza contagem de uso no banco SE a API respondeu e descontou do seu limite
                 if (resRastreio.status === 200 || resRastreio.status === 404) {
                     const incClient = await pool.connect();
                     try {
@@ -107,13 +82,11 @@ export const trackPackage = async (req: Request, res: Response) => {
                     } catch (e) {} finally { incClient.release(); }
                 }
 
-                // Processamento exato da documentação (Sucesso = 200 e success = true)
+                // Formatação dos Dados da Wonca
                 if (resRastreio.status === 200 && resRastreio.data?.success) {
                     const data = resRastreio.data;
-                    
                     let baseEventos: any[] = [];
                     
-                    // Se tiver o plano pago, pega o 'historico'. Se for grátis, pega o 'eventoMaisRecente'
                     if (data.historico && Array.isArray(data.historico)) {
                         baseEventos = data.historico;
                     } else if (data.eventoMaisRecente) {
@@ -122,7 +95,6 @@ export const trackPackage = async (req: Request, res: Response) => {
 
                     if (baseEventos.length > 0) {
                         eventosFormatados = baseEventos.map((evt: any) => {
-                            // Extrai a cidade e a UF se vier no formato "São Paulo/SP"
                             let cidadeStr = evt.local || "Desconhecido";
                             let ufStr = "";
                             if (cidadeStr.includes('/')) {
@@ -132,8 +104,8 @@ export const trackPackage = async (req: Request, res: Response) => {
                             }
 
                             return {
-                                descricao: evt.descricao || "Status atualizado",
-                                dtHrCriado: evt.data || new Date().toISOString(),
+                                descricao: evt.descricao || evt.status || "Status atualizado",
+                                dtHrCriado: evt.data || evt.dataHora || new Date().toISOString(),
                                 unidade: { 
                                     tipo: "Local", 
                                     endereco: { cidade: cidadeStr, uf: ufStr } 
@@ -145,18 +117,21 @@ export const trackPackage = async (req: Request, res: Response) => {
                             };
                         });
                         encontrouDados = true;
-                        console.log(`[Tracking] API Seu Rastreio encontrou a encomenda!`);
+                        console.log(`[Tracking] Sucesso estrondoso na API Wonca Labs!`);
                     }
-                } else {
-                    console.log(`[Tracking] Seu Rastreio não encontrou (Status: ${resRastreio.status})`);
+                } else if (resRastreio.status === 401) {
+                    console.log(`[Tracking] Token da Wonca Labs inválido ou sem cota!`);
                 }
             } catch (error: any) { 
-                console.log(`[Tracking] Falha na comunicação com Seu Rastreio: ${error.message}`); 
+                console.log(`[Tracking] Falha na Wonca Labs: ${error.message}`); 
             }
+        } else {
+            console.log(`[Tracking] LIMITE ATINGIDO! Bloqueando Wonca Labs. Tentando alternativas gratuitas...`);
         }
 
         // =======================================================
-        // FALLBACK: BRASIL API (O plano de emergência ilimitado)
+        // TENTATIVA 2: FALLBACK GRATUITO (Brasil API)
+        // (Entra em ação quando chegar aos 1001 rastreios)
         // =======================================================
         if (!encontrouDados) {
             try {
@@ -180,23 +155,22 @@ export const trackPackage = async (req: Request, res: Response) => {
                         };
                     });
                     encontrouDados = true;
-                    console.log(`[Tracking] Fallback BrasilAPI funcionou!`);
                 }
-            } catch (error: any) { console.log(`[Tracking] BrasilAPI falhou: ${error.message}`); }
+            } catch (error: any) {}
         }
 
         // =======================================================
         // RESPOSTA AO FRONTEND
         // =======================================================
         if (!encontrouDados || eventosFormatados.length === 0) {
-            // Se o código for muito velho ou ainda não foi postado, ele cai aqui.
-            return res.status(200).json({ eventos: [], usage: { count: usageCount, limit: 50 } });
+            return res.status(200).json({ eventos: [], usage: { count: usageCount, limit: API_LIMIT } });
         }
 
         const resultFinal = { eventos: eventosFormatados };
         trackingCache.set(code, { data: resultFinal, timestamp: Date.now() });
 
-        return res.status(200).json({ ...resultFinal, usage: { count: usageCount, limit: 50 } });
+        // Envia sempre o contador de uso para o Frontend atualizar a tela
+        return res.status(200).json({ ...resultFinal, usage: { count: usageCount, limit: API_LIMIT } });
 
     } catch (error: any) {
         console.error('[Tracking] Erro crítico geral:', error.message);
