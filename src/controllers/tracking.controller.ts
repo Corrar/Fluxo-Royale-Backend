@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import axios from 'axios';
 import { pool } from '../db';
 
-// A sua Nova Chave Profissional (Wonca Labs / Site Rastreio)
+// Chave fornecida pelo usuário
 const WONCA_API_KEY = "bNamHEjNg2ibpZgOkZDNHuGbuoVhvMap-X_MZKDK20U";
 const API_LIMIT = 1000;
 
@@ -36,7 +36,6 @@ export const trackPackage = async (req: Request, res: Response) => {
                     usageCount = usage.request_count;
                 }
             } else {
-                // Se a tabela não tiver a linha, insere a primeira vez
                 await client.query(`INSERT INTO api_usage (api_name, request_count, last_reset) VALUES ('seu_rastreio', 0, CURRENT_TIMESTAMP)`);
             }
         } catch (dbErr) {
@@ -58,44 +57,44 @@ export const trackPackage = async (req: Request, res: Response) => {
         let encontrouDados = false;
 
         // =======================================================
-        // TENTATIVA 1: WONCA LABS (Site Rastreio) - Até 1000 Usos
+        // TENTATIVA 1: WONCA LABS (API Oficial - Método POST)
         // =======================================================
         if (usageCount < API_LIMIT) {
             try {
-                console.log(`[Tracking] Consultando Wonca Labs para: ${code}`);
+                console.log(`[Tracking] Consultando Wonca Labs (POST) para: ${code}`);
                 
-                // Endpoints corporativos da Wonca/Site Rastreio
-                const url = `https://api.siterastreio.com.br/api/public/rastreio/${code}`;
+                const url = `https://api-labs.wonca.com.br/wonca.labs.v1.LabsService/Track`;
                 
-                const resRastreio = await axios.get(url, {
-                    headers: { 'Authorization': `Bearer ${WONCA_API_KEY}` },
-                    validateStatus: () => true,
-                    timeout: 8000
-                });
+                const resWonca = await axios.post(url, 
+                    { code: code }, // Corpo da requisição conforme a documentação
+                    {
+                        headers: { 
+                            'Content-Type': 'application/json',
+                            'Authorization': `Apikey ${WONCA_API_KEY}` // Formato Apikey conforme doc
+                        },
+                        timeout: 10000
+                    }
+                );
 
-                // Atualiza contagem de uso no banco SE a API respondeu e descontou do seu limite
-                if (resRastreio.status === 200 || resRastreio.status === 404) {
+                // Se a API respondeu, incrementa o uso
+                if (resWonca.status === 200) {
                     const incClient = await pool.connect();
                     try {
                         await incClient.query(`UPDATE api_usage SET request_count = request_count + 1 WHERE api_name = 'seu_rastreio'`);
                         usageCount += 1;
                     } catch (e) {} finally { incClient.release(); }
-                }
 
-                // Formatação dos Dados da Wonca
-                if (resRastreio.status === 200 && resRastreio.data?.success) {
-                    const data = resRastreio.data;
-                    let baseEventos: any[] = [];
+                    // A Wonca Labs geralmente retorna um objeto com os eventos diretamente ou dentro de um campo 'events'
+                    // Vamos adaptar para o formato que o seu Frontend já espera.
+                    const data = resWonca.data;
                     
-                    if (data.historico && Array.isArray(data.historico)) {
-                        baseEventos = data.historico;
-                    } else if (data.eventoMaisRecente) {
-                        baseEventos = [data.eventoMaisRecente];
-                    }
+                    // Nota: Se a estrutura de resposta da Wonca Labs mudar, ajustamos aqui.
+                    // Baseado no histórico dessas APIs, o campo costuma ser 'eventos' ou 'events'
+                    const rawEvents = data.eventos || data.events || data.historico || [];
 
-                    if (baseEventos.length > 0) {
-                        eventosFormatados = baseEventos.map((evt: any) => {
-                            let cidadeStr = evt.local || "Desconhecido";
+                    if (Array.isArray(rawEvents) && rawEvents.length > 0) {
+                        eventosFormatados = rawEvents.map((evt: any) => {
+                            let cidadeStr = evt.local || evt.location || "Desconhecido";
                             let ufStr = "";
                             if (cidadeStr.includes('/')) {
                                 const parts = cidadeStr.split('/');
@@ -105,7 +104,7 @@ export const trackPackage = async (req: Request, res: Response) => {
 
                             return {
                                 descricao: evt.descricao || evt.status || "Status atualizado",
-                                dtHrCriado: evt.data || evt.dataHora || new Date().toISOString(),
+                                dtHrCriado: evt.data || evt.date || evt.dataHora || new Date().toISOString(),
                                 unidade: { 
                                     tipo: "Local", 
                                     endereco: { cidade: cidadeStr, uf: ufStr } 
@@ -117,21 +116,18 @@ export const trackPackage = async (req: Request, res: Response) => {
                             };
                         });
                         encontrouDados = true;
-                        console.log(`[Tracking] Sucesso estrondoso na API Wonca Labs!`);
+                        console.log(`[Tracking] Sucesso na Wonca Labs para o código: ${code}`);
                     }
-                } else if (resRastreio.status === 401) {
-                    console.log(`[Tracking] Token da Wonca Labs inválido ou sem cota!`);
                 }
             } catch (error: any) { 
                 console.log(`[Tracking] Falha na Wonca Labs: ${error.message}`); 
+                // Se der erro 403/401, o token ou a URL podem estar errados
+                if (error.response) console.log('[Tracking] Erro Detalhado:', error.response.data);
             }
-        } else {
-            console.log(`[Tracking] LIMITE ATINGIDO! Bloqueando Wonca Labs. Tentando alternativas gratuitas...`);
         }
 
         // =======================================================
-        // TENTATIVA 2: FALLBACK GRATUITO (Brasil API)
-        // (Entra em ação quando chegar aos 1001 rastreios)
+        // TENTATIVA 2: FALLBACK (Brasil API)
         // =======================================================
         if (!encontrouDados) {
             try {
@@ -160,7 +156,7 @@ export const trackPackage = async (req: Request, res: Response) => {
         }
 
         // =======================================================
-        // RESPOSTA AO FRONTEND
+        // RESPOSTA FINAL
         // =======================================================
         if (!encontrouDados || eventosFormatados.length === 0) {
             return res.status(200).json({ eventos: [], usage: { count: usageCount, limit: API_LIMIT } });
@@ -169,7 +165,6 @@ export const trackPackage = async (req: Request, res: Response) => {
         const resultFinal = { eventos: eventosFormatados };
         trackingCache.set(code, { data: resultFinal, timestamp: Date.now() });
 
-        // Envia sempre o contador de uso para o Frontend atualizar a tela
         return res.status(200).json({ ...resultFinal, usage: { count: usageCount, limit: API_LIMIT } });
 
     } catch (error: any) {
