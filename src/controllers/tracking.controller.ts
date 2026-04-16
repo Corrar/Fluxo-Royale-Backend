@@ -1,13 +1,13 @@
 import { Request, Response } from 'express';
 import axios from 'axios';
 import { pool } from '../db';
+import { rastrearEncomendas } from 'correios-brasil'; 
 
-// A sua Chave Oficial
+// ⚠️ AVISO: Nunca partilhe a sua Chave publicamente (apague do chat se puder depois).
 const SEU_RASTREIO_TOKEN = "sr_live_o8afqByB4GIqDCgQruI-kOzMuiKOLCRlYQf5r7QhmFE";
 
-// Cache para não gastar o limite se alguém atualizar a página (15 min)
 const trackingCache = new Map<string, { data: any, timestamp: number }>();
-const CACHE_TTL = 1000 * 60 * 15; 
+const CACHE_TTL = 1000 * 60 * 15; // 15 minutos
 
 export const trackPackage = async (req: Request, res: Response) => {
     const { code } = req.params;
@@ -17,36 +17,15 @@ export const trackPackage = async (req: Request, res: Response) => {
     }
 
     try {
-        // =======================================================
-        // 1. GESTÃO DO LIMITE NO BANCO DE DADOS (50/mês)
-        // =======================================================
-        const client = await pool.connect();
         let usageCount = 0;
+        const client = await pool.connect();
         try {
-            // Cria a tabela automaticamente se o utilizador ainda não a tiver criado!
-            await client.query(`
-                CREATE TABLE IF NOT EXISTS api_usage (
-                    api_name VARCHAR(50) PRIMARY KEY,
-                    request_count INT DEFAULT 0,
-                    last_reset TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            `);
-            await client.query(`
-                INSERT INTO api_usage (api_name, request_count) 
-                VALUES ('seu_rastreio', 0) ON CONFLICT DO NOTHING;
-            `);
-
-            // Lê o uso atual
             const resUsage = await client.query(`
-                SELECT request_count, 
-                       EXTRACT(MONTH FROM last_reset) as reset_month, 
-                       EXTRACT(MONTH FROM CURRENT_TIMESTAMP) as curr_month 
+                SELECT request_count, EXTRACT(MONTH FROM last_reset) as reset_month, EXTRACT(MONTH FROM CURRENT_TIMESTAMP) as curr_month 
                 FROM api_usage WHERE api_name = 'seu_rastreio'
             `);
-            
             if (resUsage.rows.length > 0) {
                 const usage = resUsage.rows[0];
-                // Se virou o mês, reseta o contador para Zero!
                 if (usage.reset_month !== usage.curr_month) {
                     await client.query(`UPDATE api_usage SET request_count = 0, last_reset = CURRENT_TIMESTAMP WHERE api_name = 'seu_rastreio'`);
                     usageCount = 0;
@@ -54,83 +33,108 @@ export const trackPackage = async (req: Request, res: Response) => {
                     usageCount = usage.request_count;
                 }
             }
-        } catch (dbErr) {
-            console.error('[Tracking] Erro na verificação do banco de dados:', dbErr);
-        } finally {
-            client.release();
-        }
+        } catch (dbErr) {} finally { client.release(); }
 
         // =======================================================
-        // 2. VERIFICAR O CACHE (As consultas aqui não gastam o seu limite!)
+        // 1. VERIFICAR O CACHE
         // =======================================================
         const cached = trackingCache.get(code);
         if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
-            console.log(`[Tracking] Código ${code} no Cache! Cota poupada. ⚡`);
+            console.log(`[Tracking] Código ${code} no Cache! ⚡`);
             return res.status(200).json({ ...cached.data, usage: { count: usageCount, limit: 50 } });
-        }
-
-        // =======================================================
-        // 3. BLOQUEIO DE SEGURANÇA SE ATINGIU 50
-        // =======================================================
-        if (usageCount >= 50) {
-            console.log(`[Tracking] ⚠️ ALERTA: Limite de 50 rastreios mensais atingido! Bloqueando consulta para ${code}.`);
-            return res.status(429).json({ error: 'LIMIT_REACHED' });
         }
 
         let eventosFormatados: any[] = [];
         let encontrouDados = false;
 
         // =======================================================
-        // 4. TENTATIVA 1: SEU RASTREIO API
+        // TENTATIVA 1: CORREIOS OFICIAL DIRETO (Ilimitado e Grátis)
         // =======================================================
         try {
-            console.log(`[Tracking] Consultando 'Seu Rastreio' para: ${code}`);
+            console.log(`[Tracking] Tentativa 1: correios-brasil para ${code}`);
+            const correiosRes = await rastrearEncomendas([code]);
             
-            // O Escudo Try/Catch aqui impede o Erro 500 se a rede falhar
-            const url = `https://api.seurastreio.com.br/v1/trackings/${code}`;
-            const resRastreio = await axios.get(url, {
-                headers: { 'Authorization': `Bearer ${SEU_RASTREIO_TOKEN}` },
-                validateStatus: () => true,
-                timeout: 8000
-            });
-
-            // INCREMENTA O SEU USO NO BANCO
-            if (resRastreio.status === 200 || resRastreio.status === 404) {
-                const incClient = await pool.connect();
-                try {
-                    await incClient.query(`UPDATE api_usage SET request_count = request_count + 1 WHERE api_name = 'seu_rastreio'`);
-                    usageCount += 1;
-                } catch (e) {} finally { incClient.release(); }
-            }
-
-            if (resRastreio.status === 200 && resRastreio.data) {
-                const dadosBrutos = resRastreio.data.events || resRastreio.data.historico || resRastreio.data.eventos || [];
-                if (Array.isArray(dadosBrutos) && dadosBrutos.length > 0) {
-                    eventosFormatados = dadosBrutos.map((evt: any) => ({
-                        descricao: evt.status || evt.description || evt.descricao || "Status atualizado",
-                        dtHrCriado: evt.date || evt.dataHora || evt.dtHrCriado || new Date().toISOString(),
-                        unidade: {
-                            tipo: evt.location || "Local",
-                            endereco: { cidade: evt.city || evt.cidade || evt.local || "Desconhecido", uf: evt.state || evt.uf || "" }
-                        }
-                    }));
-                    encontrouDados = true;
-                    console.log(`[Tracking] Sucesso na API 'Seu Rastreio'!`);
-                }
+            if (correiosRes && correiosRes[0] && correiosRes[0].eventos && correiosRes[0].eventos.length > 0) {
+                eventosFormatados = correiosRes[0].eventos.map((evt: any) => ({
+                    descricao: evt.descricao || evt.status || "Status atualizado",
+                    dtHrCriado: evt.dtHrCriado || new Date().toISOString(),
+                    unidade: {
+                        tipo: evt.unidade?.tipo || "Local",
+                        endereco: { cidade: evt.unidade?.endereco?.cidade || evt.local || "Desconhecido", uf: evt.unidade?.endereco?.uf || "" }
+                    },
+                    unidadeDestino: evt.unidadeDestino ? {
+                        tipo: evt.unidadeDestino.tipo || "Destino",
+                        endereco: { cidade: evt.unidadeDestino.endereco?.cidade || "", uf: evt.unidadeDestino.endereco?.uf || "" }
+                    } : null
+                }));
+                encontrouDados = true;
             }
         } catch (error: any) {
-            console.log(`[Tracking] Seu Rastreio falhou (Caindo para o Plano B): ${error.message}`);
+            console.log(`[Tracking] Tentativa 1 falhou: ${error.message}`);
         }
 
         // =======================================================
-        // 5. TENTATIVA 2: BRASILAPI (Plano B Gratuito e Ilimitado)
+        // TENTATIVA 2: SEU RASTREIO (Com Auto-Registo!)
+        // =======================================================
+        if (!encontrouDados && usageCount < 50) {
+            try {
+                console.log(`[Tracking] Tentativa 2: Seu Rastreio para ${code}`);
+                const url = `https://api.seurastreio.com.br/v1/trackings/${code}`;
+                
+                // 1. Tenta buscar a encomenda
+                const resRastreio = await axios.get(url, {
+                    headers: { 'Authorization': `Bearer ${SEU_RASTREIO_TOKEN}` },
+                    validateStatus: () => true, timeout: 8000
+                });
+
+                // Incrementa a cota no banco
+                if (resRastreio.status === 200 || resRastreio.status === 404) {
+                    const incClient = await pool.connect();
+                    try {
+                        await incClient.query(`UPDATE api_usage SET request_count = request_count + 1 WHERE api_name = 'seu_rastreio'`);
+                        usageCount += 1;
+                    } catch (e) {} finally { incClient.release(); }
+                }
+
+                // 2. SE NÃO EXISTIR NO PAINEL DELES (404), REGISTRA AGORA!
+                if (resRastreio.status === 404) {
+                    console.log(`[Tracking] Encomenda não encontrada no painel. Registrando ${code} agora...`);
+                    try {
+                        // Fazemos um POST para criar a encomenda no seu painel "Seu Rastreio"
+                        await axios.post('https://api.seurastreio.com.br/v1/trackings', {
+                            codigo: code // Payload comum da API
+                        }, {
+                            headers: { 'Authorization': `Bearer ${SEU_RASTREIO_TOKEN}` },
+                            validateStatus: () => true
+                        });
+                        console.log(`[Tracking] Código ${code} cadastrado no painel com sucesso!`);
+                    } catch (postErr) {
+                        console.log(`[Tracking] Falha ao auto-registrar:`, postErr);
+                    }
+                }
+                
+                // 3. Se a busca (GET) inicial deu sucesso e trouxe dados
+                if (resRastreio.status === 200 && resRastreio.data) {
+                    const dadosBrutos = resRastreio.data.events || resRastreio.data.historico || resRastreio.data.eventos || [];
+                    if (dadosBrutos.length > 0) {
+                        eventosFormatados = dadosBrutos.map((evt: any) => ({
+                            descricao: evt.status || evt.description || evt.descricao || "Status atualizado",
+                            dtHrCriado: evt.date || evt.dataHora || evt.dtHrCriado || new Date().toISOString(),
+                            unidade: { tipo: evt.location || "Local", endereco: { cidade: evt.city || evt.cidade || evt.local || "Desconhecido", uf: evt.state || evt.uf || "" } }
+                        }));
+                        encontrouDados = true;
+                    }
+                }
+            } catch (error: any) { console.log(`[Tracking] Tentativa 2 falhou: ${error.message}`); }
+        }
+
+        // =======================================================
+        // TENTATIVA 3: BRASILAPI
         // =======================================================
         if (!encontrouDados) {
             try {
-                console.log(`[Tracking] Tentativa 2: BrasilAPI para: ${code}`);
-                const resBrasil = await axios.get(`https://brasilapi.com.br/api/correios/v1/${code}`, { 
-                    validateStatus: () => true, timeout: 8000
-                });
+                console.log(`[Tracking] Tentativa 3: BrasilAPI para: ${code}`);
+                const resBrasil = await axios.get(`https://brasilapi.com.br/api/correios/v1/${code}`, { validateStatus: () => true, timeout: 8000 });
 
                 if (resBrasil.status === 200 && resBrasil.data?.eventos?.length > 0) {
                     eventosFormatados = resBrasil.data.eventos.map((evt: any) => {
@@ -141,33 +145,27 @@ export const trackPackage = async (req: Request, res: Response) => {
                                 dataIso = `${ano}-${mes}-${dia}T${evt.hora}:00`;
                             }
                         } catch (e) {}
-
                         return {
                             descricao: evt.descricao || evt.status || "Status atualizado",
                             dtHrCriado: dataIso,
-                            unidade: {
-                                tipo: "Local",
-                                endereco: { cidade: evt.local || evt.cidade || "Desconhecido", uf: evt.uf || "" }
-                            }
+                            unidade: { tipo: "Local", endereco: { cidade: evt.local || evt.cidade || "Desconhecido", uf: evt.uf || "" } }
                         };
                     });
                     encontrouDados = true;
-                    console.log(`[Tracking] Sucesso na BrasilAPI!`);
                 }
-            } catch (error: any) {
-                console.log(`[Tracking] BrasilAPI falhou: ${error.message}`);
-            }
+            } catch (error: any) { console.log(`[Tracking] Tentativa 3 falhou: ${error.message}`); }
         }
 
         // =======================================================
-        // 6. RESPOSTA FINAL AO FRONTEND
+        // RESPOSTA AO FRONTEND
         // =======================================================
-        const resultFinal = { eventos: encontrouDados ? eventosFormatados : [] };
-        
-        // Guarda na memória
+        if (!encontrouDados || eventosFormatados.length === 0) {
+            return res.status(200).json({ eventos: [], usage: { count: usageCount, limit: 50 } });
+        }
+
+        const resultFinal = { eventos: eventosFormatados };
         trackingCache.set(code, { data: resultFinal, timestamp: Date.now() });
 
-        // Envia resposta incluindo a contagem de uso (ex: 1/50)
         return res.status(200).json({ ...resultFinal, usage: { count: usageCount, limit: 50 } });
 
     } catch (error: any) {
