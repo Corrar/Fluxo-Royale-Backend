@@ -69,9 +69,12 @@ export const trackPackage = async (req: Request, res: Response) => {
                     {
                         headers: { 
                             'Content-Type': 'application/json',
-                            'Authorization': `Apikey ${WONCA_API_KEY}`
+                            'Accept': 'application/json',
+                            'Authorization': `Apikey ${WONCA_API_KEY}`,
+                            // A camuflagem perfeita anti-bloqueio de Firewall:
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
                         },
-                        timeout: 10000
+                        timeout: 15000 // Aumentado para 15 segundos para evitar o timeout da barreira deles
                     }
                 );
 
@@ -133,6 +136,7 @@ export const trackPackage = async (req: Request, res: Response) => {
                 }
             } catch (error: any) { 
                 console.log(`[Tracking] Falha na Wonca Labs: ${error.message}`); 
+                if (error.response) console.log('[Tracking] Detalhe do Erro:', JSON.stringify(error.response.data));
             }
         }
 
