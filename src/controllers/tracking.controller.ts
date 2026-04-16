@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import axios from 'axios';
 
 export const trackPackage = async (req: Request, res: Response) => {
     const { code } = req.params;
@@ -8,50 +9,63 @@ export const trackPackage = async (req: Request, res: Response) => {
     }
 
     try {
-        // Usamos a API pública do Link&Track para fugir do bloqueio de IP dos Correios no Render
-        const url = `https://api.linketrack.com/track/json?user=teste&token=1abcd00b2731640e886fb41a8a9671ad1434c599dbaa0a0de9a5aa619f29a83f&codigo=${code}`;
+        console.log(`[Tracking] Consultando BrasilAPI para o código: ${code}`);
         
-        // O Node.js moderno já tem o fetch nativo, igual ao navegador
-        const response = await fetch(url);
+        // Utilizamos a BrasilAPI: estável, gratuita e sem tokens
+        const url = `https://brasilapi.com.br/api/correios/v1/${code}`;
         
-        if (!response.ok) {
-            throw new Error('Falha na API de rastreio externa (Link&Track)');
+        // validateStatus garante que o axios não "quebre" se a API devolver erro 404 (Objeto não encontrado)
+        const response = await axios.get(url, { validateStatus: () => true });
+
+        // Se o objeto ainda não foi postado ou não existe, a BrasilAPI devolve 404
+        if (response.status === 404) {
+            console.log(`[Tracking] Código ${code} ainda não encontrado na base dos Correios.`);
+            return res.status(200).json({ eventos: [] });
         }
 
-        const data = await response.json();
+        if (response.status !== 200) {
+            throw new Error(`A BrasilAPI retornou status ${response.status}`);
+        }
 
-        // Se a encomenda não existir ou ainda não tiver sido postada
-        if (!data.eventos || data.eventos.length === 0) {
+        const data = response.data;
+
+        if (!data || !data.eventos || data.eventos.length === 0) {
              return res.status(200).json({ eventos: [] });
         }
 
-        // O Link&Track devolve num formato ligeiramente diferente.
-        // Vamos formatar para o exato padrão que o seu Frontend (React) já espera.
+        // Formatamos os dados da BrasilAPI para o Frontend (React) não precisar mudar nada
         const eventosFormatados = data.eventos.map((evt: any) => {
+            let dataIso = new Date().toISOString(); // Fallback seguro
             
-            // O Link&Track devolve a data como "DD/MM/YYYY" e hora "HH:MM". 
-            // O React precisa do formato ISO: "YYYY-MM-DDTHH:MM:00"
-            const [dia, mes, ano] = evt.data.split('/');
-            const dataIso = `${ano}-${mes}-${dia}T${evt.hora}:00`;
+            try {
+                // A BrasilAPI devolve data: "DD/MM/YYYY" e hora: "HH:MM"
+                if (evt.data && evt.hora) {
+                    const [dia, mes, ano] = evt.data.split('/');
+                    dataIso = `${ano}-${mes}-${dia}T${evt.hora}:00`;
+                }
+            } catch (e) {
+                console.log("[Tracking] Erro ao formatar a data:", e);
+            }
 
             return {
-                descricao: evt.status,
+                descricao: evt.descricao,
                 dtHrCriado: dataIso,
                 unidade: {
-                    tipo: "Local",
+                    tipo: evt.local || "Unidade dos Correios",
                     endereco: {
-                        cidade: evt.local, // Ex: "SAO PAULO - SP"
-                        uf: ""
+                        cidade: evt.cidade || "Desconhecido",
+                        uf: evt.uf || ""
                     }
                 }
             };
         });
 
-        // Devolvemos o array formatado. O React faz: response.data.eventos
-        res.status(200).json({ eventos: eventosFormatados });
+        // Devolve o array pronto para a Timeline do Frontend
+        return res.status(200).json({ eventos: eventosFormatados });
 
-    } catch (error) {
-        console.error('Erro ao buscar rastreio:', error);
-        res.status(500).json({ error: 'Erro ao consultar os dados de rastreio. Tente novamente mais tarde.' });
+    } catch (error: any) {
+        console.error('[Tracking] Erro crítico ao buscar rastreio:', error.message);
+        // Mantemos o erro 500 em caso de falha crítica na nossa API ou na rede
+        return res.status(500).json({ error: 'Erro ao consultar os dados de rastreio. Tente novamente mais tarde.' });
     }
 };
