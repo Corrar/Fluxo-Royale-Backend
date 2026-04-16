@@ -86,7 +86,6 @@ export const trackPackage = async (req: Request, res: Response) => {
                         usageCount += 1;
                     } catch (e) {} finally { incClient.release(); }
 
-                    // O SEGREDO DESVENDADO: Converter a String (Texto) em JSON real
                     let parsedData = data;
                     if (data && typeof data.json === 'string') {
                         try {
@@ -106,7 +105,6 @@ export const trackPackage = async (req: Request, res: Response) => {
 
                     if (rawEvents.length > 0) {
                         eventosFormatados = rawEvents.map((evt: any) => {
-                            // Extração Avançada de Data
                             let dtCriado = new Date().toISOString();
                             if (evt.dtHrCriado && evt.dtHrCriado.date) {
                                 dtCriado = evt.dtHrCriado.date.replace(' ', 'T') + 'Z';
@@ -116,7 +114,6 @@ export const trackPackage = async (req: Request, res: Response) => {
                                 dtCriado = evt.dtHrCriado;
                             }
 
-                            // Extração Avançada de Local e Tipo
                             let cidadeStr = "Desconhecido";
                             let ufStr = "";
                             let tipoLocal = "Local";
@@ -135,8 +132,9 @@ export const trackPackage = async (req: Request, res: Response) => {
                                 }
                             }
 
-                            // Extração Avançada de Destino
-                            let destinoFinal = null;
+                            // SOLUÇÃO DO TYPESCRIPT AQUI: A variável agora é do tipo "any" em vez de estritamente "null"
+                            let destinoFinal: any = null;
+                            
                             if (evt.unidadeDestino && evt.unidadeDestino.endereco) {
                                 destinoFinal = {
                                     tipo: evt.unidadeDestino.tipo || "Destino",
