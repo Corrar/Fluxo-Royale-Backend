@@ -6,7 +6,7 @@ const WONCA_API_KEY = "bNamHEjNg2ibpZgOkZDNHuGbuoVhvMap-X_MZKDK20U";
 const API_LIMIT = 1000;
 
 const trackingCache = new Map<string, { data: any, timestamp: number }>();
-const CACHE_TTL = 1000 * 60 * 15;
+const CACHE_TTL = 1000 * 60 * 15; // 15 minutos
 
 export const trackPackage = async (req: Request, res: Response) => {
     const { code } = req.params;
@@ -17,7 +17,7 @@ export const trackPackage = async (req: Request, res: Response) => {
 
     try {
         // =======================================================
-        // 1. GESTÃO DE LIMITES DA API (1000 requisições)
+        // 1. GESTÃO DE LIMITES DA API
         // =======================================================
         let usageCount = 0;
         const client = await pool.connect();
@@ -71,72 +71,108 @@ export const trackPackage = async (req: Request, res: Response) => {
                             'Content-Type': 'application/json',
                             'Accept': 'application/json',
                             'Authorization': `Apikey ${WONCA_API_KEY}`,
-                            // A camuflagem perfeita anti-bloqueio de Firewall:
                             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
                         },
-                        timeout: 15000 // Aumentado para 15 segundos para evitar o timeout da barreira deles
+                        timeout: 15000
                     }
                 );
 
                 if (resWonca.status === 200) {
                     const data = resWonca.data;
                     
-                    // IMPRESSÃO DE SEGURANÇA (Para podermos ver o JSON se falhar)
-                    console.log(`[Tracking] RAW DATA WONCA (${code}):`, JSON.stringify(data, null, 2));
-
                     const incClient = await pool.connect();
                     try {
                         await incClient.query(`UPDATE api_usage SET request_count = request_count + 1 WHERE api_name = 'seu_rastreio'`);
                         usageCount += 1;
                     } catch (e) {} finally { incClient.release(); }
 
+                    // O SEGREDO DESVENDADO: Converter a String (Texto) em JSON real
+                    let parsedData = data;
+                    if (data && typeof data.json === 'string') {
+                        try {
+                            parsedData = JSON.parse(data.json);
+                        } catch (e) {
+                            console.log('[Tracking] Erro ao decodificar a string JSON da Wonca.');
+                        }
+                    }
+
                     // CAÇADOR INTELIGENTE DE EVENTOS
                     let rawEvents: any[] = [];
                     
-                    if (Array.isArray(data)) rawEvents = data;
-                    else if (data.events && Array.isArray(data.events)) rawEvents = data.events;
-                    else if (data.eventos && Array.isArray(data.eventos)) rawEvents = data.eventos;
-                    else if (data.historico && Array.isArray(data.historico)) rawEvents = data.historico;
-                    else if (data.tracking && data.tracking.events) rawEvents = data.tracking.events;
-                    else if (data.data && data.data.events) rawEvents = data.data.events;
-                    else if (data.response && data.response.events) rawEvents = data.response.events;
-                    else if (data.track && data.track.events) rawEvents = data.track.events;
+                    if (Array.isArray(parsedData)) rawEvents = parsedData;
+                    else if (parsedData.events && Array.isArray(parsedData.events)) rawEvents = parsedData.events;
+                    else if (parsedData.eventos && Array.isArray(parsedData.eventos)) rawEvents = parsedData.eventos;
+                    else if (parsedData.historico && Array.isArray(parsedData.historico)) rawEvents = parsedData.historico;
 
                     if (rawEvents.length > 0) {
                         eventosFormatados = rawEvents.map((evt: any) => {
-                            // Suporta formatos PT e EN
-                            let cidadeStr = evt.local || evt.location || evt.cidade || evt.city || "Desconhecido";
-                            let ufStr = evt.uf || evt.state || "";
-                            if (cidadeStr.includes('/')) {
-                                const parts = cidadeStr.split('/');
-                                cidadeStr = parts[0].trim();
-                                ufStr = parts[1].trim();
+                            // Extração Avançada de Data
+                            let dtCriado = new Date().toISOString();
+                            if (evt.dtHrCriado && evt.dtHrCriado.date) {
+                                dtCriado = evt.dtHrCriado.date.replace(' ', 'T') + 'Z';
+                            } else if (evt.data || evt.date || evt.dataHora) {
+                                dtCriado = evt.data || evt.date || evt.dataHora;
+                            } else if (typeof evt.dtHrCriado === 'string') {
+                                dtCriado = evt.dtHrCriado;
                             }
 
-                            const dest = evt.destino || evt.destination;
+                            // Extração Avançada de Local e Tipo
+                            let cidadeStr = "Desconhecido";
+                            let ufStr = "";
+                            let tipoLocal = "Local";
+
+                            if (evt.unidade && evt.unidade.endereco) {
+                                cidadeStr = evt.unidade.endereco.cidade || "Desconhecido";
+                                ufStr = evt.unidade.endereco.uf || "";
+                                tipoLocal = evt.unidade.tipo || "Local";
+                            } else {
+                                cidadeStr = evt.local || evt.location || evt.cidade || evt.city || "Desconhecido";
+                                ufStr = evt.uf || evt.state || "";
+                                if (cidadeStr.includes('/')) {
+                                    const parts = cidadeStr.split('/');
+                                    cidadeStr = parts[0].trim();
+                                    ufStr = parts[1].trim();
+                                }
+                            }
+
+                            // Extração Avançada de Destino
+                            let destinoFinal = null;
+                            if (evt.unidadeDestino && evt.unidadeDestino.endereco) {
+                                destinoFinal = {
+                                    tipo: evt.unidadeDestino.tipo || "Destino",
+                                    endereco: {
+                                        cidade: evt.unidadeDestino.endereco.cidade || "",
+                                        uf: evt.unidadeDestino.endereco.uf || ""
+                                    }
+                                };
+                            } else if (evt.destino || evt.destination) {
+                                destinoFinal = {
+                                    tipo: "Destino",
+                                    endereco: { cidade: evt.destino || evt.destination, uf: "" }
+                                };
+                            }
+
+                            let detalhes = evt.detalhe ? ` - ${evt.detalhe}` : "";
 
                             return {
-                                descricao: evt.descricao || evt.status || evt.description || evt.action || "Status atualizado",
-                                dtHrCriado: evt.data || evt.date || evt.dataHora || evt.trackedAt || evt.createdAt || new Date().toISOString(),
+                                descricao: (evt.descricao || evt.status || "Status atualizado") + detalhes,
+                                dtHrCriado: dtCriado,
                                 unidade: { 
-                                    tipo: "Local", 
+                                    tipo: tipoLocal, 
                                     endereco: { cidade: cidadeStr, uf: ufStr } 
                                 },
-                                unidadeDestino: dest ? { 
-                                    tipo: "Destino", 
-                                    endereco: { cidade: dest, uf: "" } 
-                                } : null
+                                unidadeDestino: destinoFinal
                             };
                         });
+                        
                         encontrouDados = true;
-                        console.log(`[Tracking] Mapeamento feito com Sucesso na Wonca!`);
+                        console.log(`[Tracking] Encomenda encontrada e processada com sucesso!`);
                     } else {
-                        console.log(`[Tracking] O JSON da Wonca chegou, mas não encontramos a lista de eventos dentro dele.`);
+                        console.log(`[Tracking] Encomenda ainda não possui movimentações na base de dados.`);
                     }
                 }
             } catch (error: any) { 
                 console.log(`[Tracking] Falha na Wonca Labs: ${error.message}`); 
-                if (error.response) console.log('[Tracking] Detalhe do Erro:', JSON.stringify(error.response.data));
             }
         }
 
