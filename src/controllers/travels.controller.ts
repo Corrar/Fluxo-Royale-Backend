@@ -64,16 +64,62 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
       let itemStatus = missing > 0 ? 'missing' : missing < 0 ? 'extra' : 'ok';
 
       await client.query(`UPDATE travel_order_items SET quantity_returned = $1, status = $2 WHERE id = $3`, [returnedQty, itemStatus, oldItem.id]);
+      
+      // Remove da reserva a totalidade que ele tinha levado, afinal a viagem acabou para esse item
       await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [qtyOut, oldItem.product_id]);
 
-      if (missing > 0) await client.query(`UPDATE stock SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1) WHERE product_id = $2`, [missing, oldItem.product_id]);
-      if (missing < 0) await client.query(`UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`, [Math.abs(missing), oldItem.product_id]);
+      // --- ATUALIZAÇÃO FÍSICA DO ESTOQUE E GERAÇÃO DE LOGS PARA RELATÓRIOS ---
+      
+      // Cálculos da viagem para este item
+      const consumed = Math.max(0, qtyOut - returnedQty); 
+      const returnedToStock = Math.min(qtyOut, returnedQty); 
+      const extra = Math.max(0, returnedQty - qtyOut);
+
+      // 1. MATERIAL CONSUMIDO NA OBRA (Baixa no Físico e Gera Log de Saída)
+      if (consumed > 0) {
+          await client.query(`UPDATE stock SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1) WHERE product_id = $2`, [consumed, oldItem.product_id]);
+          await createLog(userId, 'RECONCILE_OUT', { 
+              travelOrderId: id, 
+              product_id: oldItem.product_id, 
+              quantity: consumed,
+              tipo_confronto: 'Consumido'
+          }, getClientIp(req), client);
+      }
+
+      // 2. MATERIAL DEVOLVIDO AO ESTOQUE (Gera Log de Entrada apenas - o físico já lá estava porque era apenas reserva)
+      if (returnedToStock > 0) {
+          await createLog(userId, 'RECONCILE_IN', { 
+              travelOrderId: id, 
+              product_id: oldItem.product_id, 
+              quantity: returnedToStock,
+              tipo_confronto: 'Devolvido'
+          }, getClientIp(req), client);
+      }
+
+      // 3. MATERIAL EXTRA (Gera Log de Entrada E aumenta o Físico, pois veio a mais)
+      if (extra > 0) {
+          await client.query(`UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`, [extra, oldItem.product_id]);
+          await createLog(userId, 'RECONCILE_IN', { 
+              travelOrderId: id, 
+              product_id: oldItem.product_id, 
+              quantity: extra,
+              tipo_confronto: 'Extra'
+          }, getClientIp(req), client);
+      }
     }
 
+    // Agora lida com materiais que nem sequer estavam na viagem e foram devolvidos! (Extra Puro)
     for (const retItem of returnedItems) {
         if (!currentItemsRes.rows.some(old => old.product_id === retItem.product_id) && retItem.returnedQuantity > 0) {
             await client.query(`INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out, quantity_returned, status) VALUES ($1, $2, 0, $3, 'extra')`, [id, retItem.product_id, retItem.returnedQuantity]);
             await client.query(`UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`, [retItem.returnedQuantity, retItem.product_id]);
+            
+            await createLog(userId, 'RECONCILE_IN', { 
+                travelOrderId: id, 
+                product_id: retItem.product_id, 
+                quantity: retItem.returnedQuantity,
+                tipo_confronto: 'Extra'
+            }, getClientIp(req), client);
         }
     }
 
