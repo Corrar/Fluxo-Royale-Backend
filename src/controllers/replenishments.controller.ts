@@ -97,10 +97,20 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
           }
           if (diff !== 0) await client.query(`UPDATE stock SET quantity_reserved = quantity_reserved + $1 WHERE product_id = $2`, [diff, productId]);
         } else if (action === 'entregar') {
-          const stCheck = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
+          // --- INÍCIO DA ATUALIZAÇÃO ---
+          const stCheck = await client.query('SELECT quantity_on_hand, quantity_reserved FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
+          
           if (parseFloat(stCheck.rows[0]?.quantity_on_hand || 0) < newQty) throw new Error(`Furo de Estoque! O saldo físico é menor que a quantidade a entregar no produto ID ${productId}.`);
+          
+          const diffDelivery = newQty - oldQty;
+          if (diffDelivery > 0) {
+              const available = parseFloat(stCheck.rows[0]?.quantity_on_hand || 0) - parseFloat(stCheck.rows[0]?.quantity_reserved || 0);
+              if (available < diffDelivery) throw new Error(`Estoque disponível insuficiente para adicionar os itens extras na entrega do produto ID ${productId}.`);
+          }
+
           await client.query('UPDATE replenishment_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
           await client.query(`UPDATE stock SET quantity_on_hand = quantity_on_hand - $1, quantity_reserved = GREATEST(0, quantity_reserved - $2) WHERE product_id = $3`, [newQty, oldQty, productId]);
+          // --- FIM DA ATUALIZAÇÃO ---
         } else if (action === 'reverter') {
           await client.query(`UPDATE stock SET quantity_on_hand = quantity_on_hand + $1, quantity_reserved = quantity_reserved + $1 WHERE product_id = $2`, [oldQty, productId]);
         }
