@@ -11,42 +11,42 @@ export const sendPushNotificationToRole = async (
   try {
     // ==========================================
     // 🚀 INTEGRAÇÃO COM WHATSAPP (VIA GREEN API)
+    // Perfeito para Render/Cloud usando Variáveis de Ambiente
     // ==========================================
     if (role === 'almoxarife') {
       
-      // 1. Cole aqui as credenciais que você pegou no painel da Green API
-      const idInstance = '7107596732'; 
-      const apiTokenInstance = '4c4bebada0044e559765b9e11ddef3074b77721e5cb0428cb1';
+      // Buscamos os dados de forma segura das configurações do seu servidor (Render)
+      const idInstance = process.env.GREEN_API_ID; 
+      const apiTokenInstance = process.env.GREEN_API_TOKEN;
+      const numeroAlmoxarifado = process.env.ALMOXARIFADO_PHONE;
 
-      // ATENÇÃO À URL: A Green API às vezes usa subdomínios diferentes (ex: https://7103.api.greenapi.com)
-      // Verifique no seu painel qual é a "API URL" correta da sua instância e troque abaixo se necessário.
-      const greenApiUrl = `https://api.green-api.com/waInstance${idInstance}/sendMessage/${apiTokenInstance}`;
+      // Só executa se todas as variáveis de ambiente existirem
+      if (idInstance && apiTokenInstance && numeroAlmoxarifado) {
+        
+        const greenApiUrl = `https://api.green-api.com/waInstance${idInstance}/sendMessage/${apiTokenInstance}`;
 
-      // 2. Configure o número do Almoxarifado que vai RECEBER a mensagem
-      // Formato OBRIGATÓRIO da Green API: DDI + DDD + NÚMERO + "@c.us"
-      // Exemplo para o Brasil (55), DDD (11), número (999999999)
-      const numeroAlmoxarifado = '5518997874513@c.us'; 
+        // Montamos o texto da mensagem (O asterisco * cria negrito no WhatsApp)
+        const textoZap = `*🔔 NOVA SOLICITAÇÃO!*\n\n*${title}*\n${message}\n\nAcesse o sistema para verificar.`;
 
-      // 3. Montamos o texto da mensagem (O asterisco * cria negrito no WhatsApp)
-      const textoZap = `*🔔 NOVA SOLICITAÇÃO!*\n\n*${title}*\n${message}\n\nAcesse o sistema para verificar.`;
-
-      // 4. Fazemos a requisição HTTP (fetch) para a API deles enviando os dados
-      // Fazemos isso sem o comando "await", para que rode em segundo plano e não atrase o seu sistema!
-      fetch(greenApiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json' // Avisamos que estamos enviando dados no formato JSON
-        },
-        body: JSON.stringify({
-          chatId: numeroAlmoxarifado, // Para quem vai a mensagem
-          message: textoZap           // Qual é o texto da mensagem
+        // Requisição para a Green API
+        fetch(greenApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            chatId: numeroAlmoxarifado, 
+            message: textoZap
+          })
         })
-      })
-      .then(res => {
-          if (res.ok) console.log(`✅ [WhatsApp] Alerta enviado ao Almoxarifado via Green API!`);
-          else console.error(`❌ [WhatsApp] Erro na Green API. Status Code: ${res.status}`);
-      })
-      .catch(err => console.error(`❌ [WhatsApp] Falha de conexão com a Green API:`, err));
+        .then(res => {
+            if (res.ok) console.log(`✅ [WhatsApp] Alerta enviado ao Almoxarifado via Green API!`);
+            else console.error(`❌ [WhatsApp] Erro na Green API. Status Code: ${res.status}`);
+        })
+        .catch(err => console.error(`❌ [WhatsApp] Falha de conexão com a Green API:`, err));
+      } else {
+        console.warn('⚠️ [WhatsApp] Alerta não enviado: Variáveis de ambiente (GREEN_API_ID, etc) não configuradas.');
+      }
     }
     // ==========================================
 
