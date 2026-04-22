@@ -15,8 +15,8 @@ export const sendPushNotificationToRole = async (
     if (role === 'almoxarife') {
       
       // 1. Cole aqui as credenciais que você pegou no painel da Green API
-      const idInstance = 'SEU_ID_INSTANCE_AQUI'; 
-      const apiTokenInstance = 'SEU_API_TOKEN_INSTANCE_AQUI';
+      const idInstance = '7107596732'; 
+      const apiTokenInstance = '4c4bebada0044e559765b9e11ddef3074b77721e5cb0428cb1';
 
       // ATENÇÃO À URL: A Green API às vezes usa subdomínios diferentes (ex: https://7103.api.greenapi.com)
       // Verifique no seu painel qual é a "API URL" correta da sua instância e troque abaixo se necessário.
