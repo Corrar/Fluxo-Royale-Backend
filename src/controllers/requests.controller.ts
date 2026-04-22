@@ -112,7 +112,42 @@ export const createRequest = async (req: Request, res: Response) => {
         (req as any).io.to(['almoxarife', 'admin', 'escritorio']).emit('new_request', fullReqRows[0]);
         (req as any).io.emit('refresh_stock'); 
     }
-    sendPushNotificationToRole('almoxarife', 'Nova Solicitação!', `O setor ${sector} fez um novo pedido.`, '/requests');
+
+    // ================================================================
+    // 🟢 INÍCIO DA MONTAGEM DA MENSAGEM DO WHATSAPP
+    // ================================================================
+    const dataAtual = new Date();
+    const dataFormatada = dataAtual.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+    const horaFormatada = dataAtual.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+
+    let listaMateriais = '';
+    const itemsDetail = fullReqRows[0].request_items || [];
+    
+    itemsDetail.forEach((reqItem: any) => {
+        const qtd = reqItem.quantity_requested;
+        // Pega o nome do produto ou o nome customizado se for item avulso
+        const nomeProduto = reqItem.products ? reqItem.products.name : (reqItem.custom_product_name || 'Produto Genérico');
+        // Pega o SKU se existir, senão N/A
+        const skuProduto = reqItem.products?.sku ? `SKU: ${reqItem.products.sku}` : 'SKU: N/A';
+        
+        listaMateriais += `\n- ${qtd} un. ${nomeProduto} | ${skuProduto}`;
+    });
+
+    const nomeSolicitante = fullReqRows[0].requester?.name || 'Usuário';
+    
+    const mensagemPersonalizada = `Setor: ${sector}\nData/Hora: ${dataFormatada} - ${horaFormatada}\nMateriais:${listaMateriais}`;
+
+    // Dispara a notificação passando a nossa mensagem montada!
+    sendPushNotificationToRole(
+      'almoxarife', 
+      `Novo Pedido de ${nomeSolicitante}`, 
+      mensagemPersonalizada, 
+      '/requests'
+    );
+    // ================================================================
+    // 🔴 FIM DA MONTAGEM DA MENSAGEM DO WHATSAPP
+    // ================================================================
+
     res.status(201).json({ success: true, id: requestId });
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch(e) {}
