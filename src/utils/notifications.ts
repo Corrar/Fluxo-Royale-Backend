@@ -25,7 +25,7 @@ export const sendPushNotificationToRole = async (
       // 2. Configure o número do Almoxarifado que vai RECEBER a mensagem
       // Formato OBRIGATÓRIO da Green API: DDI + DDD + NÚMERO + "@c.us"
       // Exemplo para o Brasil (55), DDD (11), número (999999999)
-      const numeroAlmoxarifado = '5511999999999@c.us'; 
+      const numeroAlmoxarifado = '5518997874513@c.us'; 
 
       // 3. Montamos o texto da mensagem (O asterisco * cria negrito no WhatsApp)
       const textoZap = `*🔔 NOVA SOLICITAÇÃO!*\n\n*${title}*\n${message}\n\nAcesse o sistema para verificar.`;
