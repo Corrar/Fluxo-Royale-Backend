@@ -1,8 +1,39 @@
 import webpush from 'web-push';
 import { pool } from '../db';
+// 1. Importamos a função do WhatsApp que criamos no arquivo whatsapp.ts
+import { sendWhatsAppMessage } from './whatsapp';
 
-export const sendPushNotificationToRole = async (role: string, title: string, message: string, url: string = '/requests', uniqueId?: string) => {
+export const sendPushNotificationToRole = async (
+  role: string, 
+  title: string, 
+  message: string, 
+  url: string = '/requests', 
+  uniqueId?: string
+) => {
   try {
+    // ==========================================
+    // 🚀 INTEGRAÇÃO COM WHATSAPP
+    // ==========================================
+    // Se a notificação for para o almoxarifado, enviamos mensagem via WhatsApp
+    if (role === 'almoxarife') {
+      // ATENÇÃO: Substitua este número pelo número real do WhatsApp do almoxarifado!
+      // Formato exigido: DDI (55) + DDD (ex: 11) + Número. Tudo junto, sem espaços ou traços.
+      const numeroAlmoxarifado = '5511999999999'; 
+      
+      // Montamos o texto da mensagem. O asterisco (*) deixa o texto em negrito no WhatsApp.
+      const textoZap = `*🔔 NOVA SOLICITAÇÃO!*\n\n*${title}*\n${message}\n\nAcesse o sistema para verificar.`;
+      
+      // Disparamos a mensagem. 
+      // Nota didática: Não usamos "await" propositalmente para que o código continue rodando 
+      // imediatamente, sem atrasar a vida do usuário que fez a solicitação no sistema.
+      sendWhatsAppMessage(numeroAlmoxarifado, textoZap);
+    }
+    // ==========================================
+
+
+    // ==========================================
+    // 🌐 NOTIFICAÇÕES WEB PUSH (Originais)
+    // ==========================================
     let query = `
       SELECT ps.subscription 
       FROM push_subscriptions ps
