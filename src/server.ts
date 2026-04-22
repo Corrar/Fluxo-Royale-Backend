@@ -7,7 +7,6 @@ import { createServer } from 'http';
 import { globalLimiter } from './middlewares/rateLimiters';
 import { initSocket } from './config/socket';
 import { startExpireRequestsJob } from './jobs/expireRequests.job';
-import { initWhatsApp } from './utils/whatsapp';
 
 // --- Rotas (Routers) ---
 import authRouter from './routes/auth.routes';
@@ -69,9 +68,6 @@ app.use((req: any, res, next) => {
 
 // 3. Cron Jobs
 startExpireRequestsJob();
-
-// 👇 ADICIONE ESTA LINHA PARA INICIAR O WHATSAPP 👇
-initWhatsApp();
 
 // ==========================================
 // 🚀 REGISTO DE ROTAS (API ENDPOINTS)
