@@ -25,8 +25,8 @@ export const sendPushNotificationToRole = async (
         
         const greenApiUrl = `https://api.green-api.com/waInstance${idInstance}/sendMessage/${apiTokenInstance}`;
 
-        // Montamos o texto da mensagem (O asterisco * cria negrito no WhatsApp)
-        const textoZap = `*🔔 NOVA SOLICITAÇÃO!*\n\n*${title}*\n${message}\n\nAcesse o sistema para verificar.`;
+        // Montamos o texto da mensagem incluindo o link de acesso rápido (com negrito e emoji)
+        const textoZap = `*🔔 NOVA SOLICITAÇÃO!*\n\n*${title}*\n${message}\n\n🚀 *Acesse o sistema para conferir:*\nhttps://fluxo-royale.vercel.app/auth`;
 
         // Requisição para a Green API
         fetch(greenApiUrl, {
