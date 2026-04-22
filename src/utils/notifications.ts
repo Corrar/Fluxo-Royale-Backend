@@ -18,7 +18,7 @@ export const sendPushNotificationToRole = async (
     if (role === 'almoxarife') {
       // ATENÇÃO: Substitua este número pelo número real do WhatsApp do almoxarifado!
       // Formato exigido: DDI (55) + DDD (ex: 11) + Número. Tudo junto, sem espaços ou traços.
-      const numeroAlmoxarifado = '5511999999999'; 
+      const numeroAlmoxarifado = '5518997874513'; 
       
       // Montamos o texto da mensagem. O asterisco (*) deixa o texto em negrito no WhatsApp.
       const textoZap = `*🔔 NOVA SOLICITAÇÃO!*\n\n*${title}*\n${message}\n\nAcesse o sistema para verificar.`;
