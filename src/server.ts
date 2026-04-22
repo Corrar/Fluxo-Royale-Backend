@@ -33,11 +33,11 @@ app.use(helmet());
 app.use(express.json());
 app.use(globalLimiter);
 
-// Configuração de CORS (ajusta os URLs conforme a tua necessidade)
+// Configuração de CORS para o teu sistema principal
 const allowedOrigins = [
   'http://localhost:5173',        
   'http://localhost:3000',        
-  'https://fluxo-royale.vercel.app',
+  'https://fluxo-royale.vercel.app', // Teu sistema principal
   'https://fluxoroyale21.vercel.app'
 ];
 
@@ -45,6 +45,7 @@ const corsOptions = {
   origin: function (origin: any, callback: any) {
     if (!origin) return callback(null, true);
     if (allowedOrigins.indexOf(origin) !== -1) return callback(null, true);
+    // Permite conexões de desenvolvimento local ou IP da rede interna
     if (origin.startsWith('http://localhost') || origin.startsWith('http://192.168.')) {
         return callback(null, true);
     }
@@ -60,13 +61,14 @@ app.use(cors(corsOptions));
 const httpServer = createServer(app);
 const io = initSocket(httpServer, corsOptions);
 
-// Middleware para injetar o 'io' no Express (req.io)
+// Middleware para injetar o 'io' no Express (disponível em todas as rotas como req.io)
 app.use((req: any, res, next) => {
   req.io = io;
   next();
 });
 
 // 3. Cron Jobs
+// Tarefa agendada para expirar solicitações antigas
 startExpireRequestsJob();
 
 // ==========================================
@@ -93,13 +95,12 @@ app.use('/tasks', tasksRouter);
 app.use('/eletrica-tasks', eletricaTasksRouter);
 app.use('/reminders', remindersRouter);
 app.use('/office', officeRouter);
-// 👇 AQUI ESTÁ A NOVA ROTA DE RASTREIO 👇
 app.use('/tracking', trackingRoutes);
 
-// Sistema (Relatórios, Logs, Dashboards) - Mapeado na raiz '/' para manter compatibilidade
+// Sistema (Relatórios, Logs, Dashboards)
 app.use('/', systemRouter); 
 
-// Atalhos de retro-compatibilidade (para não quebrar o frontend atual)
+// Atalhos de retro-compatibilidade
 app.post('/manual-entry', stockRouter);
 app.post('/manual-withdrawal', stockRouter);
 
