@@ -15,3 +15,25 @@ export const authenticate = (req: any, res: any, next: any) => {
     res.status(401).json({ error: 'Token inválido' });
   }
 };
+
+/**
+ * Middleware para verificar se o utilizador tem uma das roles (cargos) permitidas.
+ * Exemplo de uso: authorizeRole(['financeiro', 'admin'])
+ */
+export const authorizeRole = (allowedRoles: string[]) => {
+  return (req: any, res: any, next: any) => {
+    // Verificamos o cargo do utilizador que foi guardado no req.user pelo middleware 'authenticate'
+    // ⚠️ Se o teu token guarda o cargo com outro nome (ex: req.user.cargo ou req.user.department), deves alterar aqui!
+    const userRole = req.user?.role; 
+
+    // Se o utilizador não tiver cargo, ou se o seu cargo não estiver na lista de permitidos, bloqueamos.
+    if (!userRole || !allowedRoles.includes(userRole)) {
+      return res.status(403).json({ 
+        error: 'Acesso negado. Esta ação é restrita a departamentos autorizados.' 
+      });
+    }
+    
+    // Se o cargo estiver correto, deixamos o pedido passar para a próxima função (o nosso controller de preços).
+    next();
+  };
+};
