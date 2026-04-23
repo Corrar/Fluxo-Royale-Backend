@@ -19,8 +19,7 @@ export const login = async (req: Request, res: Response) => {
     const validPassword = await bcrypt.compare(password, user.encrypted_password);
     if (!validPassword) return res.status(400).json({ error: 'Senha incorreta' });
 
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1d' });
-    
+    // 1. PRIMEIRO PASSO CORRIGIDO: Buscar o perfil (onde está o cargo/role) ANTES de criar o Token
     let { rows: profiles } = await pool.query('SELECT * FROM profiles WHERE id = $1', [user.id]);
     if (profiles.length === 0) {
       const defaultName = user.email.split('@')[0];
@@ -30,6 +29,17 @@ export const login = async (req: Request, res: Response) => {
       );
       profiles = insertRes.rows;
     }
+
+    // 2. SEGUNDO PASSO CORRIGIDO: Criar o Token agora, injetando a 'role' que acabámos de buscar!
+    const token = jwt.sign(
+      { 
+        id: user.id, 
+        email: user.email, 
+        role: profiles[0].role // 👈 AQUI ESTÁ A MAGIA!
+      }, 
+      JWT_SECRET, 
+      { expiresIn: '1d' }
+    );
 
     const permRes = await pool.query('SELECT page_key FROM role_permissions WHERE role = $1', [profiles[0].role]);
     const userPermissions = permRes.rows.map((r: any) => r.page_key);
