@@ -22,14 +22,18 @@ export const authenticate = (req: any, res: any, next: any) => {
  */
 export const authorizeRole = (allowedRoles: string[]) => {
   return (req: any, res: any, next: any) => {
-    // Verificamos o cargo do utilizador que foi guardado no req.user pelo middleware 'authenticate'
-    // ⚠️ Se o teu token guarda o cargo com outro nome (ex: req.user.cargo ou req.user.department), deves alterar aqui!
-    const userRole = req.user?.role; 
+    // 1. Transformamos o cargo do utilizador em minúsculas para evitar erros de digitação na Base de Dados
+    // Usamos o operador '?' (optional chaining) para evitar erros caso a role não exista no token
+    const userRole = req.user?.role?.toLowerCase(); 
+
+    // 2. Transformamos a nossa lista de permitidos em minúsculas também
+    const safeAllowedRoles = allowedRoles.map(role => role.toLowerCase());
 
     // Se o utilizador não tiver cargo, ou se o seu cargo não estiver na lista de permitidos, bloqueamos.
-    if (!userRole || !allowedRoles.includes(userRole)) {
+    if (!userRole || !safeAllowedRoles.includes(userRole)) {
       return res.status(403).json({ 
-        error: 'Acesso negado. Esta ação é restrita a departamentos autorizados.' 
+        // Adicionei qual é a role atual na mensagem de erro, para facilitar se precisares de investigar!
+        error: `Acesso negado. O seu cargo atual (${req.user?.role || 'Nenhum'}) não tem permissão para esta ação.` 
       });
     }
     
