@@ -167,3 +167,50 @@ export const getInactiveProducts = async (req: Request, res: Response) => {
     res.status(500).json({ error: error.message }); 
   }
 };
+
+// 💰 NOVA FUNÇÃO: Atualizar APENAS os preços (Para o setor financeiro)
+export const updateProductPrices = async (req: Request, res: Response) => {
+  const userId = (req as any).user.id;
+  const { id } = req.params;
+  
+  // Extraímos apenas os preços do corpo do pedido. Ignoramos tudo o resto.
+  const { unit_price, sales_price } = req.body;
+  
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    // Atualiza apenas os preços. O COALESCE mantém o valor antigo se não for enviado nenhum novo.
+    const { rows } = await client.query(
+      `UPDATE products 
+       SET unit_price = COALESCE($1, unit_price), 
+           sales_price = COALESCE($2, sales_price) 
+       WHERE id = $3 RETURNING *`,
+      [unit_price, sales_price, id]
+    );
+
+    if (rows.length === 0) { 
+      await client.query('ROLLBACK'); 
+      return res.status(404).json({ error: 'Produto não encontrado' }); 
+    }
+    
+    // 📝 LOG DE AUDITORIA
+    await createLog(
+      userId, 
+      'ATUALIZAR_PRECOS', 
+      { id_produto: id, novos_precos: { unit_price, sales_price } }, 
+      getClientIp(req), 
+      client
+    );
+    
+    await client.query('COMMIT');
+    res.json(rows[0]);
+    
+  } catch (error: any) {
+    try { await client.query('ROLLBACK'); } catch(e) {}
+    res.status(500).json({ error: error.message });
+  } finally { 
+    client.release(); 
+  }
+};
