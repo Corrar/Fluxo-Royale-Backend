@@ -1,15 +1,23 @@
 import { Request, Response } from 'express';
-import  supabase  from '../db';
+import { pool } from '../db';
 
 // 1. Buscar todos os clientes com as suas OPs
 export const getClients = async (req: Request, res: Response) => {
   try {
-    const { data, error } = await supabase
-      .from('clients')
-      .select('*, services:client_services(*)');
-
-    if (error) throw error;
-    res.json(data);
+    const clientsQuery = `
+        SELECT c.*, 
+               COALESCE(
+                 json_agg(
+                   json_build_object('id', s.id, 'op_code', s.op_code, 'description', s.description)
+                 ) FILTER (WHERE s.id IS NOT NULL), '[]'
+               ) as services
+        FROM clients c
+        LEFT JOIN client_services s ON c.id = s.client_id
+        GROUP BY c.id
+        ORDER BY c.name ASC
+    `;
+    const result = await pool.query(clientsQuery);
+    res.json(result.rows);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -24,15 +32,18 @@ export const createClient = async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Código e Nome são obrigatórios.' });
     }
 
-    const { data, error } = await supabase
-      .from('clients')
-      .insert([{ code, name }])
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.status(201).json(data);
+    const query = `
+      INSERT INTO clients (code, name) 
+      VALUES ($1, $2) 
+      RETURNING *
+    `;
+    const result = await pool.query(query, [code, name]);
+    
+    res.status(201).json(result.rows[0]);
   } catch (error: any) {
+    if (error.code === '23505') { // Erro de violação de chave única no Postgres
+        return res.status(400).json({ error: 'Já existe um cliente com este código.' });
+    }
     res.status(500).json({ error: error.message });
   }
 };
@@ -47,15 +58,18 @@ export const createService = async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'O código da OP é obrigatório.' });
     }
 
-    const { data, error } = await supabase
-      .from('client_services')
-      .insert([{ client_id: id, op_code, description }])
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.status(201).json(data);
+    const query = `
+      INSERT INTO client_services (client_id, op_code, description) 
+      VALUES ($1, $2, $3) 
+      RETURNING *
+    `;
+    const result = await pool.query(query, [id, op_code, description]);
+    
+    res.status(201).json(result.rows[0]);
   } catch (error: any) {
+    if (error.code === '23505') {
+        return res.status(400).json({ error: 'Esta OP já está registrada.' });
+    }
     res.status(500).json({ error: error.message });
   }
 };
