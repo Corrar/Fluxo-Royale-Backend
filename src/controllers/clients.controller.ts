@@ -8,13 +8,18 @@ export const getClients = async (req: Request, res: Response) => {
         SELECT c.*, 
                COALESCE(
                  json_agg(
-                   json_build_object('id', s.id, 'op_code', s.op_code, 'description', s.description)
+                   json_build_object(
+                     'id', s.id, 
+                     'op_code', s.op_code, 
+                     'description', s.description, 
+                     'status', s.status -- 🔥 O status agora é retornado para a barra de progresso funcionar!
+                   )
                  ) FILTER (WHERE s.id IS NOT NULL), '[]'
                ) as services
         FROM clients c
         LEFT JOIN client_services s ON c.id = s.client_id
         GROUP BY c.id
-        ORDER BY c.name ASC
+        ORDER BY c.created_at DESC
     `;
     const result = await pool.query(clientsQuery);
     res.json(result.rows);
@@ -48,7 +53,35 @@ export const createClient = async (req: Request, res: Response) => {
   }
 };
 
-// 3. Adicionar uma nova OP a um cliente
+// 3. Atualizar/Renomear Cliente
+export const updateClient = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { name } = req.body;
+
+    if (!name) return res.status(400).json({ error: 'O novo nome é obrigatório.' });
+
+    const query = `UPDATE clients SET name = $1 WHERE id = $2 RETURNING *`;
+    const result = await pool.query(query, [name, id]);
+    
+    res.json(result.rows[0]);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// 4. Apagar Cliente
+export const deleteClient = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM clients WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// 5. Adicionar uma nova OP a um cliente
 export const createService = async (req: Request, res: Response) => {
   try {
     const { id } = req.params; // ID do cliente
@@ -70,6 +103,30 @@ export const createService = async (req: Request, res: Response) => {
     if (error.code === '23505') {
         return res.status(400).json({ error: 'Esta OP já está registrada.' });
     }
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// 6. Atualizar Status da OP
+export const updateServiceStatus = async (req: Request, res: Response) => {
+  try {
+    const { serviceId } = req.params;
+    const { status } = req.body;
+    
+    await pool.query('UPDATE client_services SET status = $1 WHERE id = $2', [status, serviceId]);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// 7. Apagar OP
+export const deleteService = async (req: Request, res: Response) => {
+  try {
+    const { serviceId } = req.params;
+    await pool.query('DELETE FROM client_services WHERE id = $1', [serviceId]);
+    res.json({ success: true });
+  } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
 };
