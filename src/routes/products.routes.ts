@@ -33,7 +33,8 @@ router.put('/reactivate/:sku', authenticate, reactivateProduct);
 router.patch(
     '/:id/prices', 
     authenticate, 
-    authorizeRole(['financeiro', 'admin']), // Aqui podes ajustar os cargos que têm permissão
+    // 🔥 Adicionado 'almoxarife' e 'compras' para combinar perfeitamente com o Frontend
+    authorizeRole(['financeiro', 'admin', 'almoxarife', 'compras']), 
     updateProductPrices
 );
 
