@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { supabase } from '../db';
+import  supabase  from '../db';
 
 // 1. Buscar todos os clientes com as suas OPs
 export const getClients = async (req: Request, res: Response) => {
