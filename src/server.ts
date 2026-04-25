@@ -24,6 +24,8 @@ import remindersRouter from './routes/reminders.routes';
 import officeRouter from './routes/office.routes';
 import permissionsRouter from './routes/permissions.routes';
 import trackingRoutes from './routes/tracking.routes';
+// 👇 NOVA IMPORTAÇÃO DOS CLIENTES
+import clientsRouter from './routes/clients.routes';
 
 const app = express();
 
@@ -80,10 +82,12 @@ app.use('/auth', authRouter);
 app.use('/users', usersRouter);
 app.use('/admin/permissions', permissionsRouter);
 
-// Core do ERP (Produtos, Stock, Pedidos)
+// Core do ERP (Produtos, Stock, Pedidos, Clientes)
 app.use('/products', productsRouter);
 app.use('/requests', requestsRouter);
 app.use('/stock', stockRouter);
+// 👇 NOVA ROTA ATIVADA NO SERVIDOR
+app.use('/clients', clientsRouter);
 
 // Movimentações Avançadas
 app.use('/separations', separationsRouter);
