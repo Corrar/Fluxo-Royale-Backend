@@ -117,8 +117,19 @@ export const createRequest = async (req: Request, res: Response) => {
     // 🟢 INÍCIO DA MONTAGEM DA MENSAGEM DO WHATSAPP
     // ================================================================
     const dataAtual = new Date();
-    const dataFormatada = dataAtual.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-    const horaFormatada = dataAtual.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    
+    // 🔥 CORREÇÃO: Forçando o fuso horário de São Paulo (Brasília)
+    const dataFormatada = dataAtual.toLocaleDateString('pt-BR', { 
+      day: '2-digit', 
+      month: '2-digit', 
+      timeZone: 'America/Sao_Paulo' 
+    });
+    
+    const horaFormatada = dataAtual.toLocaleTimeString('pt-BR', { 
+      hour: '2-digit', 
+      minute: '2-digit', 
+      timeZone: 'America/Sao_Paulo' 
+    });
 
     let listaMateriais = '';
     const itemsDetail = fullReqRows[0].request_items || [];
