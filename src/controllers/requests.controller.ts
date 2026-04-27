@@ -74,7 +74,6 @@ export const getMyRequests = async (req: Request, res: Response) => {
 
 export const createRequest = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
-  // 🟢 Adicionado 'op_code' recebido do frontend
   const { sector, items, op_code } = req.body; 
   const client = await pool.connect();
   
@@ -82,29 +81,61 @@ export const createRequest = async (req: Request, res: Response) => {
     validatePositiveItems(items);
     await client.query('BEGIN');
 
-    // 🛡️ INÍCIO DA VALIDAÇÃO DA OP
-    if (!op_code) {
-      throw new Error("OP_OBRIGATORIA");
+    // =========================================================================
+    // 🛡️ 1. REGRA DE NEGÓCIO: VERIFICA SE A OP É OBRIGATÓRIA (BASEADO EM TAGS)
+    // =========================================================================
+    let requiresOp = false;
+    const exemptTags = ['camisetas', 'epi', 'ferramentas'];
+    
+    // Pega apenas os IDs válidos (ignora itens 'custom' genéricos)
+    const productIds = items
+      .map((i: any) => i.product_id)
+      .filter((id: any) => id && id !== 'custom');
+
+    // Se o pedido tem algum item "avulso/genérico", a OP é obrigatória
+    if (items.length > productIds.length) {
+        requiresOp = true;
+    } else if (productIds.length > 0) {
+        // Busca as tags dos produtos lá no banco de dados
+        const productsQuery = await client.query(
+            'SELECT id, tags FROM products WHERE id = ANY($1::uuid[])', 
+            [productIds]
+        );
+        
+        for (const product of productsQuery.rows) {
+            const tags = Array.isArray(product.tags) ? product.tags.map((t: string) => t.toLowerCase()) : [];
+            const isExempt = tags.some((tag: string) => exemptTags.includes(tag));
+            
+            // Se achar UM produto que não tem a tag de isenção, exige a OP e para de procurar
+            if (!isExempt) {
+                requiresOp = true;
+                break;
+            }
+        }
     }
 
-    // Busca o ID e o Status na tabela client_services com base no código digitado
-    const opCheck = await client.query('SELECT id, status FROM client_services WHERE op_code = $1', [op_code]);
-    
-    // Valida se a OP existe
-    if (opCheck.rows.length === 0) {
-      throw new Error("OP_NAO_ENCONTRADA");
-    }
-    
-    // Valida se a OP está encerrada
-    const opStatus = opCheck.rows[0].status;
-    if (opStatus === 'finalizada' || opStatus === 'encerrada') {
-      throw new Error("OP_FINALIZADA");
-    }
-    
-    const client_service_id = opCheck.rows[0].id;
-    // 🛡️ FIM DA VALIDAÇÃO DA OP
+    // =========================================================================
+    // 🛡️ 2. VALIDAÇÃO E VÍNCULO DA OP
+    // =========================================================================
+    let client_service_id = null;
 
-    // 🟢 Inserção agora inclui o 'client_service_id'
+    if (op_code) {
+        // Se ele digitou uma OP (mesmo sendo isento, a gente vincula pra ficar organizado)
+        const opCheck = await client.query('SELECT id, status FROM client_services WHERE op_code = $1', [op_code]);
+        if (opCheck.rows.length === 0) throw new Error("OP_NAO_ENCONTRADA");
+        
+        const opStatus = opCheck.rows[0].status;
+        if (opStatus === 'finalizada' || opStatus === 'encerrada') throw new Error("OP_FINALIZADA");
+        
+        client_service_id = opCheck.rows[0].id;
+    } else if (requiresOp) {
+        // Se a OP é obrigatória e ele não digitou nada
+        throw new Error("OP_OBRIGATORIA_TAGS");
+    }
+
+    // =========================================================================
+    // 🟢 INSERÇÃO DO PEDIDO
+    // =========================================================================
     const reqRes = await client.query(
       'INSERT INTO requests (requester_id, sector, status, client_service_id) VALUES ($1, $2, $3, $4) RETURNING id', 
       [userId, sector, 'aberto', client_service_id]
@@ -133,7 +164,6 @@ export const createRequest = async (req: Request, res: Response) => {
       );
     }
     
-    // 📝 LOG TRADUZIDO E MELHORADO
     await createLog(userId, 'CRIAR_SOLICITACAO', { id_solicitacao: requestId, setor: sector, total_itens: items.length }, getClientIp(req), client);
     await client.query('COMMIT');
 
@@ -147,22 +177,9 @@ export const createRequest = async (req: Request, res: Response) => {
         (req as any).io.emit('refresh_stock'); 
     }
 
-    // ================================================================
-    // 🟢 INÍCIO DA MONTAGEM DA MENSAGEM DO WHATSAPP
-    // ================================================================
     const dataAtual = new Date();
-    
-    const dataFormatada = dataAtual.toLocaleDateString('pt-BR', { 
-      day: '2-digit', 
-      month: '2-digit', 
-      timeZone: 'America/Sao_Paulo' 
-    });
-    
-    const horaFormatada = dataAtual.toLocaleTimeString('pt-BR', { 
-      hour: '2-digit', 
-      minute: '2-digit', 
-      timeZone: 'America/Sao_Paulo' 
-    });
+    const dataFormatada = dataAtual.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', timeZone: 'America/Sao_Paulo' });
+    const horaFormatada = dataAtual.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
 
     let listaMateriais = '';
     const itemsDetail = fullReqRows[0].request_items || [];
@@ -175,25 +192,19 @@ export const createRequest = async (req: Request, res: Response) => {
     });
 
     const nomeSolicitante = fullReqRows[0].requester?.name || 'Usuário';
-    const mensagemPersonalizada = `Setor: ${sector}\nOP: ${op_code}\nData/Hora: ${dataFormatada} - ${horaFormatada}\nMateriais:${listaMateriais}`;
+    
+    // Deixa o aviso da OP na mensagem do WhatsApp apenas se houver OP
+    const avisoOp = op_code ? `\nOP: ${op_code}` : `\nOP: Isento (EPI/Ferramenta)`;
+    const mensagemPersonalizada = `Setor: ${sector}${avisoOp}\nData/Hora: ${dataFormatada} - ${horaFormatada}\nMateriais:${listaMateriais}`;
 
-    sendPushNotificationToRole(
-      'almoxarife', 
-      `Novo Pedido de ${nomeSolicitante}`, 
-      mensagemPersonalizada, 
-      '/requests'
-    );
-    // ================================================================
-    // 🔴 FIM DA MONTAGEM DA MENSAGEM DO WHATSAPP
-    // ================================================================
+    sendPushNotificationToRole('almoxarife', `Novo Pedido de ${nomeSolicitante}`, mensagemPersonalizada, '/requests');
 
     res.status(201).json({ success: true, id: requestId });
   } catch (error: any) {
-    // Caso de erro, desfaz a transação no banco de dados!
     try { await client.query('ROLLBACK'); } catch(e) {}
     
-    // 🟢 Tratamento das mensagens de erro da OP para o Frontend
-    if (error.message === "OP_OBRIGATORIA") return res.status(400).json({ error: "É obrigatório informar o número da OP para esta solicitação." });
+    // Tratamento dos erros para o Frontend
+    if (error.message === "OP_OBRIGATORIA_TAGS") return res.status(400).json({ error: "É obrigatório informar o número da OP para estes tipos de produtos." });
     if (error.message === "OP_NAO_ENCONTRADA") return res.status(404).json({ error: "OP não encontrada no sistema. Verifique o número digitado." });
     if (error.message === "OP_FINALIZADA") return res.status(400).json({ error: "Essa OP ja foi finalizada, verifique a OP correta" });
     
@@ -218,7 +229,6 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     if (!currentRes.rows[0]?.status) throw new Error("Solicitação não encontrada");
     const currentStatus = currentRes.rows[0].status;
 
-    // 1. LÓGICA DE AJUSTE DE QUANTIDADE (Ocorre ao aprovar e conferir)
     if (adjusted_items && Array.isArray(adjusted_items)) {
        for (const adj of adjusted_items) {
           const itemCheck = await client.query('SELECT product_id, quantity_requested, quantity_delivered FROM request_items WHERE id = $1', [adj.id]);
@@ -228,10 +238,8 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
              const oldReserved = parseFloat(item.quantity_delivered ?? item.quantity_requested);
              const newReserved = parseFloat(adj.quantity_delivered);
              
-             // Salva a quantidade ajustada (enviada/atendida)
              await client.query('UPDATE request_items SET quantity_delivered = $1 WHERE id = $2', [newReserved, adj.id]);
              
-             // Ajusta o "quantity_reserved" do stock se houver diferença entre o que foi pedido e o que vamos enviar
              if (item.product_id && oldReserved !== newReserved && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
                 const delta = newReserved - oldReserved;
                 await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) + $1) WHERE product_id = $2', [delta, item.product_id]);
@@ -240,10 +248,8 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
        }
     }
 
-    // Busca os itens novamente para ter as quantidades mais atualizadas (caso tenham sido ajustadas acima)
     const itemsRes = await client.query('SELECT product_id, quantity_requested, quantity_delivered FROM request_items WHERE request_id = $1 ORDER BY product_id', [id]);
     
-    // 2. LÓGICA DE ENTREGA (Desconta do stock final baseando-se na entrega real)
     if (status === 'entregue' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
       for (const item of itemsRes.rows) {
         if (item.product_id) {
@@ -254,14 +260,12 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
         }
       }
     } 
-    // 3. LÓGICA DE RECUSA (Devolve as reservas)
     else if (status === 'rejeitado' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
       for (const item of itemsRes.rows) {
         const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
         if (item.product_id) await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [finalQty, item.product_id]);
       }
     }
-    // 4. LÓGICA DE DEVOLUÇÃO / ESTORNO (Devolve o item físico que já tinha sido entregue)
     else if (status === 'devolvido' && currentStatus === 'entregue') {
       for (const item of itemsRes.rows) {
         const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
@@ -271,7 +275,6 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
 
     await client.query('UPDATE requests SET status = $1, rejection_reason = $2 WHERE id = $3', [status, rejection_reason || null, id]);
     
-    // 📝 LOG TRADUZIDO (Com lógica ternária para cada ação)
     const logAction = status === 'entregue' ? 'ENTREGAR_SOLICITACAO' : status === 'rejeitado' ? 'REJEITAR_SOLICITACAO' : status === 'devolvido' ? 'DEVOLVER_SOLICITACAO' : 'ATUALIZAR_STATUS_SOLICITACAO';
     await createLog(userId, logAction, { id_solicitacao: id, novo_status: status, motivo: rejection_reason || 'N/A' }, getClientIp(req), client);
     
@@ -300,7 +303,6 @@ export const deleteRequest = async (req: Request, res: Response) => {
 
     if (status === 'rejeitado' || status === 'entregue' || status === 'devolvido') throw new Error('Não é possível cancelar no estado atual.');
     
-    // Se estava em aberto/aprovado, desfaz as reservas usando a quantidade entregue (se já ajustada) ou a pedida
     if (status === 'aberto' || status === 'aprovado') {
        const itemsRes = await client.query('SELECT product_id, quantity_requested, quantity_delivered FROM request_items WHERE request_id = $1', [id]);
        for (const item of itemsRes.rows) {
@@ -311,7 +313,6 @@ export const deleteRequest = async (req: Request, res: Response) => {
 
     await client.query("UPDATE requests SET status = 'rejeitado', rejection_reason = 'Cancelado pelo usuário/sistema' WHERE id = $1", [id]);
     
-    // 📝 LOG TRADUZIDO E MELHORADO
     await createLog(userId, 'CANCELAR_SOLICITACAO', { id_solicitacao: id, status_anterior: status }, getClientIp(req), client);
     await client.query('COMMIT');
     
