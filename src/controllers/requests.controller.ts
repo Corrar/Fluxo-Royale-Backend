@@ -85,7 +85,7 @@ export const createRequest = async (req: Request, res: Response) => {
     // 🛡️ 1. REGRA DE NEGÓCIO: VERIFICA SE A OP É OBRIGATÓRIA (BASEADO EM TAGS)
     // =========================================================================
     let requiresOp = false;
-    const exemptTags = ['camisetas', 'epi', 'ferramentas'];
+    const exemptTags = ['camisetas', 'camiseta', 'epi', 'ferramentas'];
     
     // Pega apenas os IDs válidos (ignora itens 'custom' genéricos)
     const productIds = items
