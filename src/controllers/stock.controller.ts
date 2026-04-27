@@ -1,3 +1,5 @@
+// src/controllers/stock.controller.ts
+
 import { Request, Response } from 'express';
 import { pool } from '../db';
 import { createLog } from '../utils/logger';
@@ -94,25 +96,97 @@ export const manualEntry = async (req: Request, res: Response) => {
 };
 
 export const manualWithdrawal = async (req: Request, res: Response) => {
-  const { sector, items } = req.body;
+  // 🟢 Adicionado 'op_code' extraído do frontend
+  const { sector, items, op_code } = req.body;
   const userId = (req as any).user.id;
   const client = await pool.connect();
+  
   try {
     validatePositiveItems(items);
     await client.query('BEGIN');
-    const sepRes = await client.query('INSERT INTO separations (destination, status, type) VALUES ($1, $2, $3) RETURNING id', [sector, 'concluida', 'manual']);
+
+    // =========================================================================
+    // 🛡️ 1. REGRA DE NEGÓCIO: VERIFICA SE A OP É OBRIGATÓRIA (BASEADO EM TAGS)
+    // =========================================================================
+    let requiresOp = false;
+    const exemptTags = ['camisetas', 'epi', 'ferramentas'];
+    
+    const productIds = items
+      .map((i: any) => i.product_id)
+      .filter((id: any) => id && id !== 'custom');
+
+    if (items.length > productIds.length) {
+        requiresOp = true;
+    } else if (productIds.length > 0) {
+        const productsQuery = await client.query(
+            'SELECT id, tags FROM products WHERE id = ANY($1::uuid[])', 
+            [productIds]
+        );
+        
+        for (const product of productsQuery.rows) {
+            const tags = Array.isArray(product.tags) ? product.tags.map((t: string) => t.toLowerCase()) : [];
+            const isExempt = tags.some((tag: string) => exemptTags.includes(tag));
+            
+            if (!isExempt) {
+                requiresOp = true;
+                break;
+            }
+        }
+    }
+
+    // =========================================================================
+    // 🛡️ 2. VALIDAÇÃO E VÍNCULO DA OP
+    // =========================================================================
+    let client_service_id = null;
+
+    if (op_code) {
+        const opCheck = await client.query('SELECT id, status FROM client_services WHERE op_code = $1', [op_code]);
+        if (opCheck.rows.length === 0) throw new Error("OP_NAO_ENCONTRADA");
+        
+        const opStatus = opCheck.rows[0].status;
+        if (opStatus === 'finalizada' || opStatus === 'encerrada') throw new Error("OP_FINALIZADA");
+        
+        client_service_id = opCheck.rows[0].id;
+    } else if (requiresOp) {
+        throw new Error("OP_OBRIGATORIA_TAGS");
+    }
+
+    // =========================================================================
+    // 🟢 INSERÇÃO DA SAÍDA MANUAL COM A OP
+    // =========================================================================
+    // Note que adicionamos o 'client_service_id' no final do INSERT
+    const sepRes = await client.query(
+      'INSERT INTO separations (destination, status, type, client_service_id) VALUES ($1, $2, $3, $4) RETURNING id', 
+      [sector, 'concluida', 'manual', client_service_id]
+    );
+
     for (const item of items) {
       if (!item.product_id || !item.quantity) throw new Error("Item inválido.");
       const stCheck = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1 FOR UPDATE', [item.product_id]);
       if(parseFloat(stCheck.rows[0]?.quantity_on_hand || 0) < item.quantity) throw new Error(`Estoque insuficiente ID ${item.product_id}.`);
-      await client.query('INSERT INTO separation_items (separation_id, product_id, quantity, observation) VALUES ($1, $2, $3, $4)', [sepRes.rows[0].id, item.product_id, item.quantity, item.observation || null]);
+      
+      await client.query(
+        'INSERT INTO separation_items (separation_id, product_id, quantity, observation) VALUES ($1, $2, $3, $4)', 
+        [sepRes.rows[0].id, item.product_id, item.quantity, item.observation || null]
+      );
+      
       await client.query('UPDATE stock SET quantity_on_hand = quantity_on_hand - $1 WHERE product_id = $2', [item.quantity, item.product_id]);
     }
+
     await createLog(userId, 'MANUAL_WITHDRAWAL', { separationId: sepRes.rows[0].id, sector }, getClientIp(req), client);
     await client.query('COMMIT');
     res.status(201).json({ success: true });
+    
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch(e) {}
+
+    // 🟢 Tratamento de erros amigáveis para exibir no Frontend
+    if (error.message === "OP_OBRIGATORIA_TAGS") return res.status(400).json({ error: "É obrigatório informar o número da OP para estes tipos de produtos." });
+    if (error.message === "OP_NAO_ENCONTRADA") return res.status(404).json({ error: "OP não encontrada no sistema. Verifique o número digitado." });
+    if (error.message === "OP_FINALIZADA") return res.status(400).json({ error: "Essa OP ja foi finalizada, verifique a OP correta" });
+
     res.status(500).json({ error: error.message });
-  } finally { client.release(); }
+  } finally { 
+    client.release(); 
+  }
 };
