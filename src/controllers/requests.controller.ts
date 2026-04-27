@@ -1,3 +1,5 @@
+// src/controllers/requests.controller.ts
+
 import { Request, Response } from 'express';
 import { pool } from '../db';
 import { createLog } from '../utils/logger';
@@ -72,13 +74,43 @@ export const getMyRequests = async (req: Request, res: Response) => {
 
 export const createRequest = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
-  const { sector, items } = req.body;
+  // 🟢 Adicionado 'op_code' recebido do frontend
+  const { sector, items, op_code } = req.body; 
   const client = await pool.connect();
+  
   try {
     validatePositiveItems(items);
     await client.query('BEGIN');
-    const reqRes = await client.query('INSERT INTO requests (requester_id, sector, status) VALUES ($1, $2, $3) RETURNING id', [userId, sector, 'aberto']);
+
+    // 🛡️ INÍCIO DA VALIDAÇÃO DA OP
+    if (!op_code) {
+      throw new Error("OP_OBRIGATORIA");
+    }
+
+    // Busca o ID e o Status na tabela client_services com base no código digitado
+    const opCheck = await client.query('SELECT id, status FROM client_services WHERE op_code = $1', [op_code]);
+    
+    // Valida se a OP existe
+    if (opCheck.rows.length === 0) {
+      throw new Error("OP_NAO_ENCONTRADA");
+    }
+    
+    // Valida se a OP está encerrada
+    const opStatus = opCheck.rows[0].status;
+    if (opStatus === 'finalizada' || opStatus === 'encerrada') {
+      throw new Error("OP_FINALIZADA");
+    }
+    
+    const client_service_id = opCheck.rows[0].id;
+    // 🛡️ FIM DA VALIDAÇÃO DA OP
+
+    // 🟢 Inserção agora inclui o 'client_service_id'
+    const reqRes = await client.query(
+      'INSERT INTO requests (requester_id, sector, status, client_service_id) VALUES ($1, $2, $3, $4) RETURNING id', 
+      [userId, sector, 'aberto', client_service_id]
+    );
     const requestId = reqRes.rows[0].id;
+    
     const sortedItems = [...items].sort((a, b) => {
        if (!a.product_id) return 1; if (!b.product_id) return -1;
        return String(a.product_id).localeCompare(String(b.product_id));
@@ -95,8 +127,10 @@ export const createRequest = async (req: Request, res: Response) => {
         await client.query(`UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2`, [item.quantity, productId]);
       }
       
-      // O quantity_delivered não é preenchido na criação do pedido (só na conferência/aprovação)
-      await client.query('INSERT INTO request_items (request_id, product_id, custom_product_name, quantity_requested, observation, client_service) VALUES ($1, $2, $3, $4, $5, $6)', [requestId, productId, customName, item.quantity, item.observation || null, item.client_service || null]);
+      await client.query(
+        'INSERT INTO request_items (request_id, product_id, custom_product_name, quantity_requested, observation, client_service) VALUES ($1, $2, $3, $4, $5, $6)', 
+        [requestId, productId, customName, item.quantity, item.observation || null, item.client_service || null]
+      );
     }
     
     // 📝 LOG TRADUZIDO E MELHORADO
@@ -118,7 +152,6 @@ export const createRequest = async (req: Request, res: Response) => {
     // ================================================================
     const dataAtual = new Date();
     
-    // 🔥 CORREÇÃO: Forçando o fuso horário de São Paulo (Brasília)
     const dataFormatada = dataAtual.toLocaleDateString('pt-BR', { 
       day: '2-digit', 
       month: '2-digit', 
@@ -136,19 +169,14 @@ export const createRequest = async (req: Request, res: Response) => {
     
     itemsDetail.forEach((reqItem: any) => {
         const qtd = reqItem.quantity_requested;
-        // Pega o nome do produto ou o nome customizado se for item avulso
         const nomeProduto = reqItem.products ? reqItem.products.name : (reqItem.custom_product_name || 'Produto Genérico');
-        // Pega o SKU se existir, senão N/A
         const skuProduto = reqItem.products?.sku ? `SKU: ${reqItem.products.sku}` : 'SKU: N/A';
-        
         listaMateriais += `\n- ${qtd} un. ${nomeProduto} | ${skuProduto}`;
     });
 
     const nomeSolicitante = fullReqRows[0].requester?.name || 'Usuário';
-    
-    const mensagemPersonalizada = `Setor: ${sector}\nData/Hora: ${dataFormatada} - ${horaFormatada}\nMateriais:${listaMateriais}`;
+    const mensagemPersonalizada = `Setor: ${sector}\nOP: ${op_code}\nData/Hora: ${dataFormatada} - ${horaFormatada}\nMateriais:${listaMateriais}`;
 
-    // Dispara a notificação passando a nossa mensagem montada!
     sendPushNotificationToRole(
       'almoxarife', 
       `Novo Pedido de ${nomeSolicitante}`, 
@@ -161,9 +189,18 @@ export const createRequest = async (req: Request, res: Response) => {
 
     res.status(201).json({ success: true, id: requestId });
   } catch (error: any) {
+    // Caso de erro, desfaz a transação no banco de dados!
     try { await client.query('ROLLBACK'); } catch(e) {}
+    
+    // 🟢 Tratamento das mensagens de erro da OP para o Frontend
+    if (error.message === "OP_OBRIGATORIA") return res.status(400).json({ error: "É obrigatório informar o número da OP para esta solicitação." });
+    if (error.message === "OP_NAO_ENCONTRADA") return res.status(404).json({ error: "OP não encontrada no sistema. Verifique o número digitado." });
+    if (error.message === "OP_FINALIZADA") return res.status(400).json({ error: "Essa OP ja foi finalizada, verifique a OP correta" });
+    
     res.status(error.message.includes('Estoque disponível insuficiente') ? 400 : 500).json({ error: `Erro Técnico: ${error.message}` }); 
-  } finally { client.release(); }
+  } finally { 
+    client.release(); 
+  }
 };
 
 export const updateRequestStatus = async (req: Request, res: Response) => {
