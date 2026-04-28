@@ -7,7 +7,8 @@ import {
     deleteClient, 
     createService, 
     updateServiceStatus, 
-    deleteService 
+    deleteService,
+    transferServiceData // <-- NOVA FUNÇÃO IMPORTADA AQUI
 } from '../controllers/clients.controller';
 
 const router = Router();
@@ -35,6 +36,9 @@ router.post('/:id/services', authenticate, createService);
 
 // Atualizar o status de uma OP
 router.patch('/services/:serviceId/status', authenticate, updateServiceStatus);
+
+// Transferir movimentações de uma OP para outra (Merge)
+router.post('/services/:serviceId/transfer', authenticate, transferServiceData); // <-- NOVA ROTA ADICIONADA AQUI
 
 // Excluir uma OP
 router.delete('/services/:serviceId', authenticate, deleteService);
