@@ -121,3 +121,34 @@ export const deleteService = async (req: Request, res: Response) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+// =========================================================================
+// NOVA FUNÇÃO: TRANSFERÊNCIA DE DADOS ENTRE OPs
+// =========================================================================
+export const transferServiceData = async (req: Request, res: Response) => {
+  const client = await pool.connect();
+  try {
+    const { serviceId } = req.params; // OP de origem (a errada, que vai ficar vazia)
+    const { targetServiceId } = req.body; // OP de destino (a correta, que vai receber)
+
+    if (!targetServiceId) return res.status(400).json({ error: "A OP de destino é obrigatória." });
+    if (serviceId === targetServiceId) return res.status(400).json({ error: "Não podes transferir para a mesma OP." });
+
+    await client.query('BEGIN');
+    
+    // 🛡️ TRANFERÊNCIA DE VÍNCULOS
+    // Atualizamos a tabela de "requests" para apontar para a nova OP
+    await client.query(
+      `UPDATE requests SET client_service_id = $1 WHERE client_service_id = $2`, 
+      [targetServiceId, serviceId]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: "Movimentações transferidas com sucesso!" });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+};
