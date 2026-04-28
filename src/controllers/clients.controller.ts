@@ -123,7 +123,7 @@ export const deleteService = async (req: Request, res: Response) => {
 };
 
 // =========================================================================
-// NOVA FUNÇÃO: TRANSFERÊNCIA DE DADOS ENTRE OPs
+// FUNÇÃO: TRANSFERÊNCIA DE DADOS ENTRE OPs (COMPLETA)
 // =========================================================================
 export const transferServiceData = async (req: Request, res: Response) => {
   const client = await pool.connect();
@@ -136,15 +136,44 @@ export const transferServiceData = async (req: Request, res: Response) => {
 
     await client.query('BEGIN');
     
-    // 🛡️ TRANFERÊNCIA DE VÍNCULOS
-    // Atualizamos a tabela de "requests" para apontar para a nova OP
+    // 1. Encontrar os Textos (Códigos) das OPs
+    const oldOpRes = await client.query('SELECT op_code FROM client_services WHERE id = $1', [serviceId]);
+    const targetOpRes = await client.query('SELECT op_code FROM client_services WHERE id = $1', [targetServiceId]);
+    
+    if (oldOpRes.rows.length === 0 || targetOpRes.rows.length === 0) {
+        throw new Error("OP de origem ou destino não encontrada no sistema.");
+    }
+
+    const oldOpCode = oldOpRes.rows[0].op_code;
+    const targetOpCode = targetOpRes.rows[0].op_code;
+
+    // -----------------------------------------------------------
+    // 🛡️ TRANSFERÊNCIA DE VÍNCULOS
+    // -----------------------------------------------------------
+    
+    // 2. Move os Pedidos/Solicitações (Busca por ID)
     await client.query(
       `UPDATE requests SET client_service_id = $1 WHERE client_service_id = $2`, 
       [targetServiceId, serviceId]
     );
 
+    // 3. Atualiza os textos avulsos dentro dos itens dos pedidos (Busca por Texto)
+    await client.query(
+      `UPDATE request_items SET client_service = $1 WHERE client_service = $2`, 
+      [targetOpCode, oldOpCode]
+    );
+
+    // 4. Move as Saídas Manuais e Separações (Busca por ID E por Texto)
+    // Atualiza tanto as Saídas Manuais novas (ID) como as Separações antigas (Texto)
+    await client.query(
+      `UPDATE separations 
+       SET client_service_id = $1, production_order = $2 
+       WHERE client_service_id = $3 OR production_order = $4`, 
+      [targetServiceId, targetOpCode, serviceId, oldOpCode]
+    );
+
     await client.query('COMMIT');
-    res.json({ success: true, message: "Movimentações transferidas com sucesso!" });
+    res.json({ success: true, message: "Todas as movimentações foram transferidas com sucesso!" });
   } catch (error: any) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
