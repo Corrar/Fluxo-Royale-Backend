@@ -85,7 +85,8 @@ export const createRequest = async (req: Request, res: Response) => {
     // 🛡️ 1. REGRA DE NEGÓCIO: VERIFICA SE A OP É OBRIGATÓRIA (BASEADO EM TAGS)
     // =========================================================================
     let requiresOp = false;
-    const exemptTags = ['camisetas', 'camiseta', 'epi', 'ferramentas'];
+    // 🟢 INSUMOS ADICIONADOS NA LISTA DE ISENÇÃO DO BACKEND
+    const exemptTags = ['camisetas', 'camiseta', 'epi', 'ferramentas', 'insumos', 'insumo'];
     
     // Pega apenas os IDs válidos (ignora itens 'custom' genéricos)
     const productIds = items
@@ -98,12 +99,19 @@ export const createRequest = async (req: Request, res: Response) => {
     } else if (productIds.length > 0) {
         // Busca as tags dos produtos lá no banco de dados
         const productsQuery = await client.query(
-            'SELECT id, tags FROM products WHERE id = ANY($1::uuid[])', 
+            'SELECT id, tags, category, grupo FROM products WHERE id = ANY($1::uuid[])', 
             [productIds]
         );
         
         for (const product of productsQuery.rows) {
-            const tags = Array.isArray(product.tags) ? product.tags.map((t: string) => t.toLowerCase()) : [];
+            let tags = Array.isArray(product.tags) ? product.tags.map((t: string) => t.trim().toLowerCase()) : [];
+            
+            // Se as tags estiverem vazias, usamos a Categoria ou Grupo para a isenção (igual ao frontend)
+            if (tags.length === 0) {
+                if (product.category) tags.push(product.category.trim().toLowerCase());
+                else if (product.grupo) tags.push(product.grupo.trim().toLowerCase());
+            }
+
             const isExempt = tags.some((tag: string) => exemptTags.includes(tag));
             
             // Se achar UM produto que não tem a tag de isenção, exige a OP e para de procurar
@@ -194,7 +202,7 @@ export const createRequest = async (req: Request, res: Response) => {
     const nomeSolicitante = fullReqRows[0].requester?.name || 'Usuário';
     
     // Deixa o aviso da OP na mensagem do WhatsApp apenas se houver OP
-    const avisoOp = op_code ? `\nOP: ${op_code}` : `\nOP: Isento (EPI/Ferramenta)`;
+    const avisoOp = op_code ? `\nOP: ${op_code}` : `\nOP: Isento (EPI/Ferramenta/Insumo)`;
     const mensagemPersonalizada = `Setor: ${sector}${avisoOp}\nData/Hora: ${dataFormatada} - ${horaFormatada}\nMateriais:${listaMateriais}`;
 
     sendPushNotificationToRole('almoxarife', `Novo Pedido de ${nomeSolicitante}`, mensagemPersonalizada, '/requests');
