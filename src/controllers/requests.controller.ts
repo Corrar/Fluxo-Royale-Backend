@@ -85,36 +85,38 @@ export const createRequest = async (req: Request, res: Response) => {
     // 🛡️ 1. REGRA DE NEGÓCIO: VERIFICA SE A OP É OBRIGATÓRIA (BASEADO EM TAGS)
     // =========================================================================
     let requiresOp = false;
-    // 🟢 INSUMOS ADICIONADOS NA LISTA DE ISENÇÃO DO BACKEND
     const exemptTags = ['camisetas', 'camiseta', 'epi', 'ferramentas', 'insumos', 'insumo'];
     
-    // Pega apenas os IDs válidos (ignora itens 'custom' genéricos)
     const productIds = items
       .map((i: any) => i.product_id)
       .filter((id: any) => id && id !== 'custom');
 
-    // Se o pedido tem algum item "avulso/genérico", a OP é obrigatória
     if (items.length > productIds.length) {
         requiresOp = true;
     } else if (productIds.length > 0) {
-        // Busca as tags dos produtos lá no banco de dados
+        // CORREÇÃO AQUI: Removemos "category" e "grupo" do SELECT porque não existem na tabela
         const productsQuery = await client.query(
-            'SELECT id, tags, category, grupo FROM products WHERE id = ANY($1::uuid[])', 
+            'SELECT id, tags FROM products WHERE id = ANY($1::uuid[])', 
             [productIds]
         );
         
         for (const product of productsQuery.rows) {
-            let tags = Array.isArray(product.tags) ? product.tags.map((t: string) => t.trim().toLowerCase()) : [];
+            let tags: string[] = [];
             
-            // Se as tags estiverem vazias, usamos a Categoria ou Grupo para a isenção (igual ao frontend)
-            if (tags.length === 0) {
-                if (product.category) tags.push(product.category.trim().toLowerCase());
-                else if (product.grupo) tags.push(product.grupo.trim().toLowerCase());
+            if (Array.isArray(product.tags)) {
+                tags.push(...product.tags.map((t: string) => String(t).trim().toLowerCase()));
+            } else if (typeof product.tags === 'string' && product.tags.trim() !== '') {
+                try {
+                    const parsed = JSON.parse(product.tags);
+                    if (Array.isArray(parsed)) tags.push(...parsed.map((t: string) => String(t).trim().toLowerCase()));
+                    else tags.push(product.tags.trim().toLowerCase());
+                } catch(e) {
+                    tags.push(product.tags.trim().toLowerCase());
+                }
             }
 
             const isExempt = tags.some((tag: string) => exemptTags.includes(tag));
             
-            // Se achar UM produto que não tem a tag de isenção, exige a OP e para de procurar
             if (!isExempt) {
                 requiresOp = true;
                 break;
@@ -128,7 +130,6 @@ export const createRequest = async (req: Request, res: Response) => {
     let client_service_id = null;
 
     if (op_code) {
-        // Se ele digitou uma OP (mesmo sendo isento, a gente vincula pra ficar organizado)
         const opCheck = await client.query('SELECT id, status FROM client_services WHERE op_code = $1', [op_code]);
         if (opCheck.rows.length === 0) throw new Error("OP_NAO_ENCONTRADA");
         
@@ -137,7 +138,6 @@ export const createRequest = async (req: Request, res: Response) => {
         
         client_service_id = opCheck.rows[0].id;
     } else if (requiresOp) {
-        // Se a OP é obrigatória e ele não digitou nada
         throw new Error("OP_OBRIGATORIA_TAGS");
     }
 
@@ -201,7 +201,6 @@ export const createRequest = async (req: Request, res: Response) => {
 
     const nomeSolicitante = fullReqRows[0].requester?.name || 'Usuário';
     
-    // Deixa o aviso da OP na mensagem do WhatsApp apenas se houver OP
     const avisoOp = op_code ? `\nOP: ${op_code}` : `\nOP: Isento (EPI/Ferramenta/Insumo)`;
     const mensagemPersonalizada = `Setor: ${sector}${avisoOp}\nData/Hora: ${dataFormatada} - ${horaFormatada}\nMateriais:${listaMateriais}`;
 
@@ -211,7 +210,6 @@ export const createRequest = async (req: Request, res: Response) => {
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch(e) {}
     
-    // Tratamento dos erros para o Frontend
     if (error.message === "OP_OBRIGATORIA_TAGS") return res.status(400).json({ error: "É obrigatório informar o número da OP para estes tipos de produtos." });
     if (error.message === "OP_NAO_ENCONTRADA") return res.status(404).json({ error: "OP não encontrada no sistema. Verifique o número digitado." });
     if (error.message === "OP_FINALIZADA") return res.status(400).json({ error: "Essa OP ja foi finalizada, verifique a OP correta" });
