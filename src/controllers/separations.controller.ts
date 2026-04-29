@@ -19,7 +19,8 @@ export const getSeparations = async (req: Request, res: Response) => {
 
 export const createSeparation = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
-  const { client_name, production_order, destination, items } = req.body;
+  // 🟢 CORREÇÃO: Adicionado o recebimento do client_service_id do frontend
+  const { client_name, production_order, destination, items, client_service_id } = req.body;
   const client = await pool.connect();
   try {
     validatePositiveItems(items);
@@ -27,7 +28,12 @@ export const createSeparation = async (req: Request, res: Response) => {
     const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     if (userCheck.rows[0]?.role !== 'admin' && userCheck.rows[0]?.role !== 'almoxarife') throw new Error('Sem permissão.');
 
-    const sepRes = await client.query(`INSERT INTO separations (destination, client_name, production_order, status, type) VALUES ($1, $2, $3, 'pendente', 'op') RETURNING id`, [destination, client_name, production_order]);
+    // 🟢 CORREÇÃO: Guardamos o client_service_id oficialmente na base de dados
+    const sepRes = await client.query(
+      `INSERT INTO separations (destination, client_name, production_order, status, type, client_service_id) VALUES ($1, $2, $3, 'pendente', 'op', $4) RETURNING id`, 
+      [destination, client_name, production_order, client_service_id || null]
+    );
+    
     for (const item of items) {
       await client.query(`INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity, observation) VALUES ($1, $2, $3, 0, $4)`, [sepRes.rows[0].id, item.product_id, item.quantity, item.observation || null]);
     }
@@ -127,7 +133,8 @@ export const deleteSeparation = async (req: Request, res: Response) => {
 // 🛠️ NOVA FUNÇÃO: Editar Pedido (updateSeparation)
 export const updateSeparation = async (req: Request, res: Response) => {
   const { id } = req.params;
-  const { client_name, production_order, destination, items } = req.body;
+  // 🟢 CORREÇÃO: Adicionado o recebimento do client_service_id do frontend
+  const { client_name, production_order, destination, items, client_service_id } = req.body;
   const userId = (req as any).user.id;
   const client = await pool.connect();
 
@@ -136,10 +143,10 @@ export const updateSeparation = async (req: Request, res: Response) => {
     const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     if (userCheck.rows[0]?.role !== 'admin' && userCheck.rows[0]?.role !== 'almoxarife') throw new Error('Acesso negado.');
 
-    // 1. Atualiza os dados principais do pedido
+    // 🟢 CORREÇÃO: Atualizamos o client_service_id na base de dados
     await client.query(
-      `UPDATE separations SET client_name = $1, production_order = $2, destination = $3 WHERE id = $4`,
-      [client_name, production_order, destination, id]
+      `UPDATE separations SET client_name = $1, production_order = $2, destination = $3, client_service_id = $4 WHERE id = $5`,
+      [client_name, production_order, destination, client_service_id || null, id]
     );
 
     // 2. Compara os itens antigos com os novos
