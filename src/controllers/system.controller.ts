@@ -39,15 +39,16 @@ export const getDashboardStats = async (req: Request, res: Response) => {
  */
 export const getManagerialReports = async (req: Request, res: Response) => {
   try {
-    // 🟢 CORREÇÃO: Status atualizado para 'entregue' ou 'finalizada'
+    // 🟢 CORREÇÃO: Status 'concluida' adicionado
     const topProductsQuery = `
       SELECT p.name, SUM(si.quantity) as total 
       FROM separation_items si 
       JOIN products p ON si.product_id = p.id 
       JOIN separations s ON si.separation_id = s.id 
-      WHERE s.status IN ('entregue', 'finalizada') 
+      WHERE s.status IN ('entregue', 'finalizada', 'concluida') 
       GROUP BY p.name ORDER BY total DESC LIMIT 5`;
 
+    // 🟢 CORREÇÃO: Usando sent_at como data base e adicionando 'concluida'
     const historyQuery = `
       WITH months AS (
         SELECT generate_series(date_trunc('month', CURRENT_DATE) - INTERVAL '5 months', date_trunc('month', CURRENT_DATE), '1 month'::interval) as month
@@ -57,8 +58,8 @@ export const getManagerialReports = async (req: Request, res: Response) => {
              (SELECT COALESCE(SUM(si.quantity), 0) 
               FROM separation_items si 
               JOIN separations s ON si.separation_id = s.id 
-              WHERE date_trunc('month', s.created_at) = m.month 
-              AND s.status IN ('entregue', 'finalizada')) as saidas 
+              WHERE date_trunc('month', COALESCE(s.sent_at, s.created_at)) = m.month 
+              AND s.status IN ('entregue', 'finalizada', 'concluida')) as saidas 
       FROM months m 
       LEFT JOIN xml_logs xl ON date_trunc('month', xl.created_at) = m.month 
       LEFT JOIN xml_items xi ON xi.xml_log_id = xl.id 
@@ -81,15 +82,16 @@ export const getManagerialReports = async (req: Request, res: Response) => {
  */
 export const getRecentTransactions = async (req: Request, res: Response) => {
   try {
+    // 🟢 CORREÇÃO: Substituição de created_at por COALESCE(s.sent_at, s.created_at) e status 'concluida' nas separações
     const query = `
       SELECT xi.id::text as id, 'in' as type, p.name as product_name, p.sku as product_sku, xi.quantity as amount, xi.created_at 
       FROM xml_items xi JOIN products p ON xi.product_id = p.id
       UNION ALL 
-      SELECT si.id::text as id, 'out' as type, p.name as product_name, p.sku as product_sku, si.quantity as amount, s.created_at 
+      SELECT si.id::text as id, 'out' as type, p.name as product_name, p.sku as product_sku, si.quantity as amount, COALESCE(s.sent_at, s.created_at) as created_at 
       FROM separation_items si 
       JOIN separations s ON si.separation_id = s.id 
       JOIN products p ON si.product_id = p.id 
-      WHERE s.status IN ('entregue', 'finalizada')
+      WHERE s.status IN ('entregue', 'finalizada', 'concluida')
       UNION ALL 
       SELECT ri.id::text as id, 'out' as type, COALESCE(p.name, ri.custom_product_name) as product_name, p.sku as product_sku, ri.quantity_requested as amount, r.created_at 
       FROM request_items ri 
@@ -110,12 +112,13 @@ export const getRecentTransactions = async (req: Request, res: Response) => {
  */
 export const getAvailableDates = async (req: Request, res: Response) => {
   try {
+    // 🟢 CORREÇÃO: A considerar sent_at nas datas base das separações
     const result = await pool.query(`
       SELECT MIN(data) as min_date, MAX(data) as max_date 
       FROM (
         SELECT created_at as data FROM xml_items 
         UNION ALL 
-        SELECT created_at as data FROM separations WHERE status IN ('entregue', 'finalizada') 
+        SELECT COALESCE(sent_at, created_at) as data FROM separations WHERE status IN ('entregue', 'finalizada', 'concluida') 
         UNION ALL 
         SELECT created_at as data FROM requests WHERE status IN ('aprovado', 'entregue')
       ) as all_dates`);
@@ -144,12 +147,14 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       WHERE xi.created_at >= $1 AND xi.created_at <= $2 
       ORDER BY xi.created_at DESC`, [start, end]);
     
-    // 🟢 CORREÇÃO: Status atualizado para capturar saídas oficiais
+    // 🟢 CORREÇÃO: Data de saída (sent_at), Status (concluida) e campos para Frontend (solicitante, status)
     const separacoesRes = await pool.query(`
-      SELECT s.created_at as data, 
+      SELECT COALESCE(s.sent_at, s.created_at) as data, 
              CASE WHEN s.type='manual' THEN 'Saída - Manual' ELSE 'Saída - Separação' END as tipo, 
              s.destination as destino_setor, 
              cs.op_code, 
+             s.client_name as solicitante,
+             s.status as status,
              p.name as produto, p.sku, p.unit as unidade, 
              si.quantity as quantidade, 
              COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario 
@@ -157,9 +162,9 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       JOIN separations s ON si.separation_id = s.id 
       JOIN products p ON si.product_id = p.id 
       LEFT JOIN client_services cs ON s.client_service_id = cs.id 
-      WHERE s.created_at >= $1 AND s.created_at <= $2 
-      AND s.status IN ('entregue', 'finalizada') 
-      ORDER BY s.created_at DESC`, [start, end]);
+      WHERE COALESCE(s.sent_at, s.created_at) >= $1 AND COALESCE(s.sent_at, s.created_at) <= $2 
+      AND s.status IN ('entregue', 'finalizada', 'concluida') 
+      ORDER BY data DESC`, [start, end]);
     
     const solicitacoesRes = await pool.query(`
       SELECT r.created_at as data, 'Saída - Solicitação' as tipo, 
@@ -186,9 +191,9 @@ export const getGeneralReports = async (req: Request, res: Response) => {
              COALESCE(CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC), 0) as estoque_minimo, 
              GREATEST(
                (SELECT MAX(created_at)::timestamp FROM xml_items WHERE product_id = p.id), 
-               (SELECT MAX(sep.created_at)::timestamp FROM separation_items si 
+               (SELECT MAX(COALESCE(sep.sent_at, sep.created_at))::timestamp FROM separation_items si 
                 JOIN separations sep ON si.separation_id = sep.id 
-                WHERE sep.status IN ('entregue', 'finalizada') AND si.product_id = p.id), 
+                WHERE sep.status IN ('entregue', 'finalizada', 'concluida') AND si.product_id = p.id), 
                (SELECT MAX(r.created_at)::timestamp FROM request_items ri 
                 JOIN requests r ON ri.request_id = r.id 
                 WHERE r.status IN ('aprovado', 'entregue') AND ri.product_id = p.id)
@@ -196,10 +201,11 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       FROM stock s 
       JOIN products p ON s.product_id = p.id WHERE p.active = true`);
     
+    // 🟢 CORREÇÃO: Utilizando COALESCE na verificação de datas para comparativo do mês anterior e incluindo 'concluida'
     const comparativoRes = await pool.query(`
       SELECT 
         (SELECT COUNT(*) FROM xml_items xi WHERE xi.created_at >= $1::timestamp - INTERVAL '1 month' AND xi.created_at <= $2::timestamp - INTERVAL '1 month') as entradas_ant, 
-        ((SELECT COUNT(*) FROM separation_items si JOIN separations sep ON si.separation_id = sep.id WHERE sep.created_at >= $1::timestamp - INTERVAL '1 month' AND sep.created_at <= $2::timestamp - INTERVAL '1 month' AND sep.status IN ('entregue', 'finalizada')) + 
+        ((SELECT COUNT(*) FROM separation_items si JOIN separations sep ON si.separation_id = sep.id WHERE COALESCE(sep.sent_at, sep.created_at) >= $1::timestamp - INTERVAL '1 month' AND COALESCE(sep.sent_at, sep.created_at) <= $2::timestamp - INTERVAL '1 month' AND sep.status IN ('entregue', 'finalizada', 'concluida')) + 
          (SELECT COUNT(*) FROM request_items ri JOIN requests req ON ri.request_id = req.id WHERE req.created_at >= $1::timestamp - INTERVAL '1 month' AND req.created_at <= $2::timestamp - INTERVAL '1 month' AND req.status IN ('aprovado', 'entregue'))) as saidas_ant`, 
       [start, end]);
     
