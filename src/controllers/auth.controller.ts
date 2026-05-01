@@ -13,15 +13,18 @@ export const login = async (req: Request, res: Response) => {
     const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     const user = rows[0];
 
+    // Verifica se o usuário existe e se está ativo
     if (!user) return res.status(400).json({ error: 'Usuário não encontrado' });
     if (user.is_active === false) return res.status(403).json({ error: 'Acesso bloqueado. Conta suspensa pelo administrador.' });
 
+    // Verifica se a senha está correta
     const validPassword = await bcrypt.compare(password, user.encrypted_password);
     if (!validPassword) return res.status(400).json({ error: 'Senha incorreta' });
 
-    // 1. PRIMEIRO PASSO CORRIGIDO: Buscar o perfil (onde está o cargo/role) ANTES de criar o Token
+    // 1. PRIMEIRO PASSO: Buscar o perfil (onde está o cargo/role) ANTES de criar o Token
     let { rows: profiles } = await pool.query('SELECT * FROM profiles WHERE id = $1', [user.id]);
     if (profiles.length === 0) {
+      // Cria um perfil padrão caso o usuário não tenha um
       const defaultName = user.email.split('@')[0];
       const insertRes = await pool.query(
         `INSERT INTO profiles (id, name, role, sector) VALUES ($1, $2, 'setor', 'Geral') RETURNING *`,
@@ -30,22 +33,32 @@ export const login = async (req: Request, res: Response) => {
       profiles = insertRes.rows;
     }
 
-    // 2. SEGUNDO PASSO CORRIGIDO: Criar o Token agora, injetando a 'role' que acabámos de buscar!
+    // 2. SEGUNDO PASSO: Criar o Token agora, injetando a 'role' que buscamos
     const token = jwt.sign(
       { 
         id: user.id, 
         email: user.email, 
-        role: profiles[0].role // 👈 AQUI ESTÁ A MAGIA!
+        role: profiles[0].role
       }, 
       JWT_SECRET, 
       { expiresIn: '1d' }
     );
 
-    const permRes = await pool.query('SELECT page_key FROM role_permissions WHERE role = $1', [profiles[0].role]);
+    // 3. TERCEIRO PASSO (A CORREÇÃO): Buscar permissões combinadas (Cargo + Exceções do Usuário)
+    // O UNION junta as duas listas e remove automaticamente as repetições
+    const permRes = await pool.query(`
+      SELECT page_key FROM role_permissions WHERE role = $1
+      UNION
+      SELECT page_key FROM user_permissions WHERE user_id = $2
+    `, [profiles[0].role, user.id]);
+    
+    // Transformamos o resultado do banco num array simples de strings. Ex: ['dashboard', 'produtos:editar']
     const userPermissions = permRes.rows.map((r: any) => r.page_key);
     
+    // Registra o login no sistema de auditoria
     await createLog(user.id, 'LOGIN', { message: 'Login realizado' }, getClientIp(req));
 
+    // Devolvemos o token e as permissões finalizadas para o Front-end
     res.json({ token, user, profile: profiles[0], permissions: userPermissions });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
