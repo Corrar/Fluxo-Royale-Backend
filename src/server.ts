@@ -9,6 +9,7 @@ import { initSocket } from './config/socket';
 import { startExpireRequestsJob } from './jobs/expireRequests.job';
 
 // --- Rotas (Routers) ---
+// Cada um destes arquivos exporta um "Router" do Express contendo sub-rotas
 import authRouter from './routes/auth.routes';
 import usersRouter from './routes/users.routes';
 import productsRouter from './routes/products.routes';
@@ -24,69 +25,90 @@ import remindersRouter from './routes/reminders.routes';
 import officeRouter from './routes/office.routes';
 import permissionsRouter from './routes/permissions.routes';
 import trackingRoutes from './routes/tracking.routes';
-// 👇 NOVA IMPORTAÇÃO DOS CLIENTES
 import clientsRouter from './routes/clients.routes';
 
+// Inicialização do aplicativo Express
 const app = express();
 
-// 1. Proteções e Configurações Globais
-app.set('trust proxy', 1);
-app.use(helmet());
-app.use(express.json());
-app.use(globalLimiter);
+// ==========================================
+// 1. PROTEÇÕES E CONFIGURAÇÕES GLOBAIS
+// ==========================================
 
-// Configuração de CORS para o teu sistema principal
+// Necessário se o servidor estiver atrás de um proxy (ex: Vercel, Heroku, Nginx)
+app.set('trust proxy', 1); 
+
+// Helmet adiciona cabeçalhos HTTP de segurança automaticamente
+app.use(helmet()); 
+
+// Permite que o Express entenda o corpo das requisições no formato JSON
+app.use(express.json()); 
+
+// Aplica limite de requisições globais para evitar sobrecarga ou ataques DDoS
+app.use(globalLimiter); 
+
+// Configuração de CORS: Define quem pode "conversar" com a sua API
 const allowedOrigins = [
   'http://localhost:5173',        
   'http://localhost:3000',        
-  'https://fluxo-royale.vercel.app', // Teu sistema principal
+  'https://fluxo-royale.vercel.app', 
   'https://fluxoroyale21.vercel.app'
 ];
 
 const corsOptions = {
   origin: function (origin: any, callback: any) {
+    // Permite requisições sem origem definida (ex: Postman, Insomnia, scripts do próprio server)
     if (!origin) return callback(null, true);
+    
+    // Verifica se a origem está na lista de permitidas
     if (allowedOrigins.indexOf(origin) !== -1) return callback(null, true);
-    // Permite conexões de desenvolvimento local ou IP da rede interna
+    
+    // Permite qualquer conexão que venha de desenvolvimento local (localhost ou rede interna)
     if (origin.startsWith('http://localhost') || origin.startsWith('http://192.168.')) {
         return callback(null, true);
     }
+    
+    // Se não passar em nenhuma regra, bloqueia a conexão
     return callback(new Error('Bloqueio CORS: Origem não permitida'), false);
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
+  credentials: true // Importante se for usar cookies ou sessões
 };
 app.use(cors(corsOptions));
 
-// 2. Servidor HTTP e Socket.io
+// ==========================================
+// 2. SERVIDOR HTTP E SOCKET.IO (Tempo Real)
+// ==========================================
 const httpServer = createServer(app);
 const io = initSocket(httpServer, corsOptions);
 
-// Middleware para injetar o 'io' no Express (disponível em todas as rotas como req.io)
+// Middleware personalizado para injetar o 'io' no Express.
+// Isso permite que você use `req.io.emit(...)` em qualquer controller.
 app.use((req: any, res, next) => {
   req.io = io;
   next();
 });
 
-// 3. Cron Jobs
-// Tarefa agendada para expirar solicitações antigas
+// ==========================================
+// 3. CRON JOBS (Tarefas em Segundo Plano)
+// ==========================================
+// Tarefa agendada para expirar solicitações antigas automaticamente
 startExpireRequestsJob();
 
 // ==========================================
-// 🚀 REGISTO DE ROTAS (API ENDPOINTS)
+// 4. REGISTRO DE ROTAS (API ENDPOINTS)
 // ==========================================
 
-// Autenticação e Perfis
+// Autenticação e Perfis de Acesso
 app.use('/auth', authRouter);
 app.use('/users', usersRouter);
+// Rota de permissões centralizadas que criamos anteriormente
 app.use('/admin/permissions', permissionsRouter);
 
 // Core do ERP (Produtos, Stock, Pedidos, Clientes)
 app.use('/products', productsRouter);
 app.use('/requests', requestsRouter);
 app.use('/stock', stockRouter);
-// 👇 NOVA ROTA ATIVADA NO SERVIDOR
 app.use('/clients', clientsRouter);
 
 // Movimentações Avançadas
@@ -101,24 +123,31 @@ app.use('/reminders', remindersRouter);
 app.use('/office', officeRouter);
 app.use('/tracking', trackingRoutes);
 
-// Sistema (Relatórios, Logs, Dashboards)
+// Sistema (Relatórios, Logs, Dashboards) - Usa a raiz('/') para capturar endpoints soltos
 app.use('/', systemRouter); 
 
-// Atalhos de retro-compatibilidade
-app.post('/manual-entry', stockRouter);
-app.post('/manual-withdrawal', stockRouter);
+// ==========================================
+// 5. ATALHOS DE RETRO-COMPATIBILIDADE
+// ==========================================
+// Correção: Para apontar uma rota diretamente para um Router inteiro, usamos app.use()
+app.use('/manual-entry', stockRouter);
+app.use('/manual-withdrawal', stockRouter);
 
+// Reescreve a URL internamente para não quebrar aplicativos antigos que chamam '/my-requests'
 app.get('/my-requests', (req, res, next) => { 
     req.url = '/my'; 
     requestsRouter(req, res, next); 
 });
 
+// Reescreve a rota de subscrição de notificações (Push)
 app.post('/notifications/subscribe', (req, res, next) => { 
     req.url = '/subscribe-push'; 
     officeRouter(req, res, next); 
 });
 
-// 4. Ligar o Servidor
+// ==========================================
+// 6. INICIALIZAÇÃO DO SERVIDOR
+// ==========================================
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
     console.log(`🚀 Fluxo Royale 2.1 Enterprise Online na porta ${PORT}`);
