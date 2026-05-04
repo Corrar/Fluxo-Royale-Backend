@@ -39,7 +39,6 @@ export const getDashboardStats = async (req: Request, res: Response) => {
  */
 export const getManagerialReports = async (req: Request, res: Response) => {
   try {
-    // 🟢 CORREÇÃO: Status 'concluida' adicionado
     const topProductsQuery = `
       SELECT p.name, SUM(si.quantity) as total 
       FROM separation_items si 
@@ -48,7 +47,6 @@ export const getManagerialReports = async (req: Request, res: Response) => {
       WHERE s.status IN ('entregue', 'finalizada', 'concluida') 
       GROUP BY p.name ORDER BY total DESC LIMIT 5`;
 
-    // 🟢 CORREÇÃO: Usando sent_at como data base e adicionando 'concluida'
     const historyQuery = `
       WITH months AS (
         SELECT generate_series(date_trunc('month', CURRENT_DATE) - INTERVAL '5 months', date_trunc('month', CURRENT_DATE), '1 month'::interval) as month
@@ -82,7 +80,6 @@ export const getManagerialReports = async (req: Request, res: Response) => {
  */
 export const getRecentTransactions = async (req: Request, res: Response) => {
   try {
-    // 🟢 CORREÇÃO: Substituição de created_at por COALESCE(s.sent_at, s.created_at) e status 'concluida' nas separações
     const query = `
       SELECT xi.id::text as id, 'in' as type, p.name as product_name, p.sku as product_sku, xi.quantity as amount, xi.created_at 
       FROM xml_items xi JOIN products p ON xi.product_id = p.id
@@ -112,7 +109,6 @@ export const getRecentTransactions = async (req: Request, res: Response) => {
  */
 export const getAvailableDates = async (req: Request, res: Response) => {
   try {
-    // 🟢 CORREÇÃO: A considerar sent_at nas datas base das separações
     const result = await pool.query(`
       SELECT MIN(data) as min_date, MAX(data) as max_date 
       FROM (
@@ -132,7 +128,9 @@ export const getAvailableDates = async (req: Request, res: Response) => {
  * Gera relatórios detalhados de Entradas, Saídas e Stock.
  */
 export const getGeneralReports = async (req: Request, res: Response) => {
-  const { startDate, endDate } = req.query;
+  // 🟢 CAPTURA DO NOVO PARÂMETRO
+  const { startDate, endDate, includeAllTimeOps } = req.query;
+  
   if (!startDate || !endDate) return res.status(400).json({ error: 'Datas obrigatórias' });
   
   const start = `${startDate} 00:00:00`; 
@@ -147,7 +145,6 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       WHERE xi.created_at >= $1 AND xi.created_at <= $2 
       ORDER BY xi.created_at DESC`, [start, end]);
     
-    // 🟢 CORREÇÃO: Data de saída (sent_at), Status (concluida) e campos para Frontend (solicitante, status)
     const separacoesRes = await pool.query(`
       SELECT COALESCE(s.sent_at, s.created_at) as data, 
              CASE WHEN s.type='manual' THEN 'Saída - Manual' ELSE 'Saída - Separação' END as tipo, 
@@ -201,13 +198,57 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       FROM stock s 
       JOIN products p ON s.product_id = p.id WHERE p.active = true`);
     
-    // 🟢 CORREÇÃO: Utilizando COALESCE na verificação de datas para comparativo do mês anterior e incluindo 'concluida'
     const comparativoRes = await pool.query(`
       SELECT 
         (SELECT COUNT(*) FROM xml_items xi WHERE xi.created_at >= $1::timestamp - INTERVAL '1 month' AND xi.created_at <= $2::timestamp - INTERVAL '1 month') as entradas_ant, 
         ((SELECT COUNT(*) FROM separation_items si JOIN separations sep ON si.separation_id = sep.id WHERE COALESCE(sep.sent_at, sep.created_at) >= $1::timestamp - INTERVAL '1 month' AND COALESCE(sep.sent_at, sep.created_at) <= $2::timestamp - INTERVAL '1 month' AND sep.status IN ('entregue', 'finalizada', 'concluida')) + 
          (SELECT COUNT(*) FROM request_items ri JOIN requests req ON ri.request_id = req.id WHERE req.created_at >= $1::timestamp - INTERVAL '1 month' AND req.created_at <= $2::timestamp - INTERVAL '1 month' AND req.status IN ('aprovado', 'entregue'))) as saidas_ant`, 
       [start, end]);
+
+    // =========================================================================
+    // 🟢 NOVO: BUSCA ATEMPORAL DE OPs PARA O RELATÓRIO (IGNORA MÊS)
+    // =========================================================================
+    let saidas_ops_all_time: any[] | null = null;
+    
+    if (includeAllTimeOps === 'true') {
+      const opsQuery = `
+        SELECT 
+          si.id, 
+          si.quantity as quantidade, 
+          p.name as produto, 
+          COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario, 
+          cs.op_code, 
+          cs.status as op_status, 
+          s.destination as destino_setor, 
+          COALESCE(s.sent_at, s.created_at) as data
+        FROM separation_items si
+        JOIN separations s ON si.separation_id = s.id
+        JOIN client_services cs ON s.client_service_id = cs.id
+        JOIN products p ON si.product_id = p.id
+        WHERE s.status IN ('entregue', 'finalizada', 'concluida')
+
+        UNION ALL
+
+        SELECT 
+          ri.id, 
+          COALESCE(ri.quantity_delivered, ri.quantity_requested) as quantidade, 
+          COALESCE(p.name, ri.custom_product_name) as produto, 
+          COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario, 
+          cs.op_code, 
+          cs.status as op_status, 
+          COALESCE(pf.sector, r.sector) as destino_setor, 
+          r.created_at as data
+        FROM request_items ri
+        JOIN requests r ON ri.request_id = r.id
+        JOIN client_services cs ON r.client_service_id = cs.id
+        LEFT JOIN products p ON ri.product_id = p.id
+        LEFT JOIN profiles pf ON r.requester_id = pf.id
+        WHERE r.status IN ('aprovado', 'entregue')
+      `;
+      const resultOps = await pool.query(opsQuery);
+      saidas_ops_all_time = resultOps.rows;
+    }
+    // =========================================================================
     
     res.json({ 
       entradas: entradasRes.rows, 
@@ -217,7 +258,8 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       comparativo_mes_anterior: { 
         entradas: parseInt(comparativoRes.rows[0].entradas_ant || '0'), 
         saidas: parseInt(comparativoRes.rows[0].saidas_ant || '0') 
-      } 
+      },
+      saidas_ops_all_time // 🟢 RETORNO ADICIONADO PARA O FRONTEND
     });
   } catch (error: any) { 
     res.status(500).json({ error: 'Erro ao gerar relatórios: ' + error.message }); 
