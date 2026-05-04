@@ -96,9 +96,23 @@ export const manualEntry = async (req: Request, res: Response) => {
 };
 
 export const manualWithdrawal = async (req: Request, res: Response) => {
-  // 🟢 Adicionado 'op_code' extraído do frontend
   const { sector, items, op_code } = req.body;
   const userId = (req as any).user.id;
+
+  // =========================================================================
+  // 🛡️ 0. VALIDAÇÃO DE SEGURANÇA DO SETOR (NOVO)
+  // =========================================================================
+  // Definimos os setores válidos exatamente como estão no Frontend
+  const VALID_SECTORS = [
+    "Elétrica", "Flow", "Esteira", "Lavadora", "Usinagem", 
+    "Desenvolvimento", "Protótipo", "Engenharia", "Outros"
+  ];
+
+  // Se o setor enviado não existir na lista acima, barramos a requisição imediatamente.
+  if (!VALID_SECTORS.includes(sector)) {
+    return res.status(400).json({ error: "Setor de destino inválido ou não autorizado." });
+  }
+
   const client = await pool.connect();
   
   try {
@@ -154,7 +168,6 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
     // =========================================================================
     // 🟢 INSERÇÃO DA SAÍDA MANUAL COM A OP
     // =========================================================================
-    // Note que adicionamos o 'client_service_id' no final do INSERT
     const sepRes = await client.query(
       'INSERT INTO separations (destination, status, type, client_service_id) VALUES ($1, $2, $3, $4) RETURNING id', 
       [sector, 'concluida', 'manual', client_service_id]
@@ -183,7 +196,7 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
     // 🟢 Tratamento de erros amigáveis para exibir no Frontend
     if (error.message === "OP_OBRIGATORIA_TAGS") return res.status(400).json({ error: "É obrigatório informar o número da OP para estes tipos de produtos." });
     if (error.message === "OP_NAO_ENCONTRADA") return res.status(404).json({ error: "OP não encontrada no sistema. Verifique o número digitado." });
-    if (error.message === "OP_FINALIZADA") return res.status(400).json({ error: "Essa OP ja foi finalizada, verifique a OP correta" });
+    if (error.message === "OP_FINALIZADA") return res.status(400).json({ error: "Essa OP já foi finalizada, verifique a OP correta" });
 
     res.status(500).json({ error: error.message });
   } finally { 
