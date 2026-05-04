@@ -9,16 +9,20 @@ import { validatePositiveItems } from '../middlewares/validators';
 
 export const getRequests = async (req: Request, res: Response) => {
   try {
+    // CORREÇÃO: Adicionado o LEFT JOIN com client_services e a seleção do cs.op_code
     const query = `
       WITH FilteredRequests AS (
           SELECT * FROM requests 
           WHERE status IN ('aberto', 'aprovado') OR created_at >= NOW() - INTERVAL '30 days'
           ORDER BY created_at DESC LIMIT 200
       )
-      SELECT r.*, json_build_object('name', p.name, 'sector', p.sector) as requester,
+      SELECT r.*, 
+          cs.op_code, /* <-- AQUI: Puxando o número da OP para o frontend */
+          json_build_object('name', p.name, 'sector', p.sector) as requester,
           COALESCE(ri_agg.items, '[]'::json) as request_items
       FROM FilteredRequests r
       LEFT JOIN profiles p ON r.requester_id = p.id
+      LEFT JOIN client_services cs ON r.client_service_id = cs.id /* <-- AQUI: Ligando a OP ao Pedido */
       LEFT JOIN (
           SELECT ri.request_id, json_agg(
               json_build_object(
@@ -43,14 +47,18 @@ export const getRequests = async (req: Request, res: Response) => {
 export const getMyRequests = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   try {
+    // CORREÇÃO: Adicionado cs.op_code e o JOIN com client_services
     const query = `
       WITH FilteredRequests AS (
           SELECT * FROM requests 
           WHERE requester_id = $1 AND (status IN ('aberto', 'aprovado') OR created_at >= NOW() - INTERVAL '30 days')
           ORDER BY created_at DESC LIMIT 200
       )
-      SELECT r.*, COALESCE(ri_agg.items, '[]'::json) as request_items
+      SELECT r.*, 
+          cs.op_code, /* <-- AQUI: Puxando o número da OP */
+          COALESCE(ri_agg.items, '[]'::json) as request_items
       FROM FilteredRequests r
+      LEFT JOIN client_services cs ON r.client_service_id = cs.id /* <-- AQUI: Ligando a OP ao Pedido */
       LEFT JOIN (
           SELECT ri.request_id, json_agg(
               json_build_object(
@@ -94,7 +102,6 @@ export const createRequest = async (req: Request, res: Response) => {
     if (items.length > productIds.length) {
         requiresOp = true;
     } else if (productIds.length > 0) {
-        // CORREÇÃO AQUI: Removemos "category" e "grupo" do SELECT porque não existem na tabela
         const productsQuery = await client.query(
             'SELECT id, tags FROM products WHERE id = ANY($1::uuid[])', 
             [productIds]
@@ -175,7 +182,16 @@ export const createRequest = async (req: Request, res: Response) => {
     await createLog(userId, 'CRIAR_SOLICITACAO', { id_solicitacao: requestId, setor: sector, total_itens: items.length }, getClientIp(req), client);
     await client.query('COMMIT');
 
-    const fullReqQuery = `SELECT r.*, json_build_object('name', p.name, 'sector', p.sector) as requester, (SELECT COALESCE(json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'quantity_delivered', ri.quantity_delivered, 'custom_product_name', ri.custom_product_name, 'observation', ri.observation, 'client_service', ri.client_service, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit, 'tags', pr.tags) ELSE NULL END)), '[]'::json) FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items FROM requests r LEFT JOIN profiles p ON r.requester_id = p.id WHERE r.id = $1`;
+    // CORREÇÃO: Adicionado cs.op_code e o JOIN na query de resposta do WebSocket para o tempo real funcionar
+    const fullReqQuery = `
+      SELECT r.*, 
+             cs.op_code, /* <-- AQUI: OP no retorno em tempo real */
+             json_build_object('name', p.name, 'sector', p.sector) as requester, 
+             (SELECT COALESCE(json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'quantity_delivered', ri.quantity_delivered, 'custom_product_name', ri.custom_product_name, 'observation', ri.observation, 'client_service', ri.client_service, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit, 'tags', pr.tags) ELSE NULL END)), '[]'::json) FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items 
+      FROM requests r 
+      LEFT JOIN profiles p ON r.requester_id = p.id 
+      LEFT JOIN client_services cs ON r.client_service_id = cs.id /* <-- AQUI */
+      WHERE r.id = $1`;
     const { rows: fullReqRows } = await client.query(fullReqQuery, [requestId]);
     
     if ((req as any).io) {
