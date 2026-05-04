@@ -197,28 +197,65 @@ export const deleteTravelOrder = async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = (req as any).user.id;
   const client = await pool.connect();
+  
   try {
     await client.query('BEGIN');
+    
+    // Fazemos o bloqueio da linha (FOR UPDATE) para evitar conflitos de concorrência
     const orderRes = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
+    
     if (orderRes.rows.length === 0) throw new Error('Viagem não encontrada.');
     const status = orderRes.rows[0].status;
 
-    if(status === 'reconciled' || status === 'cancelled') throw new Error("Apenas viagens abertas podem ser canceladas.");
+    // Buscamos todos os itens atrelados a esta viagem
+    const itemsRes = await client.query('SELECT product_id, quantity_out, quantity_returned FROM travel_order_items WHERE travel_order_id = $1', [id]);
 
-    const itemsRes = await client.query('SELECT product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
-    for (const item of itemsRes.rows) {
-      await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [item.quantity_out, item.product_id]);
+    if (status === 'pending') {
+      // 1. Viagem estava aberta. Apenas limpamos o que estava reservado para ela.
+      for (const item of itemsRes.rows) {
+        await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [item.quantity_out, item.product_id]);
+      }
+    } else if (status === 'reconciled') {
+      // 2. Viagem estava concluída. Precisamos desfazer a matemática exata do confronto físico!
+      for (const item of itemsRes.rows) {
+        const qtyOut = Number(item.quantity_out);
+        const qtyRet = Number(item.quantity_returned) || 0;
+        
+        const consumed = Math.max(0, qtyOut - qtyRet);
+        const extra = Math.max(0, qtyRet - qtyOut);
+
+        // O material que o sistema achou que foi "consumido" volta a ficar disponível fisicamente
+        if (consumed > 0) {
+          await client.query(`UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`, [consumed, item.product_id]);
+        }
+        
+        // O material que veio "extra" é retirado do físico, pois ele vai sumir do sistema
+        if (extra > 0) {
+          await client.query(`UPDATE stock SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1) WHERE product_id = $2`, [extra, item.product_id]);
+        }
+      }
     }
 
-    await client.query("UPDATE travel_orders SET status = 'cancelled' WHERE id = $1", [id]);
+    // 3. Independentemente do status, nós apagamos os itens e a viagem (Hard Delete)
+    await client.query('DELETE FROM travel_order_items WHERE travel_order_id = $1', [id]);
+    await client.query('DELETE FROM travel_orders WHERE id = $1', [id]);
     
-    // 📝 LOG TRADUZIDO
-    await createLog(userId, 'CANCELAR_VIAGEM', { id_viagem: id }, getClientIp(req), client);
+    // 📝 LOG DA EXCLUSÃO
+    await createLog(userId, 'APAGAR_VIAGEM', { id_viagem: id, status_anterior: status }, getClientIp(req), client);
+    
     await client.query('COMMIT');
-    if ((req as any).io) { (req as any).io.emit('travel_orders_update'); (req as any).io.emit('stock_updated'); }
-    res.json({ success: true });
+    
+    // Atualiza o painel do frontend em tempo real
+    if ((req as any).io) { 
+        (req as any).io.emit('travel_orders_update'); 
+        (req as any).io.emit('stock_updated'); 
+    }
+    
+    res.json({ success: true, message: "Confronto apagado e estoque restaurado com sucesso." });
   } catch (err: any) {
     try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: err.message });
-  } finally { client.release(); }
+  } finally { 
+    client.release(); 
+  }
 };
