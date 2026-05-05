@@ -187,14 +187,22 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
 
   // =========================================================================
-  // 🛡️ 0. VALIDAÇÃO DE SEGURANÇA DO SETOR
+  // 🛡️ 0. VALIDAÇÃO DE SEGURANÇA DO SETOR (À PROVA DE BALAS)
   // =========================================================================
+  
+  // Incluímos absolutamente todos os setores usados no sistema
   const VALID_SECTORS = [
     "Elétrica", "Flow", "Esteira", "Lavadora", "Usinagem", 
-    "Desenvolvimento", "Protótipo", "Engenharia", "Outros"
+    "Desenvolvimento", "Protótipo", "Engenharia", "Outros",
+    "Viagem", "Terceiros", "Acumulador", "Reposição"
   ];
 
-  if (!VALID_SECTORS.includes(sector)) {
+  // Transforma o setor recebido e a lista para letras maiúsculas.
+  // Isso garante que "PROTÓTIPO" seja lido como igual a "Protótipo".
+  const normalizedSector = sector ? sector.toUpperCase() : "";
+  const isValidSector = VALID_SECTORS.some(s => s.toUpperCase() === normalizedSector);
+
+  if (!isValidSector) {
     return res.status(400).json({ error: "Setor de destino inválido ou não autorizado." });
   }
 
