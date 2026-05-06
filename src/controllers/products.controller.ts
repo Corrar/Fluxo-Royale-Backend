@@ -5,8 +5,10 @@ import { createLog } from '../utils/logger';
 
 export const getProducts = async (req: Request, res: Response) => {
   try {
+    // 💡 AQUI: Adicionados os campos exclusivos do 3D no SELECT
     const { rows } = await pool.query(`
       SELECT p.id, p.sku, p.name, p.description, p.unit, p.tags, p.unit_price, p.sales_price, p.min_stock, p.active,
+        p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
         json_build_object('quantity_on_hand', COALESCE(s.quantity_on_hand, 0), 'quantity_reserved', COALESCE(s.quantity_reserved, 0)) as stock
       FROM products p LEFT JOIN stock s ON p.id = s.product_id WHERE p.active = true ORDER BY p.name ASC
     `);
@@ -28,14 +30,14 @@ export const getLowStockProducts = async (req: Request, res: Response) => {
 
 export const createProduct = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
-  const { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags } = req.body;
+  // 💡 AQUI: Recebemos as propriedades do 3D do frontend
+  const { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
   const client = await pool.connect();
   
   try {
     await client.query('BEGIN');
     
-    // 🛡️ Validação de Unicidade Ajustada
-    // Procura o SKU na base de dados, independentemente de estar ativo ou não
+    // 🛡️ Validação de Unicidade
     const skuCheck = await client.query('SELECT id, active FROM products WHERE sku = $1', [sku]);
     
     if (skuCheck.rows.length > 0) {
@@ -47,10 +49,14 @@ export const createProduct = async (req: Request, res: Response) => {
       }
     }
 
-    // Criação do produto caso o SKU não exista
+    // 💡 AQUI: Criação do produto guardando os campos 3D
     const productRes = await client.query(
-      'INSERT INTO products (sku, name, description, unit, min_stock, unit_price, sales_price, tags) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [sku, name, description, unit, min_stock, unit_price || 0, sales_price || 0, JSON.stringify(tags || [])]
+      `INSERT INTO products (sku, name, description, unit, min_stock, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+      [
+        sku, name, description, unit, min_stock, unit_price || 0, sales_price || 0, JSON.stringify(tags || []), 
+        is_3d || false, production_minutes || 0, filament_grams || 0, image_url || null
+      ]
     );
     const newProduct = productRes.rows[0];
 
@@ -64,7 +70,6 @@ export const createProduct = async (req: Request, res: Response) => {
       await client.query("INSERT INTO xml_items (xml_log_id, product_id, quantity) VALUES ($1, $2, $3)", [logRes.rows[0].id, newProduct.id, initialQty]);
     }
     
-    // 📝 LOG TRADUZIDO E MELHORADO
     await createLog(userId, 'CRIAR_PRODUTO', { sku, name, quantidade_inicial: initialQty }, getClientIp(req), client);
     await client.query('COMMIT');
     res.status(201).json(newProduct);
@@ -80,19 +85,32 @@ export const createProduct = async (req: Request, res: Response) => {
 export const updateProduct = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { id } = req.params;
-  const { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags } = req.body;
+  // 💡 AQUI: Atualização suporta campos 3D
+  const { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
   const client = await pool.connect();
   
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `UPDATE products SET sku = COALESCE($1, sku), name = COALESCE($2, name), description = COALESCE($3, description), unit = COALESCE($4, unit), min_stock = COALESCE($5, min_stock), unit_price = COALESCE($6, unit_price), sales_price = COALESCE($7, sales_price), tags = COALESCE($8, tags) WHERE id = $9 RETURNING *`,
-      [sku || null, name || null, description || null, unit || null, min_stock || null, unit_price || null, sales_price || null, tags ? JSON.stringify(tags) : null, id]
+      `UPDATE products 
+       SET sku = COALESCE($1, sku), name = COALESCE($2, name), description = COALESCE($3, description), 
+           unit = COALESCE($4, unit), min_stock = COALESCE($5, min_stock), unit_price = COALESCE($6, unit_price), 
+           sales_price = COALESCE($7, sales_price), tags = COALESCE($8, tags),
+           is_3d = COALESCE($9, is_3d), production_minutes = COALESCE($10, production_minutes), 
+           filament_grams = COALESCE($11, filament_grams), image_url = COALESCE($12, image_url)
+       WHERE id = $13 RETURNING *`,
+      [
+        sku || null, name || null, description || null, unit || null, min_stock || null, unit_price || null, sales_price || null, tags ? JSON.stringify(tags) : null,
+        is_3d !== undefined ? is_3d : null, 
+        production_minutes !== undefined ? production_minutes : null, 
+        filament_grams !== undefined ? filament_grams : null, 
+        image_url || null, 
+        id
+      ]
     );
     if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Produto não encontrado' }); }
     if (quantity !== undefined && quantity !== "") { await client.query('UPDATE stock SET quantity_on_hand = $1 WHERE product_id = $2', [parseFloat(quantity), id]); }
     
-    // 📝 LOG TRADUZIDO E MELHORADO
     await createLog(userId, 'EDITAR_PRODUTO', { id_produto: id, nome: name, alteracoes: req.body }, getClientIp(req), client);
     await client.query('COMMIT');
     res.json(rows[0]);
@@ -107,8 +125,6 @@ export const deleteProduct = async (req: Request, res: Response) => {
   const { id } = req.params;
   try {
     await pool.query('UPDATE products SET active = false WHERE id = $1', [id]);
-    
-    // 📝 LOG TRADUZIDO E MELHORADO
     await createLog(userId, 'ARQUIVAR_PRODUTO', { id_produto: id, mensagem: 'Produto movido para a lista de inativos' }, getClientIp(req));
     res.json({ message: 'Produto arquivado com sucesso' });
   } catch (error: any) { res.status(500).json({ error: error.message }); }
@@ -119,11 +135,8 @@ export const updatePurchaseInfo = async (req: Request, res: Response) => {
   const { purchase_status, purchase_note, delivery_forecast } = req.body;
   try {
     await pool.query('UPDATE products SET purchase_status = $1, purchase_note = $2, delivery_forecast = $3 WHERE id = $4', [purchase_status, purchase_note, delivery_forecast || null, id]);
-    
-    // 📝 NOVO LOG DE AUDITORIA ADICIONADO
     const userId = (req as any).user?.id || null;
     await createLog(userId, 'ATUALIZAR_INFO_COMPRA', { id_produto: id, status: purchase_status, previsao: delivery_forecast }, getClientIp(req));
-    
     res.json({ success: true });
   } catch (error: any) { res.status(500).json({ error: 'Erro ao atualizar info de compra' }); }
 };
@@ -143,7 +156,6 @@ export const reactivateProduct = async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Nenhum produto encontrado com este SKU para reativar.' });
     }
 
-    // 📝 LOG TRADUZIDO E MELHORADO
     await createLog(userId, 'REATIVAR_PRODUTO', { sku, mensagem: 'Produto retirado da lista de inativos' }, getClientIp(req));
     res.json({ message: 'Produto reativado com sucesso!', product: rows[0] });
     
@@ -155,8 +167,10 @@ export const reactivateProduct = async (req: Request, res: Response) => {
 // 🗑️ Nova função para listar produtos arquivados (inativos)
 export const getInactiveProducts = async (req: Request, res: Response) => {
   try {
+    // 💡 AQUI: Incluímos também as info 3D para manter integridade
     const { rows } = await pool.query(`
       SELECT p.id, p.sku, p.name, p.description, p.unit, p.unit_price, p.active,
+        p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
         json_build_object('quantity_on_hand', COALESCE(s.quantity_on_hand, 0)) as stock
       FROM products p LEFT JOIN stock s ON p.id = s.product_id 
       WHERE p.active = false 
@@ -172,16 +186,11 @@ export const getInactiveProducts = async (req: Request, res: Response) => {
 export const updateProductPrices = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { id } = req.params;
-  
-  // Extraímos apenas os preços do corpo do pedido. Ignoramos tudo o resto.
   const { unit_price, sales_price } = req.body;
-  
   const client = await pool.connect();
   
   try {
     await client.query('BEGIN');
-    
-    // Atualiza apenas os preços. O COALESCE mantém o valor antigo se não for enviado nenhum novo.
     const { rows } = await client.query(
       `UPDATE products 
        SET unit_price = COALESCE($1, unit_price), 
@@ -195,15 +204,7 @@ export const updateProductPrices = async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Produto não encontrado' }); 
     }
     
-    // 📝 LOG DE AUDITORIA
-    await createLog(
-      userId, 
-      'ATUALIZAR_PRECOS', 
-      { id_produto: id, novos_precos: { unit_price, sales_price } }, 
-      getClientIp(req), 
-      client
-    );
-    
+    await createLog(userId, 'ATUALIZAR_PRECOS', { id_produto: id, novos_precos: { unit_price, sales_price } }, getClientIp(req), client);
     await client.query('COMMIT');
     res.json(rows[0]);
     
