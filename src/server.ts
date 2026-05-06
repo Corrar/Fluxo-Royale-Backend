@@ -26,6 +26,9 @@ import permissionsRouter from './routes/permissions.routes';
 import trackingRoutes from './routes/tracking.routes';
 import clientsRouter from './routes/clients.routes';
 
+// NOVA ROTA: Módulo de Produção 3D
+import producao3dRouter from './routes/producao3d.routes';
+
 // ==========================================
 // 0. EXTENSÃO DE TIPOS GLOBAIS (TYPESCRIPT)
 // ==========================================
@@ -58,18 +61,16 @@ app.use(express.json());
 app.use(globalLimiter); 
 
 // Configuração de CORS: Define quem pode "conversar" com a sua API
-// AQUI ESTÁ A CORREÇÃO: Adicionamos seus domínios oficiais na lista de origens permitidas
 const allowedOrigins = [
   'http://localhost:5173',        
   'http://localhost:3000',        
   'https://fluxo-royale.vercel.app', 
   'https://fluxoroyale21.vercel.app',
-  'https://fluxo-royale.com.br',       // Novo domínio adicionado
-  'https://www.fluxo-royale.com.br'    // Novo subdomínio www adicionado
+  'https://fluxo-royale.com.br',       // Domínio oficial
+  'https://www.fluxo-royale.com.br'    // Subdomínio oficial
 ];
 
 const corsOptions = {
-  // Substituímos o "any" por tipos reais para maior segurança
   origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
     // Permite requisições sem origem definida (ex: Postman, Insomnia, scripts do próprio server)
     if (!origin) return callback(null, true);
@@ -87,7 +88,7 @@ const corsOptions = {
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true // Importante se for usar cookies ou sessões
+  credentials: true // Importante para cookies ou tokens de sessão
 };
 app.use(cors(corsOptions));
 
@@ -98,7 +99,7 @@ const httpServer = createServer(app);
 const io = initSocket(httpServer, corsOptions);
 
 // Middleware personalizado para injetar o 'io' no Express.
-// Isso permite que use `req.io.emit(...)` em qualquer controller.
+// Isso permite usar `req.io.emit(...)` em qualquer controller.
 app.use((req: Request, res: Response, next: NextFunction) => {
   req.io = io;
   next();
@@ -117,7 +118,6 @@ startExpireRequestsJob();
 // Autenticação e Perfis de Acesso
 app.use('/auth', authRouter);
 app.use('/users', usersRouter);
-// Rota de permissões centralizadas que criamos anteriormente
 app.use('/admin/permissions', permissionsRouter);
 
 // Core do ERP (Produtos, Estoque, Pedidos, Clientes)
@@ -126,7 +126,10 @@ app.use('/requests', requestsRouter);
 app.use('/stock', stockRouter);
 app.use('/clients', clientsRouter);
 
-// Movimentações Avançadas
+// Módulo de Produção 3D (Fábrica)
+app.use('/producao-3d', producao3dRouter);
+
+// Movimentações Avançadas e Operacional
 app.use('/separations', separationsRouter);
 app.use('/travel-orders', travelsRouter);
 app.use('/replenishments', replenishmentsRouter);
@@ -138,7 +141,7 @@ app.use('/reminders', remindersRouter);
 app.use('/office', officeRouter);
 app.use('/tracking', trackingRoutes);
 
-// Sistema (Relatórios, Logs, Dashboards) - Usa a raiz('/') para capturar endpoints soltos
+// Sistema (Relatórios, Logs, Dashboards)
 app.use('/', systemRouter); 
 
 // ==========================================
@@ -149,13 +152,12 @@ app.use('/', systemRouter);
 app.use('/manual-entry', stockRouter);
 app.use('/manual-withdrawal', stockRouter);
 
-// Reescreve a URL internamente para não quebrar aplicativos antigos que chamam '/my-requests'
+// Redirecionamentos internos para manter compatibilidade
 app.get('/my-requests', (req: Request, res: Response, next: NextFunction) => { 
     req.url = '/my'; 
     requestsRouter(req, res, next); 
 });
 
-// Reescreve a rota de subscrição de notificações (Push)
 app.post('/notifications/subscribe', (req: Request, res: Response, next: NextFunction) => { 
     req.url = '/subscribe-push'; 
     officeRouter(req, res, next); 
