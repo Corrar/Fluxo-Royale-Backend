@@ -1,40 +1,103 @@
+import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { pool } from '../db'; // Necessário para a consulta de permissões
 
 const JWT_SECRET = process.env.JWT_SECRET || 'sua-chave-secreta';
 
-export const authenticate = (req: any, res: any, next: any) => {
+// 1. CRIAMOS UMA INTERFACE PARA O REQUEST
+// Isto ensina ao TypeScript que o nosso 'req' pode conter um 'user' decodificado
+export interface AuthRequest extends Request {
+  user?: any; 
+}
+
+/**
+ * Middleware 1: Verifica se o utilizador está logado (Valida o Token JWT)
+ * Deve ser o primeiro a ser chamado em qualquer rota protegida.
+ */
+export const authenticate = (req: AuthRequest, res: Response, next: NextFunction): void | Response => {
   const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Token necessário' });
+  
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Token de autenticação não fornecido.' });
+  }
 
   const token = authHeader.split(' ')[1];
+  
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    // Agora o req.user conterá o ID, Email e a ROLE (cargo) vinda do token
+    // Injeta os dados do token (id, email, role) no Request para as próximas funções
     req.user = decoded; 
     next();
   } catch (err) {
-    res.status(401).json({ error: 'Token inválido' });
+    return res.status(401).json({ error: 'Token inválido ou expirado. Faça login novamente.' });
   }
 };
 
 /**
- * Middleware para verificar se o utilizador tem uma das roles (cargos) permitidas.
- * Exemplo de uso: authorizeRole(['financeiro', 'admin'])
+ * Middleware 2: Verifica se o utilizador tem um dos cargos (roles) permitidos.
+ * Útil para rotas exclusivas de um setor (ex: authorizeRole(['financeiro', 'admin']))
  */
 export const authorizeRole = (allowedRoles: string[]) => {
-  return (req: any, res: any, next: any) => {
-    // 🛡️ .toLowerCase() ignora maiúsculas e .trim() remove espaços extras (ex: "Financeiro " -> "financeiro")
+  return (req: AuthRequest, res: Response, next: NextFunction): void | Response => {
+    // 🛡️ Ignora maiúsculas e remove espaços extras
     const userRole = req.user?.role?.toLowerCase().trim(); 
     const safeAllowedRoles = allowedRoles.map(role => role.toLowerCase().trim());
 
-    // Se o utilizador não tiver cargo no token, ou se o seu cargo não estiver na lista permitida
+    // Bloqueia se o cargo não estiver na lista permitida
     if (!userRole || !safeAllowedRoles.includes(userRole)) {
       return res.status(403).json({ 
         error: `Acesso negado. O seu cargo atual (${req.user?.role || 'Nenhum'}) não tem permissão para esta ação.` 
       });
     }
     
-    // Se estiver tudo correto, permite a execução da função seguinte (ex: updateProductPrices)
+    // Se estiver tudo correto, permite a execução
     next();
+  };
+};
+
+/**
+ * Middleware 3: O GUARDIÃO GRANULAR
+ * Verifica se o utilizador possui a ação exata na Matriz de Permissões.
+ * Exemplo de uso: requirePermission('produtos:delete')
+ */
+export const requirePermission = (requiredAction: string) => {
+  return async (req: AuthRequest, res: Response, next: NextFunction): Promise<void | Response> => {
+    try {
+      const userId = req.user?.id;
+      const userRole = req.user?.role;
+
+      if (!userId || !userRole) {
+        return res.status(401).json({ error: 'Utilizador não identificado na requisição.' });
+      }
+
+      // 1. A Regra de Ouro: Administradores têm acesso total ao sistema
+      if (userRole === 'admin') {
+        return next();
+      }
+
+      // 2. Consulta ao banco de dados em tempo real (Garante que permissões revogadas tenham efeito imediato na API)
+      const permRes = await pool.query(`
+        SELECT page_key FROM role_permissions WHERE role = $1
+        UNION
+        SELECT page_key FROM user_permissions WHERE user_id = $2
+      `, [userRole, userId]);
+
+      // Transforma o resultado num array simples: ['produtos:view', 'produtos:edit', ...]
+      const userPermissions = permRes.rows.map(r => r.page_key);
+
+      // 3. Verificação de Segurança
+      if (userPermissions.includes(requiredAction)) {
+        return next(); // Tem permissão! Continua para o Controller.
+      }
+
+      // 4. Bloqueio Sumário se tentar forçar a ação
+      return res.status(403).json({ 
+        error: `Acesso bloqueado. Não possui o nível de permissão necessário (${requiredAction}) para executar esta operação.` 
+      });
+
+    } catch (error) {
+      console.error("Erro no middleware requirePermission:", error);
+      return res.status(500).json({ error: 'Erro interno ao validar autorizações de segurança.' });
+    }
   };
 };
