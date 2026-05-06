@@ -58,11 +58,14 @@ app.use(express.json());
 app.use(globalLimiter); 
 
 // Configuração de CORS: Define quem pode "conversar" com a sua API
+// AQUI ESTÁ A CORREÇÃO: Adicionamos seus domínios oficiais na lista de origens permitidas
 const allowedOrigins = [
   'http://localhost:5173',        
   'http://localhost:3000',        
   'https://fluxo-royale.vercel.app', 
-  'https://fluxoroyale21.vercel.app'
+  'https://fluxoroyale21.vercel.app',
+  'https://fluxo-royale.com.br',       // Novo domínio adicionado
+  'https://www.fluxo-royale.com.br'    // Novo subdomínio www adicionado
 ];
 
 const corsOptions = {
@@ -117,7 +120,7 @@ app.use('/users', usersRouter);
 // Rota de permissões centralizadas que criamos anteriormente
 app.use('/admin/permissions', permissionsRouter);
 
-// Core do ERP (Produtos, Stock, Pedidos, Clientes)
+// Core do ERP (Produtos, Estoque, Pedidos, Clientes)
 app.use('/products', productsRouter);
 app.use('/requests', requestsRouter);
 app.use('/stock', stockRouter);
