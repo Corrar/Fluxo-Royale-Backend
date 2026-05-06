@@ -1,6 +1,6 @@
 import { Router } from 'express';
-// 1. Importámos também o 'authorizeRole' para proteger a rota de preços
-import { authenticate, authorizeRole } from '../middlewares/auth'; 
+// 1. Atualizámos as importações para trazer o nosso novo 'Cão de Guarda' (requirePermission)
+import { authenticate, authorizeRole, requirePermission } from '../middlewares/auth'; 
 import { 
     getProducts, 
     getLowStockProducts, 
@@ -10,37 +10,67 @@ import {
     updatePurchaseInfo,
     reactivateProduct,
     getInactiveProducts,
-    updateProductPrices // 2. Importámos a nova função do financeiro
+    updateProductPrices 
 } from '../controllers/products.controller';
 
 const router = Router();
 
-// Todas estas rotas já terão o prefixo '/products' no server.ts
-router.get('/', authenticate, getProducts);
-router.get('/low-stock', authenticate, getLowStockProducts);
+// ============================================================================
+// 🛡️ ROTAS DE LEITURA (Requerem a permissão de visualização básica)
+// ============================================================================
 
-// 🗑️ Nova rota para buscar produtos inativos (fantasmas)
-// É crucial que esta rota venha ANTES das rotas com /:id
-router.get('/inactive', authenticate, getInactiveProducts); 
+// Listar produtos ativos no catálogo
+router.get('/', authenticate, requirePermission('produtos:view'), getProducts);
 
-router.post('/', authenticate, createProduct);
+// Listar produtos com stock baixo (Alinhado com a permissão de relatórios/críticos)
+router.get('/low-stock', authenticate, requirePermission('estoque_critico:view'), getLowStockProducts);
+
+// 🗑️ Rota para procurar produtos inativos (fantasmas) - DEVE vir antes das rotas com /:id
+router.get('/inactive', authenticate, requirePermission('produtos:view'), getInactiveProducts);
+
+// ============================================================================
+// 🛡️ ROTAS DE CRIAÇÃO (Requerem permissão de adição)
+// ============================================================================
+
+// Criar um novo produto no sistema
+router.post('/', authenticate, requirePermission('produtos:add'), createProduct);
+
+// ============================================================================
+// 🛡️ ROTAS DE EDIÇÃO (Requerem permissão de edição)
+// ============================================================================
 
 // ♻️ Rota para reativar produtos inativos (fantasmas)
-router.put('/reactivate/:sku', authenticate, reactivateProduct);
+router.put('/reactivate/:sku', authenticate, requirePermission('produtos:edit'), reactivateProduct);
 
-// 💰 NOVA ROTA: Exclusiva para atualizar preços.
-// Usamos o 'authenticate' para verificar quem é, e o 'authorizeRole' para garantir que é do setor correto.
+// Atualizar dados gerais de um produto específico
+router.put('/:id', authenticate, requirePermission('produtos:edit'), updateProduct);
+
+// ============================================================================
+// 🛡️ ROTAS FINANCEIRAS E DE COMPRAS (Permissões específicas)
+// ============================================================================
+
+// 💰 Rota exclusiva para atualizar preços (Requer a ação granular 'valores:edit')
 router.patch(
     '/:id/prices', 
     authenticate, 
-    // 🔥 Adicionado 'almoxarife' e 'compras' para combinar perfeitamente com o Frontend
-    authorizeRole(['financeiro', 'admin', 'almoxarife', 'compras']), 
+    requirePermission('valores:edit'), 
     updateProductPrices
 );
 
-// Rotas com parâmetros gerais (devem ficar sempre no final)
-router.put('/:id', authenticate, updateProduct);
-router.put('/:id/purchase-info', authenticate, updatePurchaseInfo);
-router.delete('/:id', authenticate, deleteProduct);
+// Rota para atualizar informações de compra (Carrinho de compras)
+// Como o modo de compra no Frontend ainda usa a regra global de cargo (role), mantemos o authorizeRole aqui para não quebrar o fluxo.
+router.put(
+    '/:id/purchase-info', 
+    authenticate, 
+    authorizeRole(['admin', 'compras']), 
+    updatePurchaseInfo
+);
+
+// ============================================================================
+// 🛡️ ROTAS DE EXCLUSÃO (Requerem permissão crítica)
+// ============================================================================
+
+// Eliminar um produto permanentemente ou arquivá-lo
+router.delete('/:id', authenticate, requirePermission('produtos:delete'), deleteProduct);
 
 export default router;
