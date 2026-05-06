@@ -9,7 +9,6 @@ import { validatePositiveItems } from '../middlewares/validators';
 
 export const getRequests = async (req: Request, res: Response) => {
   try {
-    // CORREÇÃO: Adicionado o LEFT JOIN com client_services e a seleção do cs.op_code
     const query = `
       WITH FilteredRequests AS (
           SELECT * FROM requests 
@@ -17,12 +16,12 @@ export const getRequests = async (req: Request, res: Response) => {
           ORDER BY created_at DESC LIMIT 200
       )
       SELECT r.*, 
-          cs.op_code, /* <-- AQUI: Puxando o número da OP para o frontend */
+          cs.op_code,
           json_build_object('name', p.name, 'sector', p.sector) as requester,
           COALESCE(ri_agg.items, '[]'::json) as request_items
       FROM FilteredRequests r
       LEFT JOIN profiles p ON r.requester_id = p.id
-      LEFT JOIN client_services cs ON r.client_service_id = cs.id /* <-- AQUI: Ligando a OP ao Pedido */
+      LEFT JOIN client_services cs ON r.client_service_id = cs.id
       LEFT JOIN (
           SELECT ri.request_id, json_agg(
               json_build_object(
@@ -47,7 +46,6 @@ export const getRequests = async (req: Request, res: Response) => {
 export const getMyRequests = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   try {
-    // CORREÇÃO: Adicionado cs.op_code e o JOIN com client_services
     const query = `
       WITH FilteredRequests AS (
           SELECT * FROM requests 
@@ -55,10 +53,10 @@ export const getMyRequests = async (req: Request, res: Response) => {
           ORDER BY created_at DESC LIMIT 200
       )
       SELECT r.*, 
-          cs.op_code, /* <-- AQUI: Puxando o número da OP */
+          cs.op_code, 
           COALESCE(ri_agg.items, '[]'::json) as request_items
       FROM FilteredRequests r
-      LEFT JOIN client_services cs ON r.client_service_id = cs.id /* <-- AQUI: Ligando a OP ao Pedido */
+      LEFT JOIN client_services cs ON r.client_service_id = cs.id
       LEFT JOIN (
           SELECT ri.request_id, json_agg(
               json_build_object(
@@ -149,7 +147,7 @@ export const createRequest = async (req: Request, res: Response) => {
     }
 
     // =========================================================================
-    // 🟢 INSERÇÃO DO PEDIDO
+    // 🟢 3. INSERÇÃO DO PEDIDO BASE
     // =========================================================================
     const reqRes = await client.query(
       'INSERT INTO requests (requester_id, sector, status, client_service_id) VALUES ($1, $2, $3, $4) RETURNING id', 
@@ -162,35 +160,62 @@ export const createRequest = async (req: Request, res: Response) => {
        return String(a.product_id).localeCompare(String(b.product_id));
     });
 
+    // =========================================================================
+    // 🌉 4. A PONTE MÁGICA: RESERVA NORMAL OU ENVIO PARA O KANBAN 3D
+    // =========================================================================
     for (const item of sortedItems) {
       const isCustom = item.product_id === 'custom' || !item.product_id;
       const productId = isCustom ? null : item.product_id;
       const customName = isCustom ? item.custom_name : null;
+      let is3D = false;
+
       if (productId) {
-        const stockCheck = await client.query('SELECT (quantity_on_hand - quantity_reserved) as available FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
-        const available = parseFloat(stockCheck.rows[0]?.available || 0);
-        if (available < item.quantity) throw new Error(`Estoque disponível insuficiente para o produto ID: ${productId}`);
-        await client.query(`UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2`, [item.quantity, productId]);
+        // Busca a quantidade disponível E o status is_3d do produto
+        const productCheck = await client.query(
+            `SELECT p.is_3d, (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) as available 
+             FROM products p LEFT JOIN stock s ON p.id = s.product_id 
+             WHERE p.id = $1 FOR UPDATE`, 
+            [productId]
+        );
+        
+        const available = parseFloat(productCheck.rows[0]?.available || 0);
+        is3D = productCheck.rows[0]?.is_3d || false;
+
+        // SE O PRODUTO NÃO FOR 3D, validamos o stock e fazemos a reserva normal
+        if (!is3D) {
+            if (available < item.quantity) throw new Error(`Estoque disponível insuficiente para o produto ID: ${productId}`);
+            await client.query(`UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2`, [item.quantity, productId]);
+        }
       }
       
+      // Regista o item na solicitação original (Aparece no painel do Almoxarife)
       await client.query(
         'INSERT INTO request_items (request_id, product_id, custom_product_name, quantity_requested, observation, client_service) VALUES ($1, $2, $3, $4, $5, $6)', 
         [requestId, productId, customName, item.quantity, item.observation || null, item.client_service || null]
       );
+
+      // SE O PRODUTO FOR 3D, clona ele silenciosamente para o Quadro Kanban 3D
+      if (is3D && productId) {
+          const kanbanOpNumber = op_code ? op_code : 'Interno';
+          await client.query(
+             `INSERT INTO demands_3d (product_id, request_id, quantity, op_number, priority) 
+              VALUES ($1, $2, $3, $4, 'Média')`,
+             [productId, requestId, item.quantity, kanbanOpNumber]
+          );
+      }
     }
     
     await createLog(userId, 'CRIAR_SOLICITACAO', { id_solicitacao: requestId, setor: sector, total_itens: items.length }, getClientIp(req), client);
     await client.query('COMMIT');
 
-    // CORREÇÃO: Adicionado cs.op_code e o JOIN na query de resposta do WebSocket para o tempo real funcionar
     const fullReqQuery = `
       SELECT r.*, 
-             cs.op_code, /* <-- AQUI: OP no retorno em tempo real */
+             cs.op_code, 
              json_build_object('name', p.name, 'sector', p.sector) as requester, 
              (SELECT COALESCE(json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'quantity_delivered', ri.quantity_delivered, 'custom_product_name', ri.custom_product_name, 'observation', ri.observation, 'client_service', ri.client_service, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit, 'tags', pr.tags) ELSE NULL END)), '[]'::json) FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items 
       FROM requests r 
       LEFT JOIN profiles p ON r.requester_id = p.id 
-      LEFT JOIN client_services cs ON r.client_service_id = cs.id /* <-- AQUI */
+      LEFT JOIN client_services cs ON r.client_service_id = cs.id 
       WHERE r.id = $1`;
     const { rows: fullReqRows } = await client.query(fullReqQuery, [requestId]);
     
@@ -251,6 +276,7 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     if (!currentRes.rows[0]?.status) throw new Error("Solicitação não encontrada");
     const currentStatus = currentRes.rows[0].status;
 
+    // Se houve ajuste manual das quantidades pelo almoxarife antes da entrega
     if (adjusted_items && Array.isArray(adjusted_items)) {
        for (const adj of adjusted_items) {
           const itemCheck = await client.query('SELECT product_id, quantity_requested, quantity_delivered FROM request_items WHERE id = $1', [adj.id]);
@@ -263,18 +289,25 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
              await client.query('UPDATE request_items SET quantity_delivered = $1 WHERE id = $2', [newReserved, adj.id]);
              
              if (item.product_id && oldReserved !== newReserved && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
-                const delta = newReserved - oldReserved;
-                await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) + $1) WHERE product_id = $2', [delta, item.product_id]);
+                // Ao ajustar a quantidade no pedido, precisamos ajustar a reserva correspondente no stock
+                // Como não sabemos se o item é 3D ou não sem fazer um JOIN complexo aqui, e peças 3D não geram reserva,
+                // Uma solução robusta é atualizar a reserva APENAS se a quantidade reservada atual for maior que 0.
+                const stockVal = await client.query('SELECT quantity_reserved FROM stock WHERE product_id = $1', [item.product_id]);
+                if (parseFloat(stockVal.rows[0]?.quantity_reserved || 0) > 0) {
+                    const delta = newReserved - oldReserved;
+                    await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) + $1) WHERE product_id = $2', [delta, item.product_id]);
+                }
              }
           }
        }
     }
 
-    const itemsRes = await client.query('SELECT product_id, quantity_requested, quantity_delivered FROM request_items WHERE request_id = $1 ORDER BY product_id', [id]);
+    const itemsRes = await client.query('SELECT ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1 ORDER BY ri.product_id', [id]);
     
+    // Status: Entregue
     if (status === 'entregue' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
       for (const item of itemsRes.rows) {
-        if (item.product_id) {
+        if (item.product_id && !item.is_3d) { // Só desconta stock físico se NÃO FOR 3D
           const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
           const stockCheck = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1 FOR UPDATE', [item.product_id]);
           if (parseFloat(stockCheck.rows[0]?.quantity_on_hand || 0) < finalQty) throw new Error(`Furo de Estoque no produto ID ${item.product_id}.`);
@@ -282,16 +315,22 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
         }
       }
     } 
+    // Status: Rejeitado
     else if (status === 'rejeitado' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
       for (const item of itemsRes.rows) {
-        const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
-        if (item.product_id) await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [finalQty, item.product_id]);
+        if (item.product_id && !item.is_3d) { // Só devolve reserva se NÃO FOR 3D
+            const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
+            await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [finalQty, item.product_id]);
+        }
       }
     }
+    // Status: Devolvido (Retornou para a prateleira)
     else if (status === 'devolvido' && currentStatus === 'entregue') {
       for (const item of itemsRes.rows) {
-        const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
-        if (item.product_id) await client.query(`UPDATE stock SET quantity_on_hand = quantity_on_hand + $1 WHERE product_id = $2`, [finalQty, item.product_id]);
+        if (item.product_id && !item.is_3d) { // Só volta para prateleira se NÃO FOR 3D
+            const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
+            await client.query(`UPDATE stock SET quantity_on_hand = quantity_on_hand + $1 WHERE product_id = $2`, [finalQty, item.product_id]);
+        }
       }
     }
 
@@ -326,15 +365,21 @@ export const deleteRequest = async (req: Request, res: Response) => {
     if (status === 'rejeitado' || status === 'entregue' || status === 'devolvido') throw new Error('Não é possível cancelar no estado atual.');
     
     if (status === 'aberto' || status === 'aprovado') {
-       const itemsRes = await client.query('SELECT product_id, quantity_requested, quantity_delivered FROM request_items WHERE request_id = $1', [id]);
+       // Puxa o status is_3d também para não tentar cancelar reservas de algo que nunca foi reservado
+       const itemsRes = await client.query('SELECT ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1', [id]);
        for (const item of itemsRes.rows) {
-         const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
-         if (item.product_id) await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [finalQty, item.product_id]);
+         if (item.product_id && !item.is_3d) {
+            const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
+            await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [finalQty, item.product_id]);
+         }
        }
     }
 
     await client.query("UPDATE requests SET status = 'rejeitado', rejection_reason = 'Cancelado pelo usuário/sistema' WHERE id = $1", [id]);
     
+    // Se havia uma cópia no Kanban 3D pendente, também "cancela" ela
+    await client.query("UPDATE demands_3d SET status = 'Cancelada' WHERE request_id = $1 AND status != 'Concluída'", [id]);
+
     await createLog(userId, 'CANCELAR_SOLICITACAO', { id_solicitacao: id, status_anterior: status }, getClientIp(req), client);
     await client.query('COMMIT');
     
