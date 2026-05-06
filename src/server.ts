@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import { createServer } from 'http';
@@ -9,7 +9,6 @@ import { initSocket } from './config/socket';
 import { startExpireRequestsJob } from './jobs/expireRequests.job';
 
 // --- Rotas (Routers) ---
-// Cada um destes arquivos exporta um "Router" do Express contendo sub-rotas
 import authRouter from './routes/auth.routes';
 import usersRouter from './routes/users.routes';
 import productsRouter from './routes/products.routes';
@@ -27,6 +26,18 @@ import permissionsRouter from './routes/permissions.routes';
 import trackingRoutes from './routes/tracking.routes';
 import clientsRouter from './routes/clients.routes';
 
+// ==========================================
+// 0. EXTENSÃO DE TIPOS GLOBAIS (TYPESCRIPT)
+// ==========================================
+// Isto ensina ao TypeScript que todas as requisições do Express terão acesso ao Socket.io
+declare global {
+  namespace Express {
+    interface Request {
+      io?: any;
+    }
+  }
+}
+
 // Inicialização do aplicativo Express
 const app = express();
 
@@ -37,7 +48,7 @@ const app = express();
 // Necessário se o servidor estiver atrás de um proxy (ex: Vercel, Heroku, Nginx)
 app.set('trust proxy', 1); 
 
-// Helmet adiciona cabeçalhos HTTP de segurança automaticamente
+// Helmet adiciona cabeçalhos HTTP de segurança automaticamente contra ataques XSS e Clickjacking
 app.use(helmet()); 
 
 // Permite que o Express entenda o corpo das requisições no formato JSON
@@ -55,7 +66,8 @@ const allowedOrigins = [
 ];
 
 const corsOptions = {
-  origin: function (origin: any, callback: any) {
+  // Substituímos o "any" por tipos reais para maior segurança
+  origin: function (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
     // Permite requisições sem origem definida (ex: Postman, Insomnia, scripts do próprio server)
     if (!origin) return callback(null, true);
     
@@ -83,8 +95,8 @@ const httpServer = createServer(app);
 const io = initSocket(httpServer, corsOptions);
 
 // Middleware personalizado para injetar o 'io' no Express.
-// Isso permite que você use `req.io.emit(...)` em qualquer controller.
-app.use((req: any, res, next) => {
+// Isso permite que use `req.io.emit(...)` em qualquer controller.
+app.use((req: Request, res: Response, next: NextFunction) => {
   req.io = io;
   next();
 });
@@ -129,18 +141,19 @@ app.use('/', systemRouter);
 // ==========================================
 // 5. ATALHOS DE RETRO-COMPATIBILIDADE
 // ==========================================
-// Correção: Para apontar uma rota diretamente para um Router inteiro, usamos app.use()
+
+// Para apontar uma rota diretamente para um Router inteiro
 app.use('/manual-entry', stockRouter);
 app.use('/manual-withdrawal', stockRouter);
 
 // Reescreve a URL internamente para não quebrar aplicativos antigos que chamam '/my-requests'
-app.get('/my-requests', (req, res, next) => { 
+app.get('/my-requests', (req: Request, res: Response, next: NextFunction) => { 
     req.url = '/my'; 
     requestsRouter(req, res, next); 
 });
 
 // Reescreve a rota de subscrição de notificações (Push)
-app.post('/notifications/subscribe', (req, res, next) => { 
+app.post('/notifications/subscribe', (req: Request, res: Response, next: NextFunction) => { 
     req.url = '/subscribe-push'; 
     officeRouter(req, res, next); 
 });
@@ -151,5 +164,5 @@ app.post('/notifications/subscribe', (req, res, next) => {
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
     console.log(`🚀 Fluxo Royale 2.1 Enterprise Online na porta ${PORT}`);
-    console.log(`🛡️ Arquitetura Modular Ativa | Proteções ACID Injetadas`);
+    console.log(`🛡️ Arquitetura Modular Ativa | Proteções RBAC e ACID Injetadas`);
 });
