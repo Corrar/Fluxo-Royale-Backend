@@ -3,38 +3,36 @@ import { pool } from '../db';
 import { getClientIp } from '../utils/ip';
 import { createLog } from '../utils/logger';
 
-// 🧠 FUNÇÃO INTELIGENTE DE AUTO-DETEÇÃO DE TAGS
-// Consegue ler tags quer venham como String ("3D") ou como Objeto do TagInput ({ name: "3D", color: "..." })
-const detect3DTag = (tagsData: any): { is3D: boolean, parsed: any[] } => {
-  let is3D = false;
-  let parsed: any[] = [];
+// 🧠 SANITIZADOR DE TAGS BLINDADO
+// Limpa os objetos do TagInput e extrai apenas o texto puro (String).
+const sanitizeTags = (tagsData: any): { is3D: boolean, parsed: string[] } => {
+  let rawArray: any[] = [];
   
-  if (!tagsData) return { is3D, parsed };
+  if (!tagsData) return { is3D: false, parsed: [] };
 
-  // 1. Garante que temos um Array
   if (Array.isArray(tagsData)) {
-    parsed = tagsData;
+    rawArray = tagsData;
   } else if (typeof tagsData === 'string') {
     try { 
-      parsed = JSON.parse(tagsData); 
-      if (!Array.isArray(parsed)) parsed = [tagsData];
+      rawArray = JSON.parse(tagsData); 
+      if (!Array.isArray(rawArray)) rawArray = [tagsData];
     } catch (e) { 
-      parsed = tagsData.split(',').map((s: string) => s.trim()); 
+      rawArray = tagsData.split(',').map((s: string) => s.trim()); 
     }
   }
 
-  // 2. Procura a tag "3D" dentro do Array
-  is3D = parsed.some((t: any) => {
-    if (!t) return false;
-    // Se vier do TagInput.tsx, ele é um objeto com a propriedade "name"
-    if (typeof t === 'object' && t.name) {
-      return String(t.name).trim().toLowerCase() === '3d';
-    }
-    // Se for texto normal
-    return String(t).trim().toLowerCase() === '3d';
-  });
+  // 🛡️ Filtra e extrai apenas strings puras para evitar erros no React
+  const stringTags = rawArray
+    .filter(t => t !== null && t !== undefined && t !== "")
+    .map(t => {
+       if (typeof t === 'object' && t.name) return String(t.name).trim();
+       if (typeof t === 'object') return 'Tag';
+       return String(t).trim();
+    });
 
-  return { is3D, parsed };
+  const is3D = stringTags.some(t => t.toLowerCase() === '3d');
+
+  return { is3D, parsed: stringTags };
 };
 
 export const getProducts = async (req: Request, res: Response) => {
@@ -45,7 +43,16 @@ export const getProducts = async (req: Request, res: Response) => {
         json_build_object('quantity_on_hand', COALESCE(s.quantity_on_hand, 0), 'quantity_reserved', COALESCE(s.quantity_reserved, 0)) as stock
       FROM products p LEFT JOIN stock s ON p.id = s.product_id WHERE p.active = true ORDER BY p.name ASC
     `);
-    res.json(rows);
+    
+    // 🛡️ A CORREÇÃO MÁGICA AQUI:
+    // Nós limpamos a sujeira e devolvemos exatamente em formato de Texto (JSON.stringify)
+    // Isso evita o erro de "0 produtos" no Products.tsx
+    const safeRows = rows.map(r => {
+       const { parsed } = sanitizeTags(r.tags);
+       return { ...r, tags: JSON.stringify(parsed) }; 
+    });
+
+    res.json(safeRows);
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 };
 
@@ -57,7 +64,13 @@ export const getLowStockProducts = async (req: Request, res: Response) => {
       FROM products p LEFT JOIN stock s ON p.id = s.product_id
       WHERE p.active = true AND (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) <= COALESCE(CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC), 0) ORDER BY (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) ASC
     `);
-    res.json(rows);
+    
+    const safeRows = rows.map(r => {
+       const { parsed } = sanitizeTags(r.tags);
+       return { ...r, tags: JSON.stringify(parsed) }; 
+    });
+
+    res.json(safeRows);
   } catch (error: any) { res.status(500).json({ error: 'Erro ao buscar estoque baixo' }); }
 };
 
@@ -69,7 +82,6 @@ export const createProduct = async (req: Request, res: Response) => {
   try {
     await client.query('BEGIN');
     
-    // 🛡️ Validação de Unicidade
     const skuCheck = await client.query('SELECT id, active FROM products WHERE sku = $1', [sku]);
     
     if (skuCheck.rows.length > 0) {
@@ -81,8 +93,8 @@ export const createProduct = async (req: Request, res: Response) => {
       }
     }
 
-    // 🚀 Usa a nova função detetora
-    const { is3D: detected3D, parsed: parsedTags } = detect3DTag(tags);
+    // 🚀 Usa o Sanitizador na entrada de dados
+    const { is3D: detected3D, parsed: parsedTags } = sanitizeTags(tags);
     const finalIs3D = is_3d || detected3D;
 
     const productRes = await client.query(
@@ -127,11 +139,10 @@ export const updateProduct = async (req: Request, res: Response) => {
     let finalIs3D = is_3d;
     let finalTagsForDB = tags ? (typeof tags === 'string' ? tags : JSON.stringify(tags)) : null;
 
-    // 🚀 Usa a nova função detetora na atualização também
     if (tags !== undefined) {
-      const { is3D: detected3D, parsed: parsedTags } = detect3DTag(tags);
+      const { is3D: detected3D, parsed: parsedTags } = sanitizeTags(tags);
       finalIs3D = is_3d !== undefined ? is_3d : detected3D;
-      if (detected3D) finalIs3D = true; // Força para true se encontrou a tag "3D"
+      if (detected3D) finalIs3D = true; 
       finalTagsForDB = JSON.stringify(parsedTags);
     }
 
@@ -206,7 +217,13 @@ export const getInactiveProducts = async (req: Request, res: Response) => {
       FROM products p LEFT JOIN stock s ON p.id = s.product_id 
       WHERE p.active = false ORDER BY p.name ASC
     `);
-    res.json(rows);
+    
+    const safeRows = rows.map(r => {
+       const { parsed } = sanitizeTags(r.tags);
+       return { ...r, tags: JSON.stringify(parsed) }; 
+    });
+
+    res.json(safeRows);
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 };
 
