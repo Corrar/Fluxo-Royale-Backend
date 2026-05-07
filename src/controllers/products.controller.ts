@@ -76,20 +76,31 @@ export const getLowStockProducts = async (req: Request, res: Response) => {
 
 export const createProduct = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
-  const { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
+  
+  // Usamos 'let' para permitir limpar o SKU antes de prosseguir
+  let { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
   const client = await pool.connect();
   
+  // 🛡️ LIMPEZA E VALIDAÇÃO DO SKU
+  if (typeof sku === 'string') sku = sku.trim();
+
+  if (!sku || sku === '') {
+     client.release();
+     return res.status(400).json({ error: 'O código SKU é obrigatório e não pode estar vazio.' });
+  }
+
   try {
     await client.query('BEGIN');
     
-    const skuCheck = await client.query('SELECT id, active FROM products WHERE sku = $1', [sku]);
+    // 🔎 Busca Inteligente: Trazemos o nome para mostrar no erro
+    const skuCheck = await client.query('SELECT id, active, name FROM products WHERE sku = $1', [sku]);
     
     if (skuCheck.rows.length > 0) {
       const existingProduct = skuCheck.rows[0];
       if (existingProduct.active) {
-        throw new Error('Já existe um produto ativo cadastrado com este SKU.');
+        throw new Error(`Conflito! O código SKU "${sku}" já está a ser utilizado pelo produto: "${existingProduct.name}".`);
       } else {
-        throw new Error('Este SKU já pertence a um produto que foi arquivado (inativo). Por favor, reative-o ou utilize um código diferente.');
+        throw new Error(`O código SKU "${sku}" pertence ao produto arquivado: "${existingProduct.name}". Reative-o primeiro.`);
       }
     }
 
@@ -101,7 +112,7 @@ export const createProduct = async (req: Request, res: Response) => {
       `INSERT INTO products (sku, name, description, unit, min_stock, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
       [
-        sku, name, description, unit, min_stock, unit_price || 0, sales_price || 0, JSON.stringify(parsedTags), 
+        sku, name, description, unit, min_stock, unit_price !== undefined ? unit_price : 0, sales_price !== undefined ? sales_price : 0, JSON.stringify(parsedTags), 
         finalIs3D, production_minutes || 0, filament_grams || 0, image_url || null
       ]
     );
@@ -130,11 +141,24 @@ export const createProduct = async (req: Request, res: Response) => {
 export const updateProduct = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { id } = req.params;
-  const { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
+  
+  // Usamos 'let' para permitir limpar o SKU
+  let { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
   const client = await pool.connect();
   
   try {
     await client.query('BEGIN');
+
+    // 🛡️ PROTEÇÃO 1: Limpeza do SKU
+    if (typeof sku === 'string') sku = sku.trim();
+
+    // 🛡️ PROTEÇÃO 2: Evitar erro de duplicação do banco de dados na Edição
+    if (sku) {
+      const skuCheck = await client.query('SELECT id, name FROM products WHERE sku = $1 AND id != $2', [sku, id]);
+      if (skuCheck.rows.length > 0) {
+        throw new Error(`Conflito! O código SKU "${sku}" já está a ser utilizado pelo produto: "${skuCheck.rows[0].name}".`);
+      }
+    }
 
     let finalIs3D = is_3d;
     let finalTagsForDB = tags ? (typeof tags === 'string' ? tags : JSON.stringify(tags)) : null;
@@ -146,6 +170,7 @@ export const updateProduct = async (req: Request, res: Response) => {
       finalTagsForDB = JSON.stringify(parsedTags);
     }
 
+    // 🛡️ PROTEÇÃO 3: Usar "param !== undefined ? param : null" impede que os números zero (0) sejam ignorados!
     const { rows } = await client.query(
       `UPDATE products 
        SET sku = COALESCE($1, sku), name = COALESCE($2, name), description = COALESCE($3, description), 
@@ -155,11 +180,18 @@ export const updateProduct = async (req: Request, res: Response) => {
            filament_grams = COALESCE($11, filament_grams), image_url = COALESCE($12, image_url)
        WHERE id = $13 RETURNING *`,
       [
-        sku || null, name || null, description || null, unit || null, min_stock || null, unit_price || null, sales_price || null, finalTagsForDB,
+        sku !== undefined ? sku : null, 
+        name !== undefined ? name : null, 
+        description !== undefined ? description : null, 
+        unit !== undefined ? unit : null, 
+        min_stock !== undefined ? min_stock : null, 
+        unit_price !== undefined ? unit_price : null, 
+        sales_price !== undefined ? sales_price : null, 
+        finalTagsForDB,
         finalIs3D !== undefined ? finalIs3D : null, 
         production_minutes !== undefined ? production_minutes : null, 
         filament_grams !== undefined ? filament_grams : null, 
-        image_url || null, 
+        image_url !== undefined ? image_url : null, 
         id
       ]
     );
@@ -172,7 +204,8 @@ export const updateProduct = async (req: Request, res: Response) => {
     res.json(rows[0]);
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch(e) {}
-    res.status(500).json({ error: error.message });
+    // Retornamos 400 em vez de 500 para o frontend mostrar o aviso no balão verde/vermelho
+    res.status(400).json({ error: error.message }); 
   } finally { client.release(); }
 };
 
@@ -234,9 +267,10 @@ export const updateProductPrices = async (req: Request, res: Response) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Aqui usamos o mesmo princípio, o valor deve poder ser 0
     const { rows } = await client.query(
       `UPDATE products SET unit_price = COALESCE($1, unit_price), sales_price = COALESCE($2, sales_price) WHERE id = $3 RETURNING *`,
-      [unit_price, sales_price, id]
+      [unit_price !== undefined ? unit_price : null, sales_price !== undefined ? sales_price : null, id]
     );
     if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Produto não encontrado' }); }
     await createLog(userId, 'ATUALIZAR_PRECOS', { id_produto: id, novos_precos: { unit_price, sales_price } }, getClientIp(req), client);
