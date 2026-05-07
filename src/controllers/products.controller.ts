@@ -3,9 +3,42 @@ import { pool } from '../db';
 import { getClientIp } from '../utils/ip';
 import { createLog } from '../utils/logger';
 
+// 🧠 FUNÇÃO INTELIGENTE DE AUTO-DETEÇÃO DE TAGS
+// Consegue ler tags quer venham como String ("3D") ou como Objeto do TagInput ({ name: "3D", color: "..." })
+const detect3DTag = (tagsData: any): { is3D: boolean, parsed: any[] } => {
+  let is3D = false;
+  let parsed: any[] = [];
+  
+  if (!tagsData) return { is3D, parsed };
+
+  // 1. Garante que temos um Array
+  if (Array.isArray(tagsData)) {
+    parsed = tagsData;
+  } else if (typeof tagsData === 'string') {
+    try { 
+      parsed = JSON.parse(tagsData); 
+      if (!Array.isArray(parsed)) parsed = [tagsData];
+    } catch (e) { 
+      parsed = tagsData.split(',').map((s: string) => s.trim()); 
+    }
+  }
+
+  // 2. Procura a tag "3D" dentro do Array
+  is3D = parsed.some((t: any) => {
+    if (!t) return false;
+    // Se vier do TagInput.tsx, ele é um objeto com a propriedade "name"
+    if (typeof t === 'object' && t.name) {
+      return String(t.name).trim().toLowerCase() === '3d';
+    }
+    // Se for texto normal
+    return String(t).trim().toLowerCase() === '3d';
+  });
+
+  return { is3D, parsed };
+};
+
 export const getProducts = async (req: Request, res: Response) => {
   try {
-    // 💡 AQUI: Adicionados os campos exclusivos do 3D no SELECT
     const { rows } = await pool.query(`
       SELECT p.id, p.sku, p.name, p.description, p.unit, p.tags, p.unit_price, p.sales_price, p.min_stock, p.active,
         p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
@@ -48,22 +81,9 @@ export const createProduct = async (req: Request, res: Response) => {
       }
     }
 
-    // 🧠 AUTO-DETECÇÃO 3D ROBUSTA
-    let finalIs3D = is_3d || false;
-    let parsedTags: string[] = [];
-    
-    if (tags) {
-      if (Array.isArray(tags)) {
-        parsedTags = tags;
-      } else if (typeof tags === 'string') {
-        try { parsedTags = JSON.parse(tags); } 
-        catch (e) { parsedTags = [tags]; }
-      }
-      
-      if (parsedTags.some((t: any) => String(t).trim().toLowerCase() === '3d')) {
-        finalIs3D = true;
-      }
-    }
+    // 🚀 Usa a nova função detetora
+    const { is3D: detected3D, parsed: parsedTags } = detect3DTag(tags);
+    const finalIs3D = is_3d || detected3D;
 
     const productRes = await client.query(
       `INSERT INTO products (sku, name, description, unit, min_stock, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url) 
@@ -104,20 +124,14 @@ export const updateProduct = async (req: Request, res: Response) => {
   try {
     await client.query('BEGIN');
 
-    // 🧠 AUTO-DETECÇÃO 3D ROBUSTA PARA ATUALIZAÇÃO
     let finalIs3D = is_3d;
     let finalTagsForDB = tags ? (typeof tags === 'string' ? tags : JSON.stringify(tags)) : null;
 
+    // 🚀 Usa a nova função detetora na atualização também
     if (tags !== undefined) {
-      let parsedTags: string[] = [];
-      if (Array.isArray(tags)) {
-        parsedTags = tags;
-      } else if (typeof tags === 'string') {
-        try { parsedTags = JSON.parse(tags); } 
-        catch (e) { parsedTags = [tags]; }
-      }
-      
-      finalIs3D = parsedTags.some((t: any) => String(t).trim().toLowerCase() === '3d');
+      const { is3D: detected3D, parsed: parsedTags } = detect3DTag(tags);
+      finalIs3D = is_3d !== undefined ? is_3d : detected3D;
+      if (detected3D) finalIs3D = true; // Força para true se encontrou a tag "3D"
       finalTagsForDB = JSON.stringify(parsedTags);
     }
 
@@ -172,30 +186,17 @@ export const updatePurchaseInfo = async (req: Request, res: Response) => {
   } catch (error: any) { res.status(500).json({ error: 'Erro ao atualizar info de compra' }); }
 };
 
-// ♻️ Nova função para reativar produtos arquivados (fantasmas)
 export const reactivateProduct = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { sku } = req.params; 
-  
   try {
-    const { rows } = await pool.query(
-      'UPDATE products SET active = true WHERE sku = $1 RETURNING *',
-      [sku]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'Nenhum produto encontrado com este SKU para reativar.' });
-    }
-
+    const { rows } = await pool.query('UPDATE products SET active = true WHERE sku = $1 RETURNING *', [sku]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Nenhum produto encontrado com este SKU para reativar.' });
     await createLog(userId, 'REATIVAR_PRODUTO', { sku, mensagem: 'Produto retirado da lista de inativos' }, getClientIp(req));
     res.json({ message: 'Produto reativado com sucesso!', product: rows[0] });
-    
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
 };
 
-// 🗑️ Nova função para listar produtos arquivados (inativos)
 export const getInactiveProducts = async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query(`
@@ -203,45 +204,29 @@ export const getInactiveProducts = async (req: Request, res: Response) => {
         p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
         json_build_object('quantity_on_hand', COALESCE(s.quantity_on_hand, 0)) as stock
       FROM products p LEFT JOIN stock s ON p.id = s.product_id 
-      WHERE p.active = false 
-      ORDER BY p.name ASC
+      WHERE p.active = false ORDER BY p.name ASC
     `);
     res.json(rows);
-  } catch (error: any) { 
-    res.status(500).json({ error: error.message }); 
-  }
+  } catch (error: any) { res.status(500).json({ error: error.message }); }
 };
 
-// 💰 NOVA FUNÇÃO: Atualizar APENAS os preços (Para o setor financeiro)
 export const updateProductPrices = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { id } = req.params;
   const { unit_price, sales_price } = req.body;
   const client = await pool.connect();
-  
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `UPDATE products 
-       SET unit_price = COALESCE($1, unit_price), 
-           sales_price = COALESCE($2, sales_price) 
-       WHERE id = $3 RETURNING *`,
+      `UPDATE products SET unit_price = COALESCE($1, unit_price), sales_price = COALESCE($2, sales_price) WHERE id = $3 RETURNING *`,
       [unit_price, sales_price, id]
     );
-
-    if (rows.length === 0) { 
-      await client.query('ROLLBACK'); 
-      return res.status(404).json({ error: 'Produto não encontrado' }); 
-    }
-    
+    if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Produto não encontrado' }); }
     await createLog(userId, 'ATUALIZAR_PRECOS', { id_produto: id, novos_precos: { unit_price, sales_price } }, getClientIp(req), client);
     await client.query('COMMIT');
     res.json(rows[0]);
-    
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: error.message });
-  } finally { 
-    client.release(); 
-  }
+  } finally { client.release(); }
 };
