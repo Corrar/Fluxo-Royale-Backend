@@ -167,6 +167,7 @@ export const createRequest = async (req: Request, res: Response) => {
       const isCustom = item.product_id === 'custom' || !item.product_id;
       const productId = isCustom ? null : item.product_id;
       const customName = isCustom ? item.custom_name : null;
+      const priority = item.priority || 'Média'; // Lê a prioridade do frontend
       let is3D = false;
 
       if (productId) {
@@ -181,28 +182,48 @@ export const createRequest = async (req: Request, res: Response) => {
         const available = parseFloat(productCheck.rows[0]?.available || 0);
         is3D = productCheck.rows[0]?.is_3d || false;
 
-        // SE O PRODUTO NÃO FOR 3D, validamos o stock e fazemos a reserva normal
-        if (!is3D) {
+        // LÓGICA INTELIGENTE: ESTOQUE + FÁBRICA 3D
+        if (is3D) {
+            let missingQty = item.quantity;
+            let reservedQty = 0;
+
+            // 1. Se tem pelo menos 1 no estoque, reserva logo essa quantidade
+            if (available > 0) {
+                reservedQty = Math.min(item.quantity, available);
+                missingQty = item.quantity - reservedQty;
+                
+                await client.query(
+                  `UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2`, 
+                  [reservedQty, productId]
+                );
+            }
+
+            // 2. Se FALTAR peças, vai para a fábrica produzir
+            if (missingQty > 0) {
+                const kanbanOpNumber = op_code ? op_code : 'Interno';
+                
+                // INFORMA O QUANTO JÁ TEM NO ESTOQUE DIRETAMENTE NAS NOTAS DO KANBAN
+                const notesInfo = `⚠️ RESUMO DO PEDIDO:\n- A Produzir: ${missingQty} un.\n- Já em Estoque: ${reservedQty} un.\n- Total Solicitado: ${item.quantity} un.\n\n📝 OBSERVAÇÕES:\n${item.observation || 'Nenhuma'}`;
+
+                await client.query(
+                   `INSERT INTO demands_3d (product_id, request_id, quantity, op_number, priority, notes) 
+                    VALUES ($1, $2, $3, $4, $5, $6)`,
+                   [productId, requestId, missingQty, kanbanOpNumber, priority, notesInfo]
+                );
+            }
+        } 
+        // LÓGICA NORMAL PARA PRODUTOS NÃO 3D
+        else {
             if (available < item.quantity) throw new Error(`Estoque disponível insuficiente para o produto ID: ${productId}`);
             await client.query(`UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2`, [item.quantity, productId]);
         }
       }
       
-      // Regista o item na solicitação original (Aparece no painel do Almoxarife)
+      // Regista o item na solicitação original (Aparece no painel do Almoxarife para entregar o que já tem)
       await client.query(
         'INSERT INTO request_items (request_id, product_id, custom_product_name, quantity_requested, observation, client_service) VALUES ($1, $2, $3, $4, $5, $6)', 
         [requestId, productId, customName, item.quantity, item.observation || null, item.client_service || null]
       );
-
-      // SE O PRODUTO FOR 3D, clona ele silenciosamente para o Quadro Kanban 3D
-      if (is3D && productId) {
-          const kanbanOpNumber = op_code ? op_code : 'Interno';
-          await client.query(
-             `INSERT INTO demands_3d (product_id, request_id, quantity, op_number, priority) 
-              VALUES ($1, $2, $3, $4, 'Média')`,
-             [productId, requestId, item.quantity, kanbanOpNumber]
-          );
-      }
     }
     
     await createLog(userId, 'CRIAR_SOLICITACAO', { id_solicitacao: requestId, setor: sector, total_itens: items.length }, getClientIp(req), client);
@@ -290,8 +311,6 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
              
              if (item.product_id && oldReserved !== newReserved && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
                 // Ao ajustar a quantidade no pedido, precisamos ajustar a reserva correspondente no stock
-                // Como não sabemos se o item é 3D ou não sem fazer um JOIN complexo aqui, e peças 3D não geram reserva,
-                // Uma solução robusta é atualizar a reserva APENAS se a quantidade reservada atual for maior que 0.
                 const stockVal = await client.query('SELECT quantity_reserved FROM stock WHERE product_id = $1', [item.product_id]);
                 if (parseFloat(stockVal.rows[0]?.quantity_reserved || 0) > 0) {
                     const delta = newReserved - oldReserved;
