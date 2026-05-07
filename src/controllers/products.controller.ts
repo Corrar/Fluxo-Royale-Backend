@@ -30,7 +30,6 @@ export const getLowStockProducts = async (req: Request, res: Response) => {
 
 export const createProduct = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
-  // 💡 AQUI: Recebemos as propriedades do 3D do frontend
   const { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
   const client = await pool.connect();
   
@@ -49,22 +48,36 @@ export const createProduct = async (req: Request, res: Response) => {
       }
     }
 
-    // 💡 AQUI: Criação do produto guardando os campos 3D
+    // 🧠 AUTO-DETECÇÃO 3D ROBUSTA
+    let finalIs3D = is_3d || false;
+    let parsedTags: string[] = [];
+    
+    if (tags) {
+      if (Array.isArray(tags)) {
+        parsedTags = tags;
+      } else if (typeof tags === 'string') {
+        try { parsedTags = JSON.parse(tags); } 
+        catch (e) { parsedTags = [tags]; }
+      }
+      
+      if (parsedTags.some((t: any) => String(t).trim().toLowerCase() === '3d')) {
+        finalIs3D = true;
+      }
+    }
+
     const productRes = await client.query(
       `INSERT INTO products (sku, name, description, unit, min_stock, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
       [
-        sku, name, description, unit, min_stock, unit_price || 0, sales_price || 0, JSON.stringify(tags || []), 
-        is_3d || false, production_minutes || 0, filament_grams || 0, image_url || null
+        sku, name, description, unit, min_stock, unit_price || 0, sales_price || 0, JSON.stringify(parsedTags), 
+        finalIs3D, production_minutes || 0, filament_grams || 0, image_url || null
       ]
     );
     const newProduct = productRes.rows[0];
 
-    // Inserção da quantidade inicial no stock
     const initialQty = quantity ? parseFloat(quantity) : 0;
     await client.query(`INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved) VALUES ($1, $2, 0) ON CONFLICT (product_id) DO UPDATE SET quantity_on_hand = COALESCE(stock.quantity_on_hand, 0) + EXCLUDED.quantity_on_hand`, [newProduct.id, initialQty]);
 
-    // Registo de logs se houver quantidade inicial
     if (initialQty > 0) {
       const logRes = await client.query("INSERT INTO xml_logs (file_name, success, total_items) VALUES ($1, $2, $3) RETURNING id", ['Estoque Inicial - Cadastro', true, 1]);
       await client.query("INSERT INTO xml_items (xml_log_id, product_id, quantity) VALUES ($1, $2, $3)", [logRes.rows[0].id, newProduct.id, initialQty]);
@@ -85,12 +98,29 @@ export const createProduct = async (req: Request, res: Response) => {
 export const updateProduct = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { id } = req.params;
-  // 💡 AQUI: Atualização suporta campos 3D
   const { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
   const client = await pool.connect();
   
   try {
     await client.query('BEGIN');
+
+    // 🧠 AUTO-DETECÇÃO 3D ROBUSTA PARA ATUALIZAÇÃO
+    let finalIs3D = is_3d;
+    let finalTagsForDB = tags ? (typeof tags === 'string' ? tags : JSON.stringify(tags)) : null;
+
+    if (tags !== undefined) {
+      let parsedTags: string[] = [];
+      if (Array.isArray(tags)) {
+        parsedTags = tags;
+      } else if (typeof tags === 'string') {
+        try { parsedTags = JSON.parse(tags); } 
+        catch (e) { parsedTags = [tags]; }
+      }
+      
+      finalIs3D = parsedTags.some((t: any) => String(t).trim().toLowerCase() === '3d');
+      finalTagsForDB = JSON.stringify(parsedTags);
+    }
+
     const { rows } = await client.query(
       `UPDATE products 
        SET sku = COALESCE($1, sku), name = COALESCE($2, name), description = COALESCE($3, description), 
@@ -100,14 +130,15 @@ export const updateProduct = async (req: Request, res: Response) => {
            filament_grams = COALESCE($11, filament_grams), image_url = COALESCE($12, image_url)
        WHERE id = $13 RETURNING *`,
       [
-        sku || null, name || null, description || null, unit || null, min_stock || null, unit_price || null, sales_price || null, tags ? JSON.stringify(tags) : null,
-        is_3d !== undefined ? is_3d : null, 
+        sku || null, name || null, description || null, unit || null, min_stock || null, unit_price || null, sales_price || null, finalTagsForDB,
+        finalIs3D !== undefined ? finalIs3D : null, 
         production_minutes !== undefined ? production_minutes : null, 
         filament_grams !== undefined ? filament_grams : null, 
         image_url || null, 
         id
       ]
     );
+    
     if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Produto não encontrado' }); }
     if (quantity !== undefined && quantity !== "") { await client.query('UPDATE stock SET quantity_on_hand = $1 WHERE product_id = $2', [parseFloat(quantity), id]); }
     
@@ -167,7 +198,6 @@ export const reactivateProduct = async (req: Request, res: Response) => {
 // 🗑️ Nova função para listar produtos arquivados (inativos)
 export const getInactiveProducts = async (req: Request, res: Response) => {
   try {
-    // 💡 AQUI: Incluímos também as info 3D para manter integridade
     const { rows } = await pool.query(`
       SELECT p.id, p.sku, p.name, p.description, p.unit, p.unit_price, p.active,
         p.is_3d, p.production_minutes, p.filament_grams, p.image_url,
