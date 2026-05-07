@@ -174,7 +174,7 @@ export const createRequest = async (req: Request, res: Response) => {
         const productCheck = await client.query(
             `SELECT p.is_3d, (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) as available 
              FROM products p LEFT JOIN stock s ON p.id = s.product_id 
-             WHERE p.id = $1 FOR UPDATE`, 
+             WHERE p.id = $1 FOR UPDATE OF p`, 
             [productId]
         );
         
