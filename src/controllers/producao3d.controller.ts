@@ -51,13 +51,14 @@ export const update3DPartDetails = async (req: Request, res: Response) => {
 export const getDemands = async (req: Request, res: Response) => {
   try {
     // Busca as demandas e junta com o nome de quem pediu na tabela requests original
+    // CORRIGIDO: r.user_id alterado para r.requester_id
     const { rows } = await pool.query(`
         SELECT d.id, d.product_id as "partId", d.request_id as "requestId", d.quantity, 
                d.op_number as "opNumber", d.priority, d.status, d.notes, d.created_at as "createdAt",
                p.name as requester
         FROM demands_3d d
         LEFT JOIN requests r ON d.request_id = r.id
-        LEFT JOIN profiles p ON r.user_id = p.id
+        LEFT JOIN profiles p ON r.requester_id = p.id
         ORDER BY d.created_at DESC
     `);
     res.json(rows);
@@ -77,21 +78,32 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
     // Atualiza o cartão no Kanban
     await client.query('UPDATE demands_3d SET status = $1 WHERE id = $2', [status, id]);
 
-    // SE A PEÇA FOI CONCLUÍDA, MÁGICA ACONTECE:
+    // SE A PEÇA FOI CONCLUÍDA, A MÁGICA DE ESTOQUE ACONTECE:
     if (status === 'Concluída') {
         const demandRes = await client.query('SELECT request_id, quantity, product_id FROM demands_3d WHERE id = $1', [id]);
         const demand = demandRes.rows[0];
 
-        // 1. Dá entrada no estoque da peça produzida automaticamente
-        await client.query(
-            `INSERT INTO stock_transactions (product_id, quantity, type, user_id, reason) 
-             VALUES ($1, $2, 'ENTRADA', $3, 'Produção 3D Concluída')`,
-            [demand.product_id, demand.quantity, (req as any).user.id]
-        );
+        if (demand.product_id) {
+            // 1. Dá entrada no estoque FÍSICO da peça produzida e reserva-a imediatamente para o pedido
+            await client.query(
+                `UPDATE stock 
+                 SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1,
+                     quantity_reserved = COALESCE(quantity_reserved, 0) + $1
+                 WHERE product_id = $2`,
+                [demand.quantity, demand.product_id]
+            );
 
-        // 2. Muda o status da solicitação original do setor para "Aprovada" / "Pronta para Retirada"
+            // 2. Registra no histórico de movimentações (Extrato)
+            await client.query(
+                `INSERT INTO stock_transactions (product_id, quantity, type, user_id, reason) 
+                 VALUES ($1, $2, 'ENTRADA', $3, 'Produção 3D Concluída')`,
+                [demand.product_id, demand.quantity, (req as any).user.id]
+            );
+        }
+
+        // 3. Muda o status da solicitação original do setor para "aprovado" (Pronta para Retirada no Almoxarifado)
         if (demand.request_id) {
-            await client.query(`UPDATE requests SET status = 'Aprovada' WHERE id = $1`, [demand.request_id]);
+            await client.query(`UPDATE requests SET status = 'aprovado' WHERE id = $1`, [demand.request_id]);
         }
     }
     
