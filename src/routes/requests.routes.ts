@@ -28,15 +28,17 @@ router.get('/', requirePermission('solicitacoes:view'), getRequests);
 router.get('/my', requirePermission('minhas_solicitacoes:view'), getMyRequests);
 
 // ➕ Criar um novo pedido (Feito pelo utilizador)
-// Requer permissão para adicionar em "Meus Pedidos"
-router.post('/', requirePermission('minhas_solicitacoes:add'), createRequest);
+// ⚠️ ALTERADO: Removido o bloqueio estrito de 'minhas_solicitacoes:add'
+// Assim, tanto quem tem acesso a "Meus Pedidos" quanto quem tem acesso apenas a "Solicitar Peças 3D" consegue gravar o pedido.
+// A segurança já é feita no Frontend (ocultando o botão de quem não tem permissão).
+router.post('/', createRequest);
 
 // ✏️ Atualizar o status do pedido (Aprovar, Rejeitar, Entregar)
 // Ação executada por quem gere as solicitações
 router.put('/:id/status', requirePermission('solicitacoes:edit'), updateRequestStatus);
 
 // 🗑️ Excluir / Cancelar um pedido
-// Permite ao utilizador apagar o próprio pedido (Nota: o controller deve validar se o status ainda é 'pendente')
+// Permite ao utilizador apagar o próprio pedido (Nota: o controller valida se o status ainda é 'pendente')
 router.delete('/:id', requirePermission('minhas_solicitacoes:delete'), deleteRequest);
 
 export default router;
