@@ -6,7 +6,7 @@ import {
   updateDemandStatus, 
   getProductions 
 } from '../controllers/producao3d.controller';
-import { authMiddleware } from '../middlewares/auth';
+import { authenticate } from '../middlewares/auth'; // Nome corrigido aqui
 
 const router = Router();
 
@@ -14,7 +14,7 @@ const router = Router();
  * 🛡️ Todas as rotas do módulo 3D exigem autenticação.
  * O middleware verifica o token JWT antes de permitir o acesso.
  */
-router.use(authMiddleware);
+router.use(authenticate); // Uso corrigido aqui
 
 // ==========================================
 // 🏗️ CATÁLOGO DE PEÇAS 3D (Lê da tabela Products)
