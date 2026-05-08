@@ -6,9 +6,9 @@ import { pool } from '../db';
 // ==========================================
 export const get3DParts = async (req: Request, res: Response) => {
   try {
-    // Busca apenas os produtos marcados como 3D na tabela principal
+    // CORREÇÃO: Trocamos 'code' por 'sku', e removemos 'category' que não existe no seu schema.
     const { rows } = await pool.query(`
-        SELECT id, code, name, image_url as image, production_minutes, filament_grams, category as material, description 
+        SELECT id, sku, name, image_url as image, production_minutes, filament_grams, description 
         FROM products 
         WHERE is_3d = true 
         ORDER BY name ASC
@@ -16,13 +16,19 @@ export const get3DParts = async (req: Request, res: Response) => {
     
     // Formata os nomes das variáveis para o frontend entender (camelCase)
     const formatted = rows.map(r => ({
-       id: r.id, code: r.code, name: r.name, image: r.image, 
-       productionMinutes: r.production_minutes, filamentGrams: r.filament_grams, 
-       material: r.material, description: r.description
+       id: r.id, 
+       code: r.sku || 'S/N', // O frontend usa 'code', então passamos o 'sku'
+       name: r.name, 
+       image: r.image, 
+       productionMinutes: r.production_minutes || 0, 
+       filamentGrams: r.filament_grams || 0, 
+       material: 'Padrão', // Como não existe coluna category, mandamos um texto padrão
+       description: r.description
     }));
     
     res.json(formatted);
   } catch (error) {
+    console.error("Erro detalhado no get3DParts:", error);
     res.status(500).json({ error: 'Erro ao buscar catálogo 3D' });
   }
 };
@@ -44,14 +50,11 @@ export const update3DPartDetails = async (req: Request, res: Response) => {
   }
 };
 
-
 // ==========================================
 // 2. DEMANDAS KANBAN (Conectado às Solicitações)
 // ==========================================
 export const getDemands = async (req: Request, res: Response) => {
   try {
-    // Busca as demandas e junta com o nome de quem pediu na tabela requests original
-    // CORRIGIDO: r.user_id alterado para r.requester_id
     const { rows } = await pool.query(`
         SELECT d.id, d.product_id as "partId", d.request_id as "requestId", d.quantity, 
                d.op_number as "opNumber", d.priority, d.status, d.notes, d.created_at as "createdAt",
@@ -101,7 +104,7 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
             );
         }
 
-        // 3. Muda o status da solicitação original do setor para "aprovado" (Pronta para Retirada no Almoxarifado)
+        // 3. Muda o status da solicitação original do setor para "aprovado"
         if (demand.request_id) {
             await client.query(`UPDATE requests SET status = 'aprovado' WHERE id = $1`, [demand.request_id]);
         }
@@ -118,12 +121,11 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
 };
 
 // ==========================================
-// 3. HISTÓRICO E REGISTO DE PRODUÇÃO
+// 3. HISTÓRICO E REGISTO DE PRODUÇÃO (COM ESTOQUE AUTOMÁTICO)
 // ==========================================
 
 export const getProductions = async (req: Request, res: Response) => {
   try {
-    // Adicionamos um LEFT JOIN para buscar o nome do operador na tabela profiles!
     const { rows } = await pool.query(`
       SELECT p3d.id, p3d.product_id as "partId", p3d.demand_id as "demandId", p3d.quantity, 
              p3d.total_minutes as "totalMinutes", p3d.filament_grams as "filamentGrams", 
@@ -142,11 +144,17 @@ export const getProductions = async (req: Request, res: Response) => {
 export const createProduction = async (req: Request, res: Response) => {
   const { partId, demandId, quantity, totalMinutes, filamentGrams, date } = req.body;
   
-  // A MÁGICA: Capturamos o ID do utilizador que fez a requisição
-  const operatorId = (req as any).user?.id; 
+  // Captura o ID do utilizador (com trava de segurança || null)
+  const operatorId = (req as any).user?.id || null; 
+  
+  // Usamos um client dedicado para garantir a Transação (Tudo ou Nada)
+  const client = await pool.connect();
   
   try {
-    const { rows } = await pool.query(`
+    await client.query('BEGIN'); // Inicia a transação
+
+    // 1. REGISTAR A PRODUÇÃO
+    const prodRes = await client.query(`
         INSERT INTO productions_3d 
         (product_id, demand_id, quantity, operator_id, total_minutes, filament_grams, date)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -155,20 +163,72 @@ export const createProduction = async (req: Request, res: Response) => {
                   date, operator_id as operator
     `, [partId, demandId || null, quantity, operatorId, totalMinutes, filamentGrams, date]);
     
-    res.status(201).json(rows[0]);
+    // 2. DAR ENTRADA NO ESTOQUE FÍSICO
+    // Usamos UPSERT: Se a peça não tiver registo no estoque, cria a linha. Se tiver, soma a quantidade.
+    await client.query(`
+        INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved)
+        VALUES ($1, $2, 0)
+        ON CONFLICT (product_id) 
+        DO UPDATE SET quantity_on_hand = COALESCE(stock.quantity_on_hand, 0) + $2
+    `, [partId, quantity]);
+
+    // 3. REGISTAR O HISTÓRICO DE MOVIMENTAÇÃO (Extrato)
+    const reason = demandId ? 'Produção 3D (Demanda Kanban)' : 'Produção 3D (Estoque Livre)';
+    await client.query(`
+        INSERT INTO stock_transactions (product_id, quantity, type, user_id, reason) 
+        VALUES ($1, $2, 'ENTRADA', $3, $4)
+    `, [partId, quantity, operatorId, reason]);
+
+    await client.query('COMMIT'); // Guarda tudo definitivamente!
+    res.status(201).json(prodRes.rows[0]);
+    
   } catch (error) {
-    console.error('Erro ao criar produção:', error);
+    await client.query('ROLLBACK'); // Se algo der erro, cancela tudo para não haver duplicados!
+    console.error('Erro ao criar produção e dar entrada no estoque:', error);
     res.status(500).json({ error: 'Erro ao registar produção 3D' });
+  } finally {
+    client.release(); // Devolve a conexão ao pool
   }
 };
 
 export const deleteProduction = async (req: Request, res: Response) => {
   const { id } = req.params;
+  const operatorId = (req as any).user?.id || null; 
+  const client = await pool.connect();
+
   try {
-    await pool.query('DELETE FROM productions_3d WHERE id = $1', [id]);
+    await client.query('BEGIN');
+
+    // 1. Descobrir qual era a peça e a quantidade produzida antes de apagar
+    const prodRes = await client.query('SELECT product_id, quantity FROM productions_3d WHERE id = $1', [id]);
+    if (prodRes.rows.length === 0) throw new Error("Produção não encontrada");
+    const { product_id, quantity } = prodRes.rows[0];
+
+    // 2. Apagar a produção
+    await client.query('DELETE FROM productions_3d WHERE id = $1', [id]);
+
+    // 3. Remover a quantidade correspondente do Estoque (Saída de correção)
+    // O GREATEST impede que o estoque fique negativo caso já tenham usado a peça
+    await client.query(`
+        UPDATE stock 
+        SET quantity_on_hand = GREATEST(COALESCE(quantity_on_hand, 0) - $2, 0)
+        WHERE product_id = $1
+    `, [product_id, quantity]);
+
+    // 4. Registar no histórico (Extrato) o cancelamento
+    await client.query(`
+        INSERT INTO stock_transactions (product_id, quantity, type, user_id, reason) 
+        VALUES ($1, $2, 'SAIDA', $3, 'Correção: Apagou registo de Produção 3D')
+    `, [product_id, quantity, operatorId]);
+
+    await client.query('COMMIT');
     res.json({ success: true });
+    
   } catch (error) {
-    console.error('Erro ao apagar produção:', error);
+    await client.query('ROLLBACK');
+    console.error('Erro ao apagar produção e reverter estoque:', error);
     res.status(500).json({ error: 'Erro ao apagar produção 3D' });
+  } finally {
+    client.release();
   }
 };
