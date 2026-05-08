@@ -123,20 +123,27 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
 
 export const getProductions = async (req: Request, res: Response) => {
   try {
+    // Adicionamos um LEFT JOIN para buscar o nome do operador na tabela profiles!
     const { rows } = await pool.query(`
-      SELECT id, product_id as "partId", demand_id as "demandId", quantity, 
-             total_minutes as "totalMinutes", filament_grams as "filamentGrams", 
-             date, operator_id as operator 
-      FROM productions_3d ORDER BY date ASC
+      SELECT p3d.id, p3d.product_id as "partId", p3d.demand_id as "demandId", p3d.quantity, 
+             p3d.total_minutes as "totalMinutes", p3d.filament_grams as "filamentGrams", 
+             p3d.date, pr.name as operator 
+      FROM productions_3d p3d
+      LEFT JOIN profiles pr ON p3d.operator_id = pr.id
+      ORDER BY p3d.date ASC
     `);
     res.json(rows);
   } catch (error) {
+    console.error('Erro ao buscar produções:', error);
     res.status(500).json({ error: 'Erro ao buscar produções' });
   }
 };
 
 export const createProduction = async (req: Request, res: Response) => {
-  const { partId, demandId, quantity, operator, totalMinutes, filamentGrams, date } = req.body;
+  const { partId, demandId, quantity, totalMinutes, filamentGrams, date } = req.body;
+  
+  // A MÁGICA: Capturamos o ID do utilizador que fez a requisição
+  const operatorId = (req as any).user?.id; 
   
   try {
     const { rows } = await pool.query(`
@@ -146,7 +153,7 @@ export const createProduction = async (req: Request, res: Response) => {
         RETURNING id, product_id as "partId", demand_id as "demandId", quantity, 
                   total_minutes as "totalMinutes", filament_grams as "filamentGrams", 
                   date, operator_id as operator
-    `, [partId, demandId || null, quantity, operator, totalMinutes, filamentGrams, date]);
+    `, [partId, demandId || null, quantity, operatorId, totalMinutes, filamentGrams, date]);
     
     res.status(201).json(rows[0]);
   } catch (error) {
