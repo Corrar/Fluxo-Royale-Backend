@@ -1,12 +1,15 @@
+// src/routes/producao3d.routes.ts
 import { Router } from 'express';
 import { 
   get3DParts, 
   update3DPartDetails, 
   getDemands, 
   updateDemandStatus, 
-  getProductions 
+  getProductions,
+  createProduction, // <-- ADICIONADO: Importação da função de criar
+  deleteProduction  // <-- ADICIONADO: Importação da função de apagar
 } from '../controllers/producao3d.controller';
-import { authenticate } from '../middlewares/auth'; // Nome corrigido aqui
+import { authenticate } from '../middlewares/auth';
 
 const router = Router();
 
@@ -14,7 +17,7 @@ const router = Router();
  * 🛡️ Todas as rotas do módulo 3D exigem autenticação.
  * O middleware verifica o token JWT antes de permitir o acesso.
  */
-router.use(authenticate); // Uso corrigido aqui
+router.use(authenticate);
 
 // ==========================================
 // 🏗️ CATÁLOGO DE PEÇAS 3D (Lê da tabela Products)
@@ -42,5 +45,11 @@ router.put('/demands/:id/status', updateDemandStatus);
 
 // Busca os dados de produções finalizadas para gerar os gráficos
 router.get('/productions', getProductions);
+
+// 🚀 REGISTRA uma nova produção e dá entrada automática no estoque
+router.post('/productions', createProduction);
+
+// 🗑️ REMOVE um registro de produção e reverte a quantidade no estoque
+router.delete('/productions/:id', deleteProduction);
 
 export default router;
