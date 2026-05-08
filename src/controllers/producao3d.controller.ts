@@ -117,16 +117,51 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
   }
 };
 
+// ==========================================
+// 3. HISTÓRICO E REGISTO DE PRODUÇÃO
+// ==========================================
+
 export const getProductions = async (req: Request, res: Response) => {
-    try {
-      const { rows } = await pool.query(`
-        SELECT id, product_id as "partId", demand_id as "demandId", quantity, 
-               total_minutes as "totalMinutes", filament_grams as "filamentGrams", 
-               date, operator_id as operator 
-        FROM productions_3d ORDER BY date ASC
-      `);
-      res.json(rows);
-    } catch (error) {
-      res.status(500).json({ error: 'Erro ao buscar produções' });
-    }
-  };
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, product_id as "partId", demand_id as "demandId", quantity, 
+             total_minutes as "totalMinutes", filament_grams as "filamentGrams", 
+             date, operator_id as operator 
+      FROM productions_3d ORDER BY date ASC
+    `);
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao buscar produções' });
+  }
+};
+
+export const createProduction = async (req: Request, res: Response) => {
+  const { partId, demandId, quantity, operator, totalMinutes, filamentGrams, date } = req.body;
+  
+  try {
+    const { rows } = await pool.query(`
+        INSERT INTO productions_3d 
+        (product_id, demand_id, quantity, operator_id, total_minutes, filament_grams, date)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id, product_id as "partId", demand_id as "demandId", quantity, 
+                  total_minutes as "totalMinutes", filament_grams as "filamentGrams", 
+                  date, operator_id as operator
+    `, [partId, demandId || null, quantity, operator, totalMinutes, filamentGrams, date]);
+    
+    res.status(201).json(rows[0]);
+  } catch (error) {
+    console.error('Erro ao criar produção:', error);
+    res.status(500).json({ error: 'Erro ao registar produção 3D' });
+  }
+};
+
+export const deleteProduction = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  try {
+    await pool.query('DELETE FROM productions_3d WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Erro ao apagar produção:', error);
+    res.status(500).json({ error: 'Erro ao apagar produção 3D' });
+  }
+};
