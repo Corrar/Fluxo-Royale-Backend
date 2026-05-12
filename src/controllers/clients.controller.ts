@@ -1,3 +1,5 @@
+// src/controllers/clients.controller.ts
+
 import { Request, Response } from 'express';
 import { pool } from '../db';
 
@@ -11,7 +13,24 @@ export const getClients = async (req: Request, res: Response) => {
                      'id', s.id, 
                      'op_code', s.op_code, 
                      'description', s.description, 
-                     'status', s.status
+                     'status', s.status,
+                     'total_cost', (
+                        -- Cálculo: (Custo Total das Saídas) - (Custo Total das Devoluções)
+                        COALESCE((
+                          SELECT SUM(si.quantity * p.unit_price)
+                          FROM separations sep
+                          JOIN separation_items si ON sep.id = si.separation_id
+                          JOIN products p ON si.product_id = p.id
+                          WHERE sep.client_service_id = s.id AND sep.status = 'concluida'
+                        ), 0)
+                        -
+                        COALESCE((
+                          SELECT SUM(r.quantity * p.unit_price)
+                          FROM op_returns r
+                          JOIN products p ON r.product_id = p.id
+                          WHERE r.client_service_id = s.id
+                        ), 0)
+                     )
                    )
                  ) FILTER (WHERE s.id IS NOT NULL), '[]'::json
                ) as services
@@ -170,6 +189,12 @@ export const transferServiceData = async (req: Request, res: Response) => {
        SET client_service_id = $1, production_order = $2 
        WHERE client_service_id = $3 OR production_order = $4`, 
       [targetServiceId, targetOpCode, serviceId, oldOpCode]
+    );
+
+    // 5. Move também as Devoluções feitas! (NOVO)
+    await client.query(
+      `UPDATE op_returns SET client_service_id = $1 WHERE client_service_id = $2`, 
+      [targetServiceId, serviceId]
     );
 
     await client.query('COMMIT');
