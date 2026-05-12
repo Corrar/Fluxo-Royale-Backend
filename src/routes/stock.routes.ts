@@ -1,3 +1,5 @@
+// src/routes/stock.routes.ts
+
 import { Router } from 'express';
 import { authenticate } from '../middlewares/auth';
 import { 
@@ -5,7 +7,9 @@ import {
   getStockReservations, 
   updateStock, 
   manualEntry, 
-  manualWithdrawal 
+  manualWithdrawal,
+  getOpMaterialsForReturn, // <-- ADICIONADO
+  registerReturn           // <-- ADICIONADO
 } from '../controllers/stock.controller';
 
 const router = Router();
@@ -14,7 +18,6 @@ const router = Router();
  * 🔒 MIDDLEWARE GLOBAL DA ROTA
  * O 'router.use(authenticate)' garante que todas as requisições que 
  * passarem por este arquivo exijam um token válido.
- * Isso protege os dados de estoque contra acessos externos não autorizados.
  */
 router.use(authenticate);
 
@@ -44,7 +47,6 @@ router.put('/:id', updateStock);
 
 // =========================================================================
 // ROTAS DE TRANSAÇÕES MANUAIS
-// (Agrupadas aqui pela relação íntima com a alteração do estoque físico)
 // =========================================================================
 
 /**
@@ -57,9 +59,26 @@ router.post('/manual-entry', manualEntry);
 /**
  * @route POST /stock/manual-withdrawal
  * @description Registra a saída/retirada de produtos (subtrai do físico).
- * Pode incluir um código de Ordem de Produção (op_code).
  * @body { sector: string, op_code?: string, items: Array<{ product_id: string, quantity: number }> }
  */
 router.post('/manual-withdrawal', manualWithdrawal);
+
+// =========================================================================
+// ROTAS DE DEVOLUÇÕES (OP)
+// =========================================================================
+
+/**
+ * @route GET /stock/returns/op/:opCode
+ * @description Busca os materiais que foram retirados para uma OP e podem ser devolvidos.
+ * @param {string} opCode - O código da Ordem de Produção.
+ */
+router.get('/returns/op/:opCode', getOpMaterialsForReturn);
+
+/**
+ * @route POST /stock/returns
+ * @description Efetiva a devolução de materiais de uma OP ao armazém (atualiza op_returns e stock).
+ * @body { op_code: string, returns: Array<{ product_id: string, quantity: number, observation?: string }> }
+ */
+router.post('/returns', registerReturn);
 
 export default router;
