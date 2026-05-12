@@ -299,3 +299,110 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
     client.release(); 
   }
 };
+
+// =========================================================================
+// DEVOLUÇÕES DE ORDEM DE PRODUÇÃO (OP)
+// =========================================================================
+
+export const getOpMaterialsForReturn = async (req: Request, res: Response) => {
+  const { opCode } = req.params;
+
+  try {
+    // Esta query SQL faz a magia toda: 
+    // 1. Acha a OP. 2. Soma o que saiu. 3. Subtrai o que já foi devolvido na op_returns.
+    const query = `
+      WITH OPData AS (
+          SELECT id FROM client_services WHERE op_code = $1
+      ),
+      Withdrawn AS (
+          SELECT 
+              si.product_id,
+              p.name,
+              p.sku,
+              SUM(si.quantity) as total_withdrawn
+          FROM separations s
+          JOIN separation_items si ON s.id = si.separation_id
+          JOIN products p ON si.product_id = p.id
+          WHERE s.client_service_id = (SELECT id FROM OPData)
+          GROUP BY si.product_id, p.name, p.sku
+      ),
+      Returned AS (
+          SELECT 
+              product_id, 
+              SUM(quantity) as total_returned
+          FROM op_returns
+          WHERE client_service_id = (SELECT id FROM OPData)
+          GROUP BY product_id
+      )
+      SELECT 
+          w.product_id,
+          w.name,
+          w.sku,
+          w.total_withdrawn,
+          COALESCE(r.total_returned, 0) as total_returned,
+          (w.total_withdrawn - COALESCE(r.total_returned, 0)) as available_to_return
+      FROM Withdrawn w
+      LEFT JOIN Returned r ON w.product_id = r.product_id
+      WHERE (w.total_withdrawn - COALESCE(r.total_returned, 0)) > 0;
+    `;
+
+    const result = await pool.query(query, [opCode]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Nenhum material disponível para devolução nesta OP.' });
+    }
+
+    res.json(result.rows);
+  } catch (error: any) {
+    console.error('Erro ao buscar materiais da OP:', error);
+    res.status(500).json({ error: 'Erro interno ao processar a busca da OP.' });
+  }
+};
+
+export const registerReturn = async (req: Request, res: Response) => {
+  const { op_code, returns } = req.body; 
+  const userId = (req as any).user.id; 
+
+  const client = await pool.connect(); // Iniciamos uma transação segura
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Procurar o ID interno da OP
+    const opResult = await client.query('SELECT id FROM client_services WHERE op_code = $1', [op_code]);
+    if (opResult.rows.length === 0) throw new Error('OP não encontrada no sistema.');
+    const client_service_id = opResult.rows[0].id;
+
+    for (const item of returns) {
+      if (!item.product_id || !item.quantity || item.quantity <= 0) {
+        throw new Error('Quantidade inválida para devolução.');
+      }
+
+      // 2. Inserir o registo na nossa nova tabela op_returns
+      await client.query(`
+          INSERT INTO op_returns (client_service_id, product_id, quantity, user_id, observation)
+          VALUES ($1, $2, $3, $4, $5)
+      `, [client_service_id, item.product_id, item.quantity, userId, item.observation]);
+
+      // 3. Devolver a quantidade ao stock (somar ao físico)
+      await client.query(`
+          UPDATE stock 
+          SET quantity_on_hand = quantity_on_hand + $1
+          WHERE product_id = $2
+      `, [item.quantity, item.product_id]);
+    }
+
+    // 4. Salvar tudo nos Logs de Auditoria
+    await createLog(userId, 'OP_RETURN', { op_code, itemsReturned: returns.length }, getClientIp(req), client);
+
+    await client.query('COMMIT'); // Sucesso! Guarda as alterações na base de dados.
+    res.status(201).json({ success: true, message: 'Devolução registada com sucesso!' });
+
+  } catch (error: any) {
+    await client.query('ROLLBACK'); // Se algo falhar, desfazemos tudo para não corromper o stock!
+    console.error('Erro ao registar devolução:', error);
+    res.status(400).json({ error: error.message || 'Erro ao processar devolução.' });
+  } finally {
+    client.release(); // Libertamos a ligação para o servidor não bloquear
+  }
+};
