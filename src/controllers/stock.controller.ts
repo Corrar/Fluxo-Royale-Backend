@@ -301,15 +301,13 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
 };
 
 // =========================================================================
-// DEVOLUÇÕES DE ORDEM DE PRODUÇÃO (OP)
+// DEVOLUÇÕES DE ORDEM DE PRODUÇÃO (OP) E NOVA ENTRADA EM LOTE (ENTRIES)
 // =========================================================================
 
 export const getOpMaterialsForReturn = async (req: Request, res: Response) => {
   const { opCode } = req.params;
 
   try {
-    // Esta query SQL faz a magia toda: 
-    // 1. Acha a OP. 2. Soma o que saiu. 3. Subtrai o que já foi devolvido na op_returns.
     const query = `
       WITH OPData AS (
           SELECT id FROM client_services WHERE op_code = $1
@@ -363,12 +361,11 @@ export const registerReturn = async (req: Request, res: Response) => {
   const { op_code, returns } = req.body; 
   const userId = (req as any).user.id; 
 
-  const client = await pool.connect(); // Iniciamos uma transação segura
+  const client = await pool.connect();
 
   try {
     await client.query('BEGIN');
 
-    // 1. Procurar o ID interno da OP
     const opResult = await client.query('SELECT id FROM client_services WHERE op_code = $1', [op_code]);
     if (opResult.rows.length === 0) throw new Error('OP não encontrada no sistema.');
     const client_service_id = opResult.rows[0].id;
@@ -378,13 +375,11 @@ export const registerReturn = async (req: Request, res: Response) => {
         throw new Error('Quantidade inválida para devolução.');
       }
 
-      // 2. Inserir o registo na nossa nova tabela op_returns
       await client.query(`
           INSERT INTO op_returns (client_service_id, product_id, quantity, user_id, observation)
           VALUES ($1, $2, $3, $4, $5)
       `, [client_service_id, item.product_id, item.quantity, userId, item.observation]);
 
-      // 3. Devolver a quantidade ao stock (somar ao físico)
       await client.query(`
           UPDATE stock 
           SET quantity_on_hand = quantity_on_hand + $1
@@ -392,17 +387,75 @@ export const registerReturn = async (req: Request, res: Response) => {
       `, [item.quantity, item.product_id]);
     }
 
-    // 4. Salvar tudo nos Logs de Auditoria
     await createLog(userId, 'OP_RETURN', { op_code, itemsReturned: returns.length }, getClientIp(req), client);
 
-    await client.query('COMMIT'); // Sucesso! Guarda as alterações na base de dados.
+    await client.query('COMMIT'); 
     res.status(201).json({ success: true, message: 'Devolução registada com sucesso!' });
 
   } catch (error: any) {
-    await client.query('ROLLBACK'); // Se algo falhar, desfazemos tudo para não corromper o stock!
+    await client.query('ROLLBACK'); 
     console.error('Erro ao registar devolução:', error);
     res.status(400).json({ error: error.message || 'Erro ao processar devolução.' });
   } finally {
-    client.release(); // Libertamos a ligação para o servidor não bloquear
+    client.release();
+  }
+};
+
+// =========================================================================
+// NOVO ENDPOINT: ENTRADA DE STOCK EM LOTE (USADO PELOS NOVOS PAINÉIS DE ENTRADA)
+// =========================================================================
+
+export const registerEntries = async (req: Request, res: Response) => {
+  const { entries } = req.body;
+  const userId = (req as any).user.id; 
+
+  if (!entries || !Array.isArray(entries) || entries.length === 0) {
+    return res.status(400).json({ error: 'Nenhuma entrada fornecida.' });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    for (const entry of entries) {
+      const { product_id, quantity, type, observation } = entry;
+
+      if (!product_id || !quantity) {
+        throw new Error("Item inválido, falta Produto ou Quantidade.");
+      }
+
+      // 1. Atualiza a tabela Stock (Soma a quantidade física disponível)
+      await client.query(`
+        UPDATE stock 
+        SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 
+        WHERE product_id = $2
+      `, [quantity, product_id]);
+
+      // 2. Insere opcionalmente um registo (dependendo se usas uma tabela de log de entradas)
+      // Usaremos o sistema central de Logs que já tens para ficar o rastreio.
+    }
+
+    // 3. Regista Log de Auditoria
+    await createLog(userId, 'STOCK_ENTRY', { type: entries[0]?.type, totalItems: entries.length }, getClientIp(req), client);
+
+    await client.query('COMMIT');
+
+    // Notificações Push
+    if ((req as any).io) {
+      (req as any).io.to('compras').emit('new_request_notification', { 
+        message: '📦 Nova Entrada/Reaproveitamento de Stock registada!', 
+        action: 'Ver Estoque', 
+        type: 'entrada' 
+      });
+    }
+
+    res.status(201).json({ success: true, message: 'Entradas registadas com sucesso.' });
+  } catch (error: any) {
+    await client.query('ROLLBACK');
+    console.error('Erro ao registar lote de entradas:', error);
+    res.status(500).json({ error: error.message || 'Erro interno ao registar as entradas.' });
+  } finally {
+    client.release();
   }
 };
