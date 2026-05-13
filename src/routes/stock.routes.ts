@@ -8,8 +8,9 @@ import {
   updateStock, 
   manualEntry, 
   manualWithdrawal,
-  getOpMaterialsForReturn, // <-- ADICIONADO
-  registerReturn           // <-- ADICIONADO
+  getOpMaterialsForReturn, 
+  registerReturn,
+  registerEntries // <-- ADICIONADO AQUI: A nova função do controller
 } from '../controllers/stock.controller';
 
 const router = Router();
@@ -46,7 +47,7 @@ router.get('/:id/reservations', getStockReservations);
 router.put('/:id', updateStock);
 
 // =========================================================================
-// ROTAS DE TRANSAÇÕES MANUAIS
+// ROTAS DE TRANSAÇÕES MANUAIS E EM LOTE
 // =========================================================================
 
 /**
@@ -63,8 +64,15 @@ router.post('/manual-entry', manualEntry);
  */
 router.post('/manual-withdrawal', manualWithdrawal);
 
+/**
+ * @route POST /stock/entries
+ * @description Registra entradas de lote vindas dos novos painéis (NFe, Reaproveitamentos).
+ * @body { entries: Array<{ product_id: string, quantity: number, type: string, observation?: string }> }
+ */
+router.post('/entries', registerEntries); // <-- ADICIONADO AQUI: O Endpoint que faltava!
+
 // =========================================================================
-// ROTAS DE DEVOLUÇÕES (OP)
+// ROTAS DE DEூடOLUÇÕES (OP)
 // =========================================================================
 
 /**
