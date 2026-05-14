@@ -418,6 +418,17 @@ export const registerEntries = async (req: Request, res: Response) => {
   try {
     await client.query('BEGIN');
 
+    // 1. 🟢 MAGIA AQUI: Criamos o log de cabeçalho na tabela xml_logs para o Reports.tsx poder ler!
+    const typeLabel = entries[0]?.type === 'REAPROVEITAMENTO' ? '♻️ Reaproveitamento' : '📦 Entrada NFe';
+    
+    // Gravamos com a data e hora para ficar perfeitamente alinhado na linha temporal do Dashboard
+    const logRes = await client.query(
+      "INSERT INTO xml_logs (file_name, success, total_items) VALUES ($1, $2, $3) RETURNING id", 
+      [`${typeLabel} - ${new Date().toLocaleString('pt-BR')}`, true, entries.length]
+    );
+
+    const logId = logRes.rows[0].id;
+
     for (const entry of entries) {
       const { product_id, quantity, type, observation } = entry;
 
@@ -425,18 +436,21 @@ export const registerEntries = async (req: Request, res: Response) => {
         throw new Error("Item inválido, falta Produto ou Quantidade.");
       }
 
-      // 1. Atualiza a tabela Stock (Soma a quantidade física disponível)
+      // 2. Atualiza a tabela Stock (Soma a quantidade física disponível)
       await client.query(`
         UPDATE stock 
         SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 
         WHERE product_id = $2
       `, [quantity, product_id]);
 
-      // 2. Insere opcionalmente um registo (dependendo se usas uma tabela de log de entradas)
-      // Usaremos o sistema central de Logs que já tens para ficar o rastreio.
+      // 3. 🟢 MAGIA AQUI: Inserimos o item na tabela xml_items, conectada ao log
+      await client.query(
+        "INSERT INTO xml_items (xml_log_id, product_id, quantity) VALUES ($1, $2, $3)", 
+        [logId, product_id, quantity]
+      );
     }
 
-    // 3. Regista Log de Auditoria
+    // 4. Regista Log de Auditoria
     await createLog(userId, 'STOCK_ENTRY', { type: entries[0]?.type, totalItems: entries.length }, getClientIp(req), client);
 
     await client.query('COMMIT');
