@@ -47,6 +47,7 @@ export const getManagerialReports = async (req: Request, res: Response) => {
       WHERE s.status IN ('entregue', 'finalizada', 'concluida') 
       GROUP BY p.name ORDER BY total DESC LIMIT 5`;
 
+    // 🟢 CORRIGIDO AQUI: xl.created_at
     const historyQuery = `
       WITH months AS (
         SELECT generate_series(date_trunc('month', CURRENT_DATE) - INTERVAL '5 months', date_trunc('month', CURRENT_DATE), '1 month'::interval) as month
@@ -80,9 +81,12 @@ export const getManagerialReports = async (req: Request, res: Response) => {
  */
 export const getRecentTransactions = async (req: Request, res: Response) => {
   try {
+    // 🟢 CORRIGIDO AQUI: xl.created_at em vez de xi.created_at
     const query = `
-      SELECT xi.id::text as id, 'in' as type, p.name as product_name, p.sku as product_sku, xi.quantity as amount, xi.created_at 
-      FROM xml_items xi JOIN products p ON xi.product_id = p.id
+      SELECT xi.id::text as id, 'in' as type, p.name as product_name, p.sku as product_sku, xi.quantity as amount, xl.created_at 
+      FROM xml_items xi 
+      JOIN products p ON xi.product_id = p.id
+      JOIN xml_logs xl ON xi.xml_log_id = xl.id
       UNION ALL 
       SELECT si.id::text as id, 'out' as type, p.name as product_name, p.sku as product_sku, si.quantity as amount, COALESCE(s.sent_at, s.created_at) as created_at 
       FROM separation_items si 
@@ -109,10 +113,11 @@ export const getRecentTransactions = async (req: Request, res: Response) => {
  */
 export const getAvailableDates = async (req: Request, res: Response) => {
   try {
+    // 🟢 CORRIGIDO AQUI: Buscar as datas ao xml_logs (xl.created_at) e não xml_items
     const result = await pool.query(`
       SELECT MIN(data) as min_date, MAX(data) as max_date 
       FROM (
-        SELECT created_at as data FROM xml_items 
+        SELECT created_at as data FROM xml_logs 
         UNION ALL 
         SELECT COALESCE(sent_at, created_at) as data FROM separations WHERE status IN ('entregue', 'finalizada', 'concluida') 
         UNION ALL 
@@ -128,7 +133,6 @@ export const getAvailableDates = async (req: Request, res: Response) => {
  * Gera relatórios detalhados de Entradas, Saídas e Stock.
  */
 export const getGeneralReports = async (req: Request, res: Response) => {
-  // 🟢 CAPTURA DO NOVO PARÂMETRO
   const { startDate, endDate, includeAllTimeOps } = req.query;
   
   if (!startDate || !endDate) return res.status(400).json({ error: 'Datas obrigatórias' });
@@ -137,13 +141,15 @@ export const getGeneralReports = async (req: Request, res: Response) => {
   const end = `${endDate} 23:59:59`;
 
   try {
+    // 🟢 CORREÇÃO CRÍTICA AQUI: Filtrar pela data do LOG (xl.created_at) em vez do item (xi.created_at)
+    // TAMBÉM GARANTIMOS QUE O CAMPO "origem_nome" E "origem" SÃO LIDOS PARA O REPORTS.TSX RECONHECER O REUSO!
     const entradasRes = await pool.query(`
-      SELECT xi.created_at as data, 'Entrada' as tipo, xl.file_name as origem, p.name as produto, p.sku, p.unit as unidade, xi.quantity as quantidade 
+      SELECT xl.created_at as data, 'Entrada' as tipo, xl.file_name as origem, xl.file_name as origem_nome, p.name as produto, p.sku, p.unit as unidade, xi.quantity as quantidade 
       FROM xml_items xi 
       JOIN products p ON xi.product_id = p.id 
       JOIN xml_logs xl ON xi.xml_log_id = xl.id 
-      WHERE xi.created_at >= $1 AND xi.created_at <= $2 
-      ORDER BY xi.created_at DESC`, [start, end]);
+      WHERE xl.created_at >= $1 AND xl.created_at <= $2 
+      ORDER BY xl.created_at DESC`, [start, end]);
     
     const separacoesRes = await pool.query(`
       SELECT COALESCE(s.sent_at, s.created_at) as data, 
@@ -181,13 +187,14 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       AND r.status IN ('aprovado', 'entregue') 
       ORDER BY r.created_at DESC`, [start, end]);
     
+    // 🟢 CORREÇÃO: Puxar a data do xl.created_at
     const estoqueRes = await pool.query(`
       SELECT p.name as produto, p.sku, 
              COALESCE(CAST(NULLIF(CAST(s.quantity_on_hand AS TEXT), '') AS NUMERIC), 0) as quantidade, 
              COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco, 
              COALESCE(CAST(NULLIF(CAST(p.min_stock AS TEXT), '') AS NUMERIC), 0) as estoque_minimo, 
              GREATEST(
-               (SELECT MAX(created_at)::timestamp FROM xml_items WHERE product_id = p.id), 
+               (SELECT MAX(xl.created_at)::timestamp FROM xml_items xi JOIN xml_logs xl ON xi.xml_log_id = xl.id WHERE xi.product_id = p.id), 
                (SELECT MAX(COALESCE(sep.sent_at, sep.created_at))::timestamp FROM separation_items si 
                 JOIN separations sep ON si.separation_id = sep.id 
                 WHERE sep.status IN ('entregue', 'finalizada', 'concluida') AND si.product_id = p.id), 
@@ -198,16 +205,14 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       FROM stock s 
       JOIN products p ON s.product_id = p.id WHERE p.active = true`);
     
+    // 🟢 CORREÇÃO: Comparativo do mês passado também usa xl.created_at
     const comparativoRes = await pool.query(`
       SELECT 
-        (SELECT COUNT(*) FROM xml_items xi WHERE xi.created_at >= $1::timestamp - INTERVAL '1 month' AND xi.created_at <= $2::timestamp - INTERVAL '1 month') as entradas_ant, 
+        (SELECT COUNT(*) FROM xml_items xi JOIN xml_logs xl ON xi.xml_log_id = xl.id WHERE xl.created_at >= $1::timestamp - INTERVAL '1 month' AND xl.created_at <= $2::timestamp - INTERVAL '1 month') as entradas_ant, 
         ((SELECT COUNT(*) FROM separation_items si JOIN separations sep ON si.separation_id = sep.id WHERE COALESCE(sep.sent_at, sep.created_at) >= $1::timestamp - INTERVAL '1 month' AND COALESCE(sep.sent_at, sep.created_at) <= $2::timestamp - INTERVAL '1 month' AND sep.status IN ('entregue', 'finalizada', 'concluida')) + 
          (SELECT COUNT(*) FROM request_items ri JOIN requests req ON ri.request_id = req.id WHERE req.created_at >= $1::timestamp - INTERVAL '1 month' AND req.created_at <= $2::timestamp - INTERVAL '1 month' AND req.status IN ('aprovado', 'entregue'))) as saidas_ant`, 
       [start, end]);
 
-    // =========================================================================
-    // 🟢 NOVO: BUSCA ATEMPORAL DE OPs PARA O RELATÓRIO (IGNORA MÊS)
-    // =========================================================================
     let saidas_ops_all_time: any[] | null = null;
     
     if (includeAllTimeOps === 'true') {
@@ -248,7 +253,6 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       const resultOps = await pool.query(opsQuery);
       saidas_ops_all_time = resultOps.rows;
     }
-    // =========================================================================
     
     res.json({ 
       entradas: entradasRes.rows, 
@@ -259,7 +263,7 @@ export const getGeneralReports = async (req: Request, res: Response) => {
         entradas: parseInt(comparativoRes.rows[0].entradas_ant || '0'), 
         saidas: parseInt(comparativoRes.rows[0].saidas_ant || '0') 
       },
-      saidas_ops_all_time // 🟢 RETORNO ADICIONADO PARA O FRONTEND
+      saidas_ops_all_time 
     });
   } catch (error: any) { 
     res.status(500).json({ error: 'Erro ao gerar relatórios: ' + error.message }); 
