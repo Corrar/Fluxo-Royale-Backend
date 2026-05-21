@@ -186,6 +186,22 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       WHERE r.created_at >= $1 AND r.created_at <= $2 
       AND r.status IN ('aprovado', 'entregue') 
       ORDER BY r.created_at DESC`, [start, end]);
+      
+    // 🟢 ADICIONADO AQUI: Consulta as Reposições concluídas no período
+    const reposicoesRes = await pool.query(`
+      SELECT rep.created_at as data, 'Saída - Reposição' as tipo, 
+             'Cliente: ' || COALESCE(rep.client_name, 'N/A') as destino_setor, 
+             NULL as op_code, rep.client_name as solicitante, 
+             p.name as produto, p.sku, p.unit as unidade, 
+             ri.quantity as quantidade, 
+             rep.status, 
+             COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario 
+      FROM replenishment_items ri 
+      JOIN replenishments rep ON ri.replenishment_id = rep.id 
+      LEFT JOIN products p ON ri.product_id = p.id 
+      WHERE rep.created_at >= $1 AND rep.created_at <= $2 
+      AND rep.status = 'concluido' 
+      ORDER BY rep.created_at DESC`, [start, end]);
     
     // 🟢 CORREÇÃO: Puxar a data do xl.created_at
     const estoqueRes = await pool.query(`
@@ -254,10 +270,12 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       saidas_ops_all_time = resultOps.rows;
     }
     
+    // 🟢 ADICIONADO: A variável `saidas_reposicoes` na resposta para o Frontend
     res.json({ 
       entradas: entradasRes.rows, 
       saidas_separacoes: separacoesRes.rows, 
       saidas_solicitacoes: solicitacoesRes.rows, 
+      saidas_reposicoes: reposicoesRes.rows, 
       estoque: estoqueRes.rows, 
       comparativo_mes_anterior: { 
         entradas: parseInt(comparativoRes.rows[0].entradas_ant || '0'), 
