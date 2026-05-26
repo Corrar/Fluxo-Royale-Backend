@@ -243,8 +243,15 @@ export const createRequest = async (req: Request, res: Response) => {
     if ((req as any).io) {
         const notificationData = { id: `req-${requestId}-${Date.now()}`, message: `📢 Nova solicitação do setor: ${sector}`, action: 'Ver Pedidos', type: 'solicitacao' };
         (req as any).io.to(['almoxarife', 'admin', 'escritorio']).emit('new_request_notification', notificationData);
+        
+        // 🟢 Otimização: O front-end já captura 'new_request' e adiciona no topo da lista. (Correto)
         (req as any).io.to(['almoxarife', 'admin', 'escritorio']).emit('new_request', fullReqRows[0]);
-        (req as any).io.emit('refresh_stock'); 
+        
+        // 🟢 Otimização: Em vez de 'refresh_stock', enviamos os produtos específicos alterados.
+        const changedProducts = sortedItems.map(item => item.product_id).filter(id => id && id !== 'custom');
+        if (changedProducts.length > 0) {
+            (req as any).io.emit('stock_updated', { changedProducts }); 
+        }
     }
 
     const dataAtual = new Date();
@@ -360,7 +367,16 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     
     await client.query('COMMIT');
 
-    if ((req as any).io) { (req as any).io.emit('refresh_requests'); (req as any).io.emit('refresh_stock'); }
+    // 🟢 Otimização: Enviamos APENAS os dados atualizados em vez do comando cego de recarga
+    if ((req as any).io) { 
+        (req as any).io.emit('request_updated', { id, status, rejection_reason }); 
+        
+        const changedProducts = itemsRes.rows.map(item => item.product_id).filter(id => id);
+        if (changedProducts.length > 0) {
+            (req as any).io.emit('stock_updated', { changedProducts });
+        }
+    }
+    
     res.json({ success: true });
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch(e) {}
@@ -383,9 +399,10 @@ export const deleteRequest = async (req: Request, res: Response) => {
 
     if (status === 'rejeitado' || status === 'entregue' || status === 'devolvido') throw new Error('Não é possível cancelar no estado atual.');
     
+    let itemsRes: any;
     if (status === 'aberto' || status === 'aprovado') {
        // Puxa o status is_3d também para não tentar cancelar reservas de algo que nunca foi reservado
-       const itemsRes = await client.query('SELECT ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1', [id]);
+       itemsRes = await client.query('SELECT ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1', [id]);
        for (const item of itemsRes.rows) {
          if (item.product_id && !item.is_3d) {
             const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
@@ -402,7 +419,18 @@ export const deleteRequest = async (req: Request, res: Response) => {
     await createLog(userId, 'CANCELAR_SOLICITACAO', { id_solicitacao: id, status_anterior: status }, getClientIp(req), client);
     await client.query('COMMIT');
     
-    if ((req as any).io) { (req as any).io.emit('refresh_requests'); (req as any).io.emit('refresh_stock'); }
+    // 🟢 Otimização: Evitar 'refresh' forçado. Avisar qual pedido mudou e quais produtos afetaram o stock.
+    if ((req as any).io) { 
+        (req as any).io.emit('request_updated', { id, status: 'rejeitado', rejection_reason: 'Cancelado pelo usuário/sistema' }); 
+        
+        if (itemsRes && itemsRes.rows) {
+            const changedProducts = itemsRes.rows.map((item: any) => item.product_id).filter((id: any) => id);
+            if (changedProducts.length > 0) {
+                (req as any).io.emit('stock_updated', { changedProducts });
+            }
+        }
+    }
+    
     res.json({ success: true, message: 'Pedido cancelado.' });
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch(e) {}
