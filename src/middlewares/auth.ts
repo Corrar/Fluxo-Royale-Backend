@@ -56,7 +56,7 @@ export const authorizeRole = (allowedRoles: string[]) => {
 };
 
 /**
- * Middleware 3: O GUARDIÃO GRANULAR
+ * Middleware 3: O GUARDIÃO GRANULAR ROBUSTO (Com Raio-X)
  * Verifica se o utilizador possui a ação exata na Matriz de Permissões.
  * Exemplo de uso: requirePermission('produtos:delete')
  */
@@ -70,27 +70,51 @@ export const requirePermission = (requiredAction: string) => {
         return res.status(401).json({ error: 'Utilizador não identificado na requisição.' });
       }
 
+      // 🛡️ Padroniza o cargo para evitar erros de letras maiúsculas/minúsculas ou espaços
+      const safeRole = userRole.toLowerCase().trim();
+
       // 1. A Regra de Ouro: Administradores têm acesso total ao sistema
-      if (userRole === 'admin') {
+      if (safeRole === 'admin') {
         return next();
       }
 
-      // 2. Consulta ao banco de dados em tempo real (Garante que permissões revogadas tenham efeito imediato na API)
+      // 2. Consulta ao banco de dados em tempo real (Garante que permissões revogadas tenham efeito imediato)
+      // Usamos LOWER(role) para garantir que comparações na base de dados não falham por maiúsculas
       const permRes = await pool.query(`
-        SELECT page_key FROM role_permissions WHERE role = $1
+        SELECT page_key FROM role_permissions WHERE LOWER(role) = $1
         UNION
         SELECT page_key FROM user_permissions WHERE user_id = $2
-      `, [userRole, userId]);
+      `, [safeRole, userId]);
 
-      // Transforma o resultado num array simples: ['produtos:view', 'produtos:edit', ...]
-      const userPermissions = permRes.rows.map(r => r.page_key);
+      // 3. Higienização dos Dados (Evita erros de arrays do PostgreSQL ou espaços extras)
+      let userPermissions: string[] = [];
 
-      // 3. Verificação de Segurança
-      if (userPermissions.includes(requiredAction)) {
+      permRes.rows.forEach(row => {
+        if (Array.isArray(row.page_key)) {
+          // Se o banco retornar um array JSON
+          const cleanArray = row.page_key.map((p: string) => p.trim());
+          userPermissions = [...userPermissions, ...cleanArray];
+        } else if (typeof row.page_key === 'string') {
+          // Se retornar uma string normal
+          userPermissions.push(row.page_key.trim());
+        }
+      });
+
+      // ==========================================
+      // 🛠️ RAIO-X: VERIFICAÇÃO NO TERMINAL
+      // ==========================================
+      console.log(`\n--- TENTATIVA DE ACESSO ---`);
+      console.log(`👤 Utilizador ID: ${userId} | Cargo: ${safeRole}`);
+      console.log(`🔑 Permissão Exigida: '${requiredAction}'`);
+      console.log(`📋 Permissões Encontradas no Banco:`, userPermissions);
+      console.log(`---------------------------\n`);
+
+      // 4. Verificação de Segurança (limpa a ação exigida também para garantir correspondência exata)
+      if (userPermissions.includes(requiredAction.trim())) {
         return next(); // Tem permissão! Continua para o Controller.
       }
 
-      // 4. Bloqueio Sumário se tentar forçar a ação
+      // 5. Bloqueio Sumário se tentar forçar a ação e não tiver a permissão
       return res.status(403).json({ 
         error: `Acesso bloqueado. Não possui o nível de permissão necessário (${requiredAction}) para executar esta operação.` 
       });
