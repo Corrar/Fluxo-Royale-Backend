@@ -54,8 +54,10 @@ app.set('trust proxy', 1);
 // Helmet adiciona cabeçalhos HTTP de segurança automaticamente contra ataques XSS e Clickjacking
 app.use(helmet()); 
 
-// Permite que o Express entenda o corpo das requisições no formato JSON
-app.use(express.json()); 
+// --- CORREÇÃO DO ERRO 413 CONTENT TOO LARGE ---
+// Permite que o Express entenda o corpo das requisições no formato JSON (com limite aumentado para base64)
+app.use(express.json({ limit: '50mb' })); 
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Aplica limite de requisições globais para evitar sobrecarga ou ataques DDoS
 app.use(globalLimiter); 
