@@ -322,3 +322,41 @@ export const getAdminLogs = async (req: Request, res: Response) => {
     res.status(500).json({ error: "Erro ao buscar logs" }); 
   }
 };
+
+/**
+ * Busca todas as configurações do sistema.
+ */
+export const getSettings = async (req: Request, res: Response) => {
+  try {
+    // Busca a chave, o valor e a descrição das configurações
+    const { rows } = await pool.query('SELECT key, value, description FROM settings');
+    res.json(rows);
+  } catch (error: any) { 
+    res.status(500).json({ error: 'Erro ao buscar configurações' }); 
+  }
+};
+
+/**
+ * Atualiza ou cria uma configuração do sistema (Upsert).
+ */
+export const updateSetting = async (req: Request, res: Response) => {
+  const { key, value } = req.body;
+  
+  if (!key) {
+    return res.status(400).json({ error: 'A chave (key) é obrigatória.' });
+  }
+
+  try {
+    // Usamos INSERT ... ON CONFLICT para inserir a configuração se ela não existir,
+    // ou atualizá-la caso a 'key' já exista na tabela.
+    await pool.query(
+      `INSERT INTO settings (key, value) 
+       VALUES ($1, $2) 
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [key, String(value)]
+    );
+    res.json({ message: 'Configuração salva com sucesso!' });
+  } catch (error: any) { 
+    res.status(500).json({ error: 'Erro ao salvar a configuração' }); 
+  }
+};
