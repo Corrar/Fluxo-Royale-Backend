@@ -28,6 +28,7 @@ export const getRequests = async (req: Request, res: Response) => {
                 'id', ri.id, 
                 'quantity_requested', ri.quantity_requested, 
                 'quantity_delivered', ri.quantity_delivered, 
+                'quantity_returned', ri.quantity_returned, 
                 'custom_product_name', ri.custom_product_name, 
                 'observation', ri.observation, 
                 'client_service', ri.client_service, 
@@ -63,6 +64,7 @@ export const getMyRequests = async (req: Request, res: Response) => {
                 'id', ri.id, 
                 'quantity_requested', ri.quantity_requested, 
                 'quantity_delivered', ri.quantity_delivered, 
+                'quantity_returned', ri.quantity_returned, 
                 'custom_product_name', ri.custom_product_name, 
                 'observation', ri.observation, 
                 'client_service', ri.client_service, 
@@ -233,7 +235,7 @@ export const createRequest = async (req: Request, res: Response) => {
       SELECT r.*, 
              cs.op_code, 
              json_build_object('name', p.name, 'sector', p.sector) as requester, 
-             (SELECT COALESCE(json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'quantity_delivered', ri.quantity_delivered, 'custom_product_name', ri.custom_product_name, 'observation', ri.observation, 'client_service', ri.client_service, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit, 'tags', pr.tags) ELSE NULL END)), '[]'::json) FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items 
+             (SELECT COALESCE(json_agg(json_build_object('id', ri.id, 'quantity_requested', ri.quantity_requested, 'quantity_delivered', ri.quantity_delivered, 'quantity_returned', ri.quantity_returned, 'custom_product_name', ri.custom_product_name, 'observation', ri.observation, 'client_service', ri.client_service, 'products', CASE WHEN pr.id IS NOT NULL THEN json_build_object('name', pr.name, 'sku', pr.sku, 'unit', pr.unit, 'tags', pr.tags) ELSE NULL END)), '[]'::json) FROM request_items ri LEFT JOIN products pr ON ri.product_id = pr.id WHERE ri.request_id = r.id) as request_items 
       FROM requests r 
       LEFT JOIN profiles p ON r.requester_id = p.id 
       LEFT JOIN client_services cs ON r.client_service_id = cs.id 
@@ -350,7 +352,7 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
         }
       }
     }
-    // Status: Devolvido (Retornou para a prateleira)
+    // Status: Devolvido (Retornou para a prateleira) - Mantido para caso queiram devolver tudo de uma vez
     else if (status === 'devolvido' && currentStatus === 'entregue') {
       for (const item of itemsRes.rows) {
         if (item.product_id && !item.is_3d) { // Só volta para prateleira se NÃO FOR 3D
@@ -435,5 +437,81 @@ export const deleteRequest = async (req: Request, res: Response) => {
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch(e) {}
     res.status(500).json({ error: error.message });
+  } finally { client.release(); }
+};
+
+// =========================================================================
+// 🟢 NOVA ROTA: DEVOLUÇÃO PARCIAL DE SOLICITAÇÕES COM INTEGRAÇÃO À OP
+// =========================================================================
+
+export const partialReturnRequest = async (req: Request, res: Response) => {
+  const { id } = req.params; // ID do Request
+  const userId = (req as any).user.id;
+  const { returns } = req.body; // Array: [{ request_item_id, quantity_to_return }]
+  const client = await pool.connect();
+  
+  try {
+    const userCheck = await pool.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+    if (userCheck.rows[0]?.role !== 'admin' && userCheck.rows[0]?.role !== 'almoxarife') return res.status(403).json({ error: 'Sem permissão.' });
+
+    await client.query('BEGIN');
+
+    // Verifica o status do pedido e se tem uma OP associada
+    const reqRes = await client.query('SELECT status, client_service_id FROM requests WHERE id = $1', [id]);
+    if (!reqRes.rows[0] || reqRes.rows[0].status !== 'entregue') {
+        throw new Error("Apenas solicitações 'entregues' podem ter itens devolvidos.");
+    }
+    const client_service_id = reqRes.rows[0].client_service_id;
+
+    for (const ret of returns) {
+      if (ret.quantity_to_return <= 0) continue;
+
+      // Verifica o item específico
+      const itemCheck = await client.query(
+          'SELECT product_id, quantity_delivered, quantity_requested, quantity_returned, is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.id = $1', 
+          [ret.request_item_id]
+      );
+      
+      const item = itemCheck.rows[0];
+      const delivered = parseFloat(item.quantity_delivered ?? item.quantity_requested);
+      const alreadyReturned = parseFloat(item.quantity_returned ?? 0);
+      const returnQty = parseFloat(ret.quantity_to_return);
+
+      if (alreadyReturned + returnQty > delivered) {
+          throw new Error(`Não podes devolver mais do que foi entregue para o produto.`);
+      }
+
+      // 1. Atualiza o item do pedido com a nova quantidade devolvida
+      await client.query('UPDATE request_items SET quantity_returned = COALESCE(quantity_returned, 0) + $1 WHERE id = $2', [returnQty, ret.request_item_id]);
+
+      // 2. Devolve ao stock físico (se não for 3D)
+      if (item.product_id && !item.is_3d) {
+          await client.query('UPDATE stock SET quantity_on_hand = quantity_on_hand + $1 WHERE product_id = $2', [returnQty, item.product_id]);
+      }
+
+      // 3. Se houver OP (client_service_id), regista na tabela op_returns para o consumo da OP ficar correto
+      if (client_service_id && item.product_id) {
+          await client.query(`
+              INSERT INTO op_returns (client_service_id, product_id, quantity, user_id, observation)
+              VALUES ($1, $2, $3, $4, $5)
+          `, [client_service_id, item.product_id, returnQty, userId, "Devolução parcial via Solicitação"]);
+      }
+    }
+
+    // Regista no log do sistema
+    await createLog(userId, 'DEVOLUCAO_PARCIAL', { id_solicitacao: id }, getClientIp(req), client);
+    
+    await client.query('COMMIT');
+
+    // Avisa o frontend para atualizar as tabelas afetadas
+    if ((req as any).io) { 
+        (req as any).io.emit('refresh_requests');
+        (req as any).io.emit('refresh_stock');
+    }
+
+    res.json({ success: true, message: "Devolução parcial processada com sucesso!" });
+  } catch (error: any) {
+    try { await client.query('ROLLBACK'); } catch(e) {}
+    res.status(500).json({ error: error.message || 'Erro ao processar devolução parcial' });
   } finally { client.release(); }
 };
