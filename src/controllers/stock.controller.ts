@@ -133,55 +133,6 @@ export const updateStock = async (req: Request, res: Response) => {
   }
 };
 
-export const manualEntry = async (req: Request, res: Response) => {
-  const userId = (req as any).user.id;
-  const { items } = req.body;
-  const client = await pool.connect();
-  
-  try {
-    validatePositiveItems(items);
-    await client.query('BEGIN');
-    
-    const logRes = await client.query(
-      "INSERT INTO xml_logs (file_name, success, total_items) VALUES ($1, $2, $3) RETURNING id", 
-      [`Entrada Manual - ${new Date().toLocaleDateString('pt-BR')}`, true, items.length]
-    );
-    
-    for (const item of items) {
-      if (!item.product_id || !item.quantity) throw new Error("Item inválido.");
-      
-      await client.query(
-        "INSERT INTO xml_items (xml_log_id, product_id, quantity) VALUES ($1, $2, $3)", 
-        [logRes.rows[0].id, item.product_id, item.quantity]
-      );
-      await client.query(
-        "UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2", 
-        [item.quantity, item.product_id]
-      );
-    }
-    
-    await createLog(userId, 'MANUAL_ENTRY', { itemCount: items.length }, getClientIp(req), client);
-    await client.query('COMMIT');
-    
-    // Notificações via WebSocket e Push
-    if ((req as any).io) {
-      (req as any).io.to('compras').emit('new_request_notification', { 
-        message: '📦 Nova entrada registrada!', 
-        action: 'Ver Estoque', 
-        type: 'entrada' 
-      });
-    }
-    sendPushNotificationToRole('compras', 'Nova Entrada de Estoque', 'O Almoxarifado registrou uma entrada.', '/stock');
-    
-    res.status(201).json({ success: true });
-  } catch (error: any) {
-    try { await client.query('ROLLBACK'); } catch(e) {}
-    res.status(500).json({ error: error.message });
-  } finally { 
-    client.release(); 
-  }
-};
-
 export const manualWithdrawal = async (req: Request, res: Response) => {
   const { sector, items, op_code } = req.body;
   const userId = (req as any).user.id;
