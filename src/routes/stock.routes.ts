@@ -6,11 +6,10 @@ import {
   getStock, 
   getStockReservations, 
   updateStock, 
-  manualEntry, 
   manualWithdrawal,
   getOpMaterialsForReturn, 
   registerReturn,
-  registerEntries // <-- ADICIONADO AQUI: A nova função do controller
+  registerEntries // A nova função do controller
 } from '../controllers/stock.controller';
 
 const router = Router();
@@ -51,13 +50,6 @@ router.put('/:id', updateStock);
 // =========================================================================
 
 /**
- * @route POST /stock/manual-entry
- * @description Registra a entrada de novos produtos no almoxarifado (soma ao físico).
- * @body { items: Array<{ product_id: string, quantity: number }> }
- */
-router.post('/manual-entry', manualEntry);
-
-/**
  * @route POST /stock/manual-withdrawal
  * @description Registra a saída/retirada de produtos (subtrai do físico).
  * @body { sector: string, op_code?: string, items: Array<{ product_id: string, quantity: number }> }
@@ -69,10 +61,10 @@ router.post('/manual-withdrawal', manualWithdrawal);
  * @description Registra entradas de lote vindas dos novos painéis (NFe, Reaproveitamentos).
  * @body { entries: Array<{ product_id: string, quantity: number, type: string, observation?: string }> }
  */
-router.post('/entries', registerEntries); // <-- ADICIONADO AQUI: O Endpoint que faltava!
+router.post('/entries', registerEntries); // O Endpoint novo que fica no lugar da entrada manual
 
 // =========================================================================
-// ROTAS DE DEூடOLUÇÕES (OP)
+// ROTAS DE DEVOLUÇÕES (OP)
 // =========================================================================
 
 /**
