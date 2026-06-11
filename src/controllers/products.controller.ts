@@ -1,3 +1,5 @@
+// src/controllers/products.controller.ts
+
 import { Request, Response } from 'express';
 import { pool } from '../db'; 
 import { getClientIp } from '../utils/ip';
@@ -77,8 +79,8 @@ export const getLowStockProducts = async (req: Request, res: Response) => {
 export const createProduct = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   
-  // Usamos 'let' para permitir limpar o SKU antes de prosseguir
-  let { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
+  // 🟢 REMOVIDO o campo 'quantity'
+  let { sku, name, description, unit, min_stock, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
   const client = await pool.connect();
   
   // 🛡️ LIMPEZA E VALIDAÇÃO DO SKU
@@ -118,15 +120,10 @@ export const createProduct = async (req: Request, res: Response) => {
     );
     const newProduct = productRes.rows[0];
 
-    const initialQty = quantity ? parseFloat(quantity) : 0;
-    await client.query(`INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved) VALUES ($1, $2, 0) ON CONFLICT (product_id) DO UPDATE SET quantity_on_hand = COALESCE(stock.quantity_on_hand, 0) + EXCLUDED.quantity_on_hand`, [newProduct.id, initialQty]);
-
-    if (initialQty > 0) {
-      const logRes = await client.query("INSERT INTO xml_logs (file_name, success, total_items) VALUES ($1, $2, $3) RETURNING id", ['Estoque Inicial - Cadastro', true, 1]);
-      await client.query("INSERT INTO xml_items (xml_log_id, product_id, quantity) VALUES ($1, $2, $3)", [logRes.rows[0].id, newProduct.id, initialQty]);
-    }
+    // 🟢 INSERE STOCK A ZERO. Removido o insert na tabela de logs (xml_logs).
+    await client.query(`INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved) VALUES ($1, 0, 0) ON CONFLICT (product_id) DO NOTHING`, [newProduct.id]);
     
-    await createLog(userId, 'CRIAR_PRODUTO', { sku, name, quantidade_inicial: initialQty }, getClientIp(req), client);
+    await createLog(userId, 'CRIAR_PRODUTO', { sku, name }, getClientIp(req), client);
     await client.query('COMMIT');
     res.status(201).json(newProduct);
     
@@ -142,8 +139,8 @@ export const updateProduct = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { id } = req.params;
   
-  // Usamos 'let' para permitir limpar o SKU
-  let { sku, name, description, unit, min_stock, quantity, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
+  // 🟢 REMOVIDO o campo 'quantity'
+  let { sku, name, description, unit, min_stock, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
   const client = await pool.connect();
   
   try {
@@ -197,7 +194,8 @@ export const updateProduct = async (req: Request, res: Response) => {
     );
     
     if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Produto não encontrado' }); }
-    if (quantity !== undefined && quantity !== "") { await client.query('UPDATE stock SET quantity_on_hand = $1 WHERE product_id = $2', [parseFloat(quantity), id]); }
+    
+    // 🟢 REMOVIDA a query que alterava o estoque diretamente aqui. Edição não mexe no stock!
     
     await createLog(userId, 'EDITAR_PRODUTO', { id_produto: id, nome: name, alteracoes: req.body }, getClientIp(req), client);
     await client.query('COMMIT');
