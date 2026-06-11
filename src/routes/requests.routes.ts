@@ -1,3 +1,5 @@
+// src/routes/requests.routes.ts
+
 import { Router } from 'express';
 // 1. Importamos o nosso "Cão de Guarda" (requirePermission) junto com a autenticação
 import { authenticate, requirePermission } from '../middlewares/auth';
@@ -6,7 +8,8 @@ import {
     getMyRequests, 
     createRequest, 
     updateRequestStatus, 
-    deleteRequest 
+    deleteRequest,
+    partialReturnRequest // 🟢 Controlador importado com sucesso
 } from '../controllers/requests.controller';
 
 const router = Router();
@@ -36,6 +39,10 @@ router.post('/', createRequest);
 // ✏️ Atualizar o status do pedido (Aprovar, Rejeitar, Entregar)
 // Ação executada por quem gere as solicitações
 router.put('/:id/status', requirePermission('solicitacoes:edit'), updateRequestStatus);
+
+// 🔄 Devolução Parcial / Estorno de Materiais da Solicitação
+// 🟢 NOVA ROTA ADICIONADA: Vincula a URL ao controlador de Devolução Parcial com a devida permissão
+router.post('/:id/partial-return', requirePermission('solicitacoes:edit'), partialReturnRequest);
 
 // 🗑️ Excluir / Cancelar um pedido
 // Permite ao utilizador apagar o próprio pedido (Nota: o controller valida se o status ainda é 'pendente')
