@@ -1,3 +1,5 @@
+// src/controllers/users.controller.ts
+
 import { Request, Response } from 'express';
 import { pool } from '../db';
 import { createLog } from '../utils/logger';
@@ -13,18 +15,32 @@ export const getUsers = async (req: Request, res: Response) => {
       FROM users u LEFT JOIN profiles p ON u.id = p.id ORDER BY u.created_at DESC
     `);
     res.json(rows);
-  } catch (error: any) { res.status(500).json({ error: 'Erro ao buscar usuários' }); }
+  } catch (error: any) { 
+    res.status(500).json({ error: 'Erro ao buscar usuários' }); 
+  }
 };
 
 export const updateRole = async (req: Request, res: Response) => {
   const { id } = req.params;
-  const { role } = req.body;
+  // 🟢 AGORA RECEBEMOS O SETOR TAMBÉM DO FRONTEND
+  const { role, sector } = req.body; 
   const userId = (req as any).user.id;
+  
   try {
-    await pool.query('UPDATE profiles SET role = $1 WHERE id = $2', [role, id]);
-    await createLog(userId, 'UPDATE_ROLE', { target_user_id: id, new_role: role }, getClientIp(req));
+    // 🟢 SE O SETOR FOR ENVIADO, ATUALIZAMOS OS DOIS. SE NÃO, ATUALIZAMOS SÓ O CARGO (Para manter compatibilidade com algo mais antigo)
+    if (sector) {
+      await pool.query('UPDATE profiles SET role = $1, sector = $2 WHERE id = $3', [role, sector, id]);
+      await createLog(userId, 'UPDATE_ROLE_AND_SECTOR', { target_user_id: id, new_role: role, new_sector: sector }, getClientIp(req));
+    } else {
+      await pool.query('UPDATE profiles SET role = $1 WHERE id = $2', [role, id]);
+      await createLog(userId, 'UPDATE_ROLE', { target_user_id: id, new_role: role }, getClientIp(req));
+    }
+    
     res.json({ success: true });
-  } catch (error: any) { res.status(500).json({ error: 'Erro ao atualizar função' }); }
+  } catch (error: any) { 
+    console.error("Erro ao atualizar função:", error);
+    res.status(500).json({ error: 'Erro ao atualizar função e setor' }); 
+  }
 };
 
 export const updateStatus = async (req: Request, res: Response) => {
@@ -45,7 +61,9 @@ export const updateStatus = async (req: Request, res: Response) => {
     res.json({ success: true, is_active });
   } catch (error: any) {
     res.status(500).json({ error: 'Erro ao alterar estado do utilizador' });
-  } finally { client.release(); }
+  } finally { 
+    client.release(); 
+  }
 };
 
 export const deleteUser = async (req: Request, res: Response) => {
@@ -55,7 +73,9 @@ export const deleteUser = async (req: Request, res: Response) => {
     await pool.query('DELETE FROM users WHERE id = $1', [id]);
     await createLog(userId, 'DELETE_USER', { target_user_id: id }, getClientIp(req));
     res.json({ success: true });
-  } catch (error: any) { res.status(500).json({ error: 'Erro ao excluir usuário' }); }
+  } catch (error: any) { 
+    res.status(500).json({ error: 'Erro ao excluir usuário' }); 
+  }
 };
 
 export const heartbeat = async (req: Request, res: Response) => {
@@ -63,7 +83,9 @@ export const heartbeat = async (req: Request, res: Response) => {
   try { 
     await pool.query(`UPDATE users SET total_minutes = COALESCE(total_minutes, 0) + 1, last_active = NOW() WHERE id = $1`, [id]);
     res.json({ success: true }); 
-  } catch (error) { res.json({ success: false }); }
+  } catch (error) { 
+    res.json({ success: false }); 
+  }
 };
 
 // --- FUNÇÃO: REDEFINIR SENHA ---
