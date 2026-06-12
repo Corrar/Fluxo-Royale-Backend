@@ -4,7 +4,7 @@ import { Request, Response } from 'express';
 import { pool } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
-import bcrypt from 'bcryptjs'; // ⬅️ CORRIGIDO PARA BCRYPTJS
+import bcrypt from 'bcryptjs';
 
 export const getUsers = async (req: Request, res: Response) => {
   try {
@@ -22,15 +22,17 @@ export const getUsers = async (req: Request, res: Response) => {
 
 export const updateRole = async (req: Request, res: Response) => {
   const { id } = req.params;
-  // 🟢 AGORA RECEBEMOS O SETOR TAMBÉM DO FRONTEND
   const { role, sector } = req.body; 
   const userId = (req as any).user.id;
   
   try {
-    // 🟢 SE O SETOR FOR ENVIADO, ATUALIZAMOS OS DOIS. SE NÃO, ATUALIZAMOS SÓ O CARGO (Para manter compatibilidade com algo mais antigo)
+    // Atualizamos o perfil com Cargo e Setor
     if (sector) {
       await pool.query('UPDATE profiles SET role = $1, sector = $2 WHERE id = $3', [role, sector, id]);
-      await createLog(userId, 'UPDATE_ROLE_AND_SECTOR', { target_user_id: id, new_role: role, new_sector: sector }, getClientIp(req));
+      
+      // 🟢 CORREÇÃO APLICADA: Voltámos a usar a string 'UPDATE_ROLE' para não quebrar a validação (ENUM) da Base de Dados.
+      // O novo setor continua a ser guardado, mas dentro do objeto JSON que a base de dados aceita bem!
+      await createLog(userId, 'UPDATE_ROLE', { target_user_id: id, new_role: role, new_sector: sector }, getClientIp(req));
     } else {
       await pool.query('UPDATE profiles SET role = $1 WHERE id = $2', [role, id]);
       await createLog(userId, 'UPDATE_ROLE', { target_user_id: id, new_role: role }, getClientIp(req));
@@ -39,7 +41,8 @@ export const updateRole = async (req: Request, res: Response) => {
     res.json({ success: true });
   } catch (error: any) { 
     console.error("Erro ao atualizar função:", error);
-    res.status(500).json({ error: 'Erro ao atualizar função e setor' }); 
+    // 🟢 Melhoria de Debug: Agora devolvemos o erro detalhado da base de dados caso volte a falhar.
+    res.status(500).json({ error: 'Erro ao atualizar função e setor', details: error.message }); 
   }
 };
 
@@ -105,7 +108,6 @@ export const resetPassword = async (req: Request, res: Response) => {
       return res.status(403).json({ error: 'Apenas administradores podem redefinir senhas.' });
     }
 
-    // Agora usa o bcryptjs que já está instalado no teu projeto
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
