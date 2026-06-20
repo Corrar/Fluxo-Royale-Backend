@@ -2,10 +2,11 @@ import { Request, Response } from 'express';
 import { google } from 'googleapis';
 import axios from 'axios'; 
 
-// Quando fores para produção, colocarás o ID real da planilha aqui
+// ==========================================
+// ⚙️ CONFIGURAÇÕES DA AUTOMAÇÃO
+// ==========================================
 const SPREADSHEET_ID = 'COLA_AQUI_O_ID_DA_TUA_PLANILHA';
-
-// Dados da tua Green API (serão colocados no teu ficheiro .env no futuro)
+const FOLDER_ID = 'COLA_AQUI_O_ID_DA_PASTA_VIGIADA'; // Adicionado para sabermos onde procurar o ficheiro
 const GREEN_API_URL = process.env.GREEN_API_URL || 'https://api.green-api.com/waInstanceXXXX/sendMessage/YYYY';
 
 /**
@@ -27,8 +28,7 @@ export const handleDriveWebhook = async (req: Request, res: Response) => {
 
         if (state === 'add' || state === 'update') {
             console.log(`📁 [Webhook] Alteração detetada no Drive! Recurso ID: ${resourceId}`);
-            // Não usamos o "await" aqui para não prender a resposta ao Google
-            processNewDriveFile(resourceId);
+            processNewDriveFile();
         }
     } catch (error) {
         console.error('❌ Erro no controlador do Webhook:', error);
@@ -36,13 +36,36 @@ export const handleDriveWebhook = async (req: Request, res: Response) => {
 };
 
 /**
- * FUNÇÃO DE PRODUÇÃO: Lê a folha de cálculo (Está pronta, mas não a vamos usar já)
+ * FUNÇÃO DE AUTENTICAÇÃO: Lê o cofre do Render e cria o "Robô"
+ */
+const iniciarAutenticacaoGoogle = async () => {
+    const credenciaisTexto = process.env.GOOGLE_CREDENTIALS;
+
+    if (!credenciaisTexto) {
+        throw new Error('A variável GOOGLE_CREDENTIALS não foi encontrada no ambiente (Render)!');
+    }
+
+    const credentials = JSON.parse(credenciaisTexto);
+
+    const auth = new google.auth.GoogleAuth({
+        credentials,
+        scopes: [
+            'https://www.googleapis.com/auth/drive.readonly', 
+            'https://www.googleapis.com/auth/spreadsheets.readonly'
+        ],
+    });
+
+    return await auth.getClient();
+};
+
+/**
+ * FUNÇÃO SECUNDÁRIA: Lê a folha de cálculo do Google Sheets
  */
 const obterListaTelefonicaDoSheets = async (authClient: any) => {
     const sheets = google.sheets({ version: 'v4', auth: authClient });
     const response = await sheets.spreadsheets.values.get({
         spreadsheetId: SPREADSHEET_ID,
-        range: 'Página1!A:B', 
+        range: 'Página1!A:B', // Ajuste o nome da aba se necessário
     });
 
     const linhas = response.data.values;
@@ -61,60 +84,68 @@ const obterListaTelefonicaDoSheets = async (authClient: any) => {
 };
 
 /**
- * FUNÇÃO PRINCIPAL: Processa o ficheiro, cruza os dados e envia a mensagem
+ * FUNÇÃO PRINCIPAL: Processa a alteração, busca o ficheiro e dispara o WhatsApp
  */
-const processNewDriveFile = async (resourceId: string) => {
+const processNewDriveFile = async () => {
     try {
-        console.log('A iniciar lógica de notificação...');
+        console.log('🔄 A iniciar a autenticação e lógica de notificação...');
+        
+        // 1. Inicia o nosso Robô
+        const authClient = await iniciarAutenticacaoGoogle();
+        const drive = google.drive({ version: 'v3', auth: authClient as any });
 
-        // ---------------------------------------------------------
-        // MODO TESTE (MOCKS): Imitando a resposta do Google Drive
-        // ---------------------------------------------------------
-        const fileMock = {
-            name: 'Projeto_Nova_Maquina.pdf',
-            link: 'https://drive.google.com/file/d/123/view',
-            permissions: [
-                { emailAddress: 'engenharia@fluxo-royale.com.br' },
-                { emailAddress: 'producao@fluxo-royale.com.br' }
-            ]
-        };
+        // 2. Busca o ÚLTIMO ficheiro alterado dentro da pasta que estamos a vigiar
+        const driveResponse = await drive.files.list({
+            q: `'${FOLDER_ID}' in parents and trashed = false`,
+            orderBy: 'modifiedTime desc', // Pega o mais recente
+            pageSize: 1,
+            fields: 'files(id, name, webViewLink, permissions)' // Pedimos também as permissões
+        });
 
-        const emailsComAcesso = fileMock.permissions
-            .map(p => p.emailAddress?.toLowerCase())
-            .filter(email => email !== undefined) as string[];
+        const file = driveResponse.data.files?.[0];
 
-        // ---------------------------------------------------------
-        // MODO TESTE (MOCKS): Imitando a folha de cálculo (Google Sheets)
-        // ---------------------------------------------------------
-        const listaTelefonicaMock: Record<string, string> = {
-            'producao@fluxo-royale.com.br': '5511999999999', // O número fingido da produção
-            // Repara que não colocámos a engenharia aqui propositadamente para testar o aviso de erro
-        };
+        if (!file) {
+            console.warn('⚠️ O webhook avisou de alteração, mas nenhum ficheiro foi encontrado na pasta.');
+            return;
+        }
 
-        // ---------------------------------------------------------
-        // CRUZAMENTO DE DADOS E DISPARO (GREEN API)
-        // ---------------------------------------------------------
+        console.log(`📄 Ficheiro detetado: ${file.name}`);
+
+        // 3. Extrai quem tem acesso a este ficheiro
+        const emailsComAcesso = file.permissions
+            ?.map(p => p.emailAddress?.toLowerCase())
+            .filter(email => email !== undefined) as string[] || [];
+
+        // 4. Vai buscar a nossa "Lista Telefónica" ao Google Sheets
+        const listaTelefonica = await obterListaTelefonicaDoSheets(authClient);
+
+        // 5. Cruzamento de Dados e Disparo (Green API)
         for (const email of emailsComAcesso) {
-            // No futuro, trocaremos "listaTelefonicaMock" pela função real
-            const telefone = listaTelefonicaMock[email];
+            const telefone = listaTelefonica[email];
 
             if (telefone) {
-                const mensagem = `*Alerta Fluxo Royale* 🚀\n\nUm ficheiro que acompanhas foi atualizado:\n\n📁 *Ficheiro:* ${fileMock.name}\n🔗 *Acesso:* ${fileMock.link}`;
+                const mensagem = `*Alerta Fluxo Royale* 🚀\n\nUm ficheiro que acompanhas foi atualizado:\n\n📁 *Ficheiro:* ${file.name}\n🔗 *Acesso:* ${file.webViewLink}`;
                 
-                // MODO TESTE: Apenas registamos no terminal em vez de enviar o WhatsApp real
-                console.log(`💬 [SIMULAÇÃO GREEN API] Enviando para ${telefone} (Email: ${email}):\n${mensagem}`);
+                console.log(`💬 Enviando WhatsApp para ${telefone} (Email: ${email})`);
                 
-                // CÓDIGO DE PRODUÇÃO (Descomentar futuramente):
-                // await axios.post(GREEN_API_URL, { 
-                //     chatId: `${telefone}@c.us`, 
-                //     message: mensagem 
-                // });
+                // DISPARO REAL (Remova os comentários quando quiser testar a Green API pra valer)
+                /*
+                try {
+                    await axios.post(GREEN_API_URL, { 
+                        chatId: `${telefone}@c.us`, 
+                        message: mensagem 
+                    });
+                    console.log(`✅ Sucesso no envio para ${email}`);
+                } catch (apiError) {
+                    console.error(`❌ Falha na Green API para ${email}:`, apiError.message);
+                }
+                */
             } else {
                 console.warn(`⚠️ O email ${email} tem acesso ao ficheiro, mas não tem o WhatsApp registado na lista.`);
             }
         }
 
     } catch (error) {
-        console.error('❌ Erro durante o processamento do ficheiro:', error);
+        console.error('❌ Erro durante o processamento da automação:', error);
     }
 };
