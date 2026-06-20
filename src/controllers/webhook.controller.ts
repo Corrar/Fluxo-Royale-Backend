@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { google } from 'googleapis';
 import axios from 'axios'; // Biblioteca para fazer a requisição HTTP para a Green API
-import { logger } from '../utils/logger';
+import * as logger from '../utils/logger';
 
 // Quando fores para produção, colocarás o ID real da planilha aqui
 const SPREADSHEET_ID = 'COLA_AQUI_O_ID_DA_TUA_PLANILHA';
