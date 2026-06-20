@@ -1,7 +1,6 @@
 import { Request, Response } from 'express';
 import { google } from 'googleapis';
-import axios from 'axios'; // Biblioteca para fazer a requisição HTTP para a Green API
-import * as logger from '../utils/logger';
+import axios from 'axios'; 
 
 // Quando fores para produção, colocarás o ID real da planilha aqui
 const SPREADSHEET_ID = 'COLA_AQUI_O_ID_DA_TUA_PLANILHA';
@@ -22,17 +21,17 @@ export const handleDriveWebhook = async (req: Request, res: Response) => {
 
         // 2. PROCESSAMENTO EM SEGUNDO PLANO
         if (state === 'sync') {
-            logger.info('✅ [Webhook] Canal do Drive sincronizado com sucesso!');
+            console.log('✅ [Webhook] Canal do Drive sincronizado com sucesso!');
             return;
         }
 
         if (state === 'add' || state === 'update') {
-            logger.info(`📁 [Webhook] Alteração detetada no Drive! Recurso ID: ${resourceId}`);
+            console.log(`📁 [Webhook] Alteração detetada no Drive! Recurso ID: ${resourceId}`);
             // Não usamos o "await" aqui para não prender a resposta ao Google
             processNewDriveFile(resourceId);
         }
     } catch (error) {
-        logger.error('❌ Erro no controlador do Webhook:', error);
+        console.error('❌ Erro no controlador do Webhook:', error);
     }
 };
 
@@ -66,7 +65,7 @@ const obterListaTelefonicaDoSheets = async (authClient: any) => {
  */
 const processNewDriveFile = async (resourceId: string) => {
     try {
-        logger.info('A iniciar lógica de notificação...');
+        console.log('A iniciar lógica de notificação...');
 
         // ---------------------------------------------------------
         // MODO TESTE (MOCKS): Imitando a resposta do Google Drive
@@ -103,7 +102,7 @@ const processNewDriveFile = async (resourceId: string) => {
                 const mensagem = `*Alerta Fluxo Royale* 🚀\n\nUm ficheiro que acompanhas foi atualizado:\n\n📁 *Ficheiro:* ${fileMock.name}\n🔗 *Acesso:* ${fileMock.link}`;
                 
                 // MODO TESTE: Apenas registamos no terminal em vez de enviar o WhatsApp real
-                logger.info(`💬 [SIMULAÇÃO GREEN API] Enviando para ${telefone} (Email: ${email}):\n${mensagem}`);
+                console.log(`💬 [SIMULAÇÃO GREEN API] Enviando para ${telefone} (Email: ${email}):\n${mensagem}`);
                 
                 // CÓDIGO DE PRODUÇÃO (Descomentar futuramente):
                 // await axios.post(GREEN_API_URL, { 
@@ -111,11 +110,11 @@ const processNewDriveFile = async (resourceId: string) => {
                 //     message: mensagem 
                 // });
             } else {
-                logger.warn(`⚠️ O email ${email} tem acesso ao ficheiro, mas não tem o WhatsApp registado na lista.`);
+                console.warn(`⚠️ O email ${email} tem acesso ao ficheiro, mas não tem o WhatsApp registado na lista.`);
             }
         }
 
     } catch (error) {
-        logger.error('❌ Erro durante o processamento do ficheiro:', error);
+        console.error('❌ Erro durante o processamento do ficheiro:', error);
     }
 };
