@@ -36,6 +36,51 @@ export const handleDriveWebhook = async (req: Request, res: Response) => {
 };
 
 /**
+ * NOVA ROTA SECUNDÁRIA: O botão que liga o alarme no Google Drive
+ */
+export const ativarAlarmeDoDrive = async (req: Request, res: Response) => {
+    try {
+        console.log('🔔 Solicitando ativação do alarme no Google Drive...');
+        
+        const authClient = await iniciarAutenticacaoGoogle();
+        const drive = google.drive({ version: 'v3', auth: authClient as any });
+
+        // ⚠️ IMPORTANTE: Precisamos informar o Google para onde ele deve enviar o aviso.
+        // Crie esta variável no painel do Render com a URL pública da sua API.
+        const WEBHOOK_URL = process.env.WEBHOOK_URL; 
+
+        if (!WEBHOOK_URL) {
+            return res.status(400).json({ 
+                error: 'A variável WEBHOOK_URL não está configurada no Render! Exemplo: https://seu-backend.onrender.com/api/webhook/drive' 
+            });
+        }
+
+        const channelId = `fluxo-royale-watch-${Date.now()}`;
+
+        const response = await drive.files.watch({
+            fileId: FOLDER_ID,
+            requestBody: {
+                id: channelId,          // Um ID único para este "canal" de aviso
+                type: 'web_hook',       // O tipo de aviso
+                address: WEBHOOK_URL,   // A URL exata desta API que vai receber o POST do Google
+            }
+        });
+
+        console.log('✅ Alarme ativado com sucesso:', response.data);
+        res.status(200).json({ 
+            success: true, 
+            message: 'Alarme do Drive ativado com sucesso!', 
+            channelId: channelId,
+            data: response.data 
+        });
+
+    } catch (error: any) {
+        console.error('❌ Erro ao ativar alarme do Drive:', error);
+        res.status(500).json({ error: 'Falha ao ativar o alarme do Drive.', details: error.message });
+    }
+};
+
+/**
  * FUNÇÃO DE AUTENTICAÇÃO: Lê o cofre do Render e cria o "Robô"
  */
 const iniciarAutenticacaoGoogle = async () => {
