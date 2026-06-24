@@ -12,8 +12,9 @@ export const getRequests = async (req: Request, res: Response) => {
     const query = `
       WITH FilteredRequests AS (
           SELECT * FROM requests 
-          WHERE status IN ('aberto', 'aprovado') OR created_at >= NOW() - INTERVAL '30 days'
-          ORDER BY created_at DESC LIMIT 200
+          WHERE status IN ('aberto', 'aprovado') 
+             OR date_trunc('month', created_at) = date_trunc('month', NOW())
+          ORDER BY created_at DESC LIMIT 1000
       )
       SELECT r.*, 
           cs.op_code,
@@ -50,8 +51,8 @@ export const getMyRequests = async (req: Request, res: Response) => {
     const query = `
       WITH FilteredRequests AS (
           SELECT * FROM requests 
-          WHERE requester_id = $1 AND (status IN ('aberto', 'aprovado') OR created_at >= NOW() - INTERVAL '30 days')
-          ORDER BY created_at DESC LIMIT 200
+          WHERE requester_id = $1 AND (status IN ('aberto', 'aprovado') OR date_trunc('month', created_at) = date_trunc('month', NOW()))
+          ORDER BY created_at DESC LIMIT 1000
       )
       SELECT r.*, 
           cs.op_code, 
