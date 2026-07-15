@@ -384,21 +384,34 @@ export const registerEntries = async (req: Request, res: Response) => {
     for (const entry of entries) {
       const { product_id, quantity, type, observation } = entry;
 
-      if (!product_id || !quantity) {
-        throw new Error("Item inválido, falta Produto ou Quantidade.");
+      // 🛡️ CORREÇÃO 1: Tratar a quantidade para garantir que é sempre um número válido.
+      // Se vier "20,00" do frontend, converte para 20.00
+      const numericQty = typeof quantity === 'string' ? parseFloat(quantity.replace(',', '.')) : Number(quantity);
+
+      if (!product_id || isNaN(numericQty) || numericQty <= 0) {
+        throw new Error(`Item inválido: falta Produto ou a Quantidade (${quantity}) é inválida.`);
       }
 
-      // 2. Atualiza a tabela Stock (Soma a quantidade física disponível)
-      await client.query(`
+      // 🛡️ CORREÇÃO 2: Atualiza a tabela Stock forçando o tipo numérico (::numeric)
+      const updateResult = await client.query(`
         UPDATE stock 
-        SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 
+        SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1::numeric 
         WHERE product_id = $2
-      `, [quantity, product_id]);
+      `, [numericQty, product_id]);
+
+      // 🛡️ CORREÇÃO 3: Se o UPDATE afetou 0 linhas, significa que o produto não estava no stock. 
+      // Então, inserimos o produto pela primeira vez!
+      if (updateResult.rowCount === 0) {
+        await client.query(`
+          INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved) 
+          VALUES ($1, $2, 0)
+        `, [product_id, numericQty]);
+      }
 
       // 3. 🟢 MAGIA AQUI: Inserimos o item na tabela xml_items, conectada ao log
       await client.query(
         "INSERT INTO xml_items (xml_log_id, product_id, quantity) VALUES ($1, $2, $3)", 
-        [logId, product_id, quantity]
+        [logId, product_id, numericQty]
       );
     }
 
