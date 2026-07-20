@@ -8,6 +8,7 @@ import { globalLimiter } from './middlewares/rateLimiters';
 import { initSocket } from './config/socket';
 import { startExpireRequestsJob } from './jobs/expireRequests.job';
 import { ensureStockLedger } from './db/stockLedger';
+import { ensureIndexes } from './db/ensureIndexes';
 
 // --- Rotas (Routers) ---
 import authRouter from './routes/auth.routes';
@@ -116,6 +117,9 @@ startExpireRequestsJob();
 
 // Garante a tabela + trigger do ledger de movimentações de estoque (idempotente)
 ensureStockLedger();
+
+// Garante os índices de performance (idempotente)
+ensureIndexes();
 
 // ==========================================
 // 4. REGISTRO DE ROTAS (API ENDPOINTS)
