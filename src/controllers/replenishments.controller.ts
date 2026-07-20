@@ -131,8 +131,14 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
       const oldItem = await client.query('SELECT ri.quantity, ri.product_id, ri.qty_requested, p.sku as product_sku FROM replenishment_items ri LEFT JOIN products p ON p.id = ri.product_id WHERE ri.id = $1', [item.id]);
       if (oldItem.rows.length > 0) {
         const oldQty = parseFloat(oldItem.rows[0].quantity || 0);
-        const newQty = item.quantity !== undefined ? parseFloat(item.quantity) : oldQty;
-        if (isNaN(newQty) || newQty < 0) throw new Error("Quantidade inválida.");
+        // Prefere o INCREMENTO (intenção do operador) somado sobre o valor atual
+        // do banco, sob o lock — evita que uma tela com cache defasado sobrescreva
+        // e reduza a reserva feita por outro almoxarife. quantity absoluta ainda
+        // é aceita para retrocompatibilidade.
+        const newQty = item.increment !== undefined
+          ? oldQty + parseFloat(item.increment)
+          : (item.quantity !== undefined ? parseFloat(item.quantity) : oldQty);
+        if (isNaN(newQty) || newQty < 0) throw new Error("Quantidade inválida (o estorno não pode ser maior que o já separado).");
 
         const productId = oldItem.rows[0].product_id;
         const diff = newQty - oldQty;

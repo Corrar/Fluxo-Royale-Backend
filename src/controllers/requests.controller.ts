@@ -96,7 +96,7 @@ export const createRequest = async (req: Request, res: Response) => {
     // =========================================================================
     let requiresOp = false;
     // 👇 AQUI ESTÁ A MUDANÇA: Adicionamos 'feira' na lista de exceções
-    const exemptTags = ['camisetas', 'camiseta', 'epi', 'ferramentas', 'insumos', 'insumo', 'feira'];
+    const exemptTags = ['camisetas', 'camiseta', 'epi', 'ferramentas', 'ferramenta', 'insumos', 'insumo', 'feira'];
     
     const productIds = items
       .map((i: any) => i.product_id)
