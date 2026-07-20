@@ -7,6 +7,20 @@ import { createLog } from '../utils/logger';
 
 // 🧠 SANITIZADOR DE TAGS BLINDADO
 // Limpa os objetos do TagInput e extrai apenas o texto puro (String).
+// 💰 SANITIZADOR DE PREÇOS
+// Aceita número ou texto em formato brasileiro ("29,90", "1.234,56").
+// Vazio ou ilegível vira null — nos updates o COALESCE mantém o valor atual,
+// em vez de gravar '' ou 0 e "sumir" com o preço.
+const parsePriceInput = (value: any): number | null => {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'number') return isNaN(value) || value < 0 ? null : value;
+  const s = String(value).trim();
+  if (!s) return null;
+  const normalized = s.includes(',') ? s.replace(/\./g, '').replace(',', '.') : s;
+  const n = parseFloat(normalized);
+  return isNaN(n) || n < 0 ? null : n;
+};
+
 const sanitizeTags = (tagsData: any): { is3D: boolean, parsed: string[] } => {
   let rawArray: any[] = [];
   
@@ -114,7 +128,7 @@ export const createProduct = async (req: Request, res: Response) => {
       `INSERT INTO products (sku, name, description, unit, min_stock, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
       [
-        sku, name, description, unit, min_stock, unit_price !== undefined ? unit_price : 0, sales_price !== undefined ? sales_price : 0, JSON.stringify(parsedTags), 
+        sku, name, description, unit, min_stock, parsePriceInput(unit_price) ?? 0, parsePriceInput(sales_price) ?? 0, JSON.stringify(parsedTags),
         finalIs3D, production_minutes || 0, filament_grams || 0, image_url || null
       ]
     );
@@ -181,9 +195,9 @@ export const updateProduct = async (req: Request, res: Response) => {
         name !== undefined ? name : null, 
         description !== undefined ? description : null, 
         unit !== undefined ? unit : null, 
-        min_stock !== undefined ? min_stock : null, 
-        unit_price !== undefined ? unit_price : null, 
-        sales_price !== undefined ? sales_price : null, 
+        min_stock !== undefined ? min_stock : null,
+        parsePriceInput(unit_price),
+        parsePriceInput(sales_price),
         finalTagsForDB,
         finalIs3D !== undefined ? finalIs3D : null, 
         production_minutes !== undefined ? production_minutes : null, 
@@ -268,7 +282,7 @@ export const updateProductPrices = async (req: Request, res: Response) => {
     // Aqui usamos o mesmo princípio, o valor deve poder ser 0
     const { rows } = await client.query(
       `UPDATE products SET unit_price = COALESCE($1, unit_price), sales_price = COALESCE($2, sales_price) WHERE id = $3 RETURNING *`,
-      [unit_price !== undefined ? unit_price : null, sales_price !== undefined ? sales_price : null, id]
+      [parsePriceInput(unit_price), parsePriceInput(sales_price), id]
     );
     if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Produto não encontrado' }); }
     await createLog(userId, 'ATUALIZAR_PRECOS', { id_produto: id, novos_precos: { unit_price, sales_price } }, getClientIp(req), client);
