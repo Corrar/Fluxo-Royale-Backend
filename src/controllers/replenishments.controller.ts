@@ -44,13 +44,25 @@ export const updateReplenishment = async (req: Request, res: Response) => {
   try {
     validatePositiveItems(items);
     await client.query('BEGIN');
+
+    // 🔒 Bloqueia edição de reposições já concluídas/canceladas
+    const repCheck = await client.query('SELECT status FROM replenishments WHERE id = $1 FOR UPDATE', [id]);
+    if (repCheck.rows.length === 0) throw new Error('Reposição não encontrada.');
+    if (!['pendente', 'em_preparo'].includes(repCheck.rows[0].status)) {
+      throw new Error(`Não é possível editar uma reposição já processada (status: ${repCheck.rows[0].status}).`);
+    }
+
     await client.query(`UPDATE replenishments SET order_number = COALESCE($1, order_number), client_name = COALESCE($2, client_name), city_state = COALESCE($3, city_state), total_value = COALESCE($4, total_value) WHERE id = $5`, [order_number, client_name, city_state, total_value, id]);
 
-    const existingItemsRes = await client.query('SELECT id, product_id FROM replenishment_items WHERE replenishment_id = $1', [id]);
+    const existingItemsRes = await client.query('SELECT id, product_id, quantity FROM replenishment_items WHERE replenishment_id = $1', [id]);
     const newItemsMap = new Map(items.map((i: any) => [i.product_id, i]));
 
     for (const oldItem of existingItemsRes.rows) {
       if (!newItemsMap.has(oldItem.product_id)) {
+        // Se o item removido já tinha reserva feita, liberta-a — antes a reserva ficava presa para sempre
+        if (parseFloat(oldItem.quantity || 0) > 0) {
+          await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2', [oldItem.quantity, oldItem.product_id]);
+        }
         await client.query('DELETE FROM replenishment_items WHERE id = $1', [oldItem.id]);
       } else {
         const newItem: any = newItemsMap.get(oldItem.product_id);
@@ -83,7 +95,26 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    for (const item of items) {
+
+    // 🔒 Trava a reposição e valida a transição de status. Sem isto:
+    // - "entregar" duas vezes debitava o estoque em dobro;
+    // - "reverter" repetido (ou a partir de um estado não-entregue) inflava o físico do nada.
+    const repCheck = await client.query('SELECT status FROM replenishments WHERE id = $1 FOR UPDATE', [id]);
+    if (repCheck.rows.length === 0) throw new Error('Reposição não encontrada.');
+    const repStatus = repCheck.rows[0].status;
+
+    const allowedFrom: Record<string, string[]> = {
+      'reservar': ['pendente', 'em_preparo'],
+      'entregar': ['pendente', 'em_preparo'],
+      'reverter': ['concluido'],
+    };
+    if (!allowedFrom[action] || !allowedFrom[action].includes(repStatus)) {
+      throw new Error(`Ação "${action}" não permitida no status atual ("${repStatus}").`);
+    }
+
+    const sortedAuthItems = [...items].sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)));
+
+    for (const item of sortedAuthItems) {
       const oldItem = await client.query('SELECT quantity, product_id, qty_requested FROM replenishment_items WHERE id = $1', [item.id]);
       if (oldItem.rows.length > 0) {
         const oldQty = parseFloat(oldItem.rows[0].quantity || 0);

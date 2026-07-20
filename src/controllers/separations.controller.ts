@@ -60,7 +60,19 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
     const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     if (userCheck.rows[0]?.role !== 'admin' && userCheck.rows[0]?.role !== 'almoxarife') throw new Error('Acesso negado.');
 
-    for (const item of items) {
+    // 🔒 Trava a separação e valida o status atual: sem isto, dois cliques em
+    // "entregar" (ou duas abas abertas) debitavam o estoque em dobro.
+    const sepCheck = await client.query('SELECT status FROM separations WHERE id = $1 FOR UPDATE', [id]);
+    if (sepCheck.rows.length === 0) throw new Error('Separação não encontrada.');
+    const sepStatus = sepCheck.rows[0].status;
+    if (!['pendente', 'em_separacao'].includes(sepStatus)) {
+      throw new Error(`Esta separação já foi processada (status atual: ${sepStatus}).`);
+    }
+
+    // Ordena para travar as linhas de stock sempre na mesma ordem (evita deadlocks)
+    const sortedAuthItems = [...items].sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)));
+
+    for (const item of sortedAuthItems) {
       const oldItem = await client.query('SELECT quantity, product_id FROM separation_items WHERE id = $1', [item.id]);
       if (oldItem.rows.length > 0) {
         const oldQty = parseFloat(oldItem.rows[0].quantity || 0);
@@ -143,6 +155,14 @@ export const updateSeparation = async (req: Request, res: Response) => {
     const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     if (userCheck.rows[0]?.role !== 'admin' && userCheck.rows[0]?.role !== 'almoxarife') throw new Error('Acesso negado.');
 
+    // 🔒 Não permitir editar separações já entregues/canceladas: remover itens aqui
+    // libertava reservas que já não existiam, zerando reservas de OUTROS pedidos.
+    const sepCheck = await client.query('SELECT status FROM separations WHERE id = $1 FOR UPDATE', [id]);
+    if (sepCheck.rows.length === 0) throw new Error('Separação não encontrada.');
+    if (!['pendente', 'em_separacao'].includes(sepCheck.rows[0].status)) {
+      throw new Error(`Não é possível editar uma separação já processada (status: ${sepCheck.rows[0].status}).`);
+    }
+
     // 🟢 CORREÇÃO: Atualizamos o client_service_id na base de dados
     await client.query(
       `UPDATE separations SET client_name = $1, production_order = $2, destination = $3, client_service_id = $4 WHERE id = $5`,
@@ -196,10 +216,30 @@ export const createReturn = async (req: Request, res: Response) => {
 
   try {
     await client.query('BEGIN');
+    // Trava a separação para serializar devoluções concorrentes do mesmo pedido
+    const sepCheck = await client.query('SELECT status FROM separations WHERE id = $1 FOR UPDATE', [id]);
+    if (sepCheck.rows.length === 0) throw new Error('Separação não encontrada.');
+
     for (const item of items) {
+      const returnQty = Number(item.quantity);
+      if (!item.product_id || isNaN(returnQty) || returnQty <= 0) throw new Error('Quantidade de devolução inválida.');
+
+      // Nunca deixar devolver mais do que foi entregue (descontando devoluções já
+      // registadas, pendentes ou aprovadas) — senão o estoque infla na aprovação.
+      const balance = await client.query(`
+        SELECT
+          COALESCE((SELECT SUM(quantity) FROM separation_items WHERE separation_id = $1 AND product_id = $2), 0) as delivered,
+          COALESCE((SELECT SUM(quantity) FROM separation_returns WHERE separation_id = $1 AND product_id = $2 AND status IN ('pendente', 'aprovado')), 0) as already_returned
+      `, [id, item.product_id]);
+
+      const availableToReturn = parseFloat(balance.rows[0].delivered) - parseFloat(balance.rows[0].already_returned);
+      if (returnQty > availableToReturn) {
+        throw new Error(`Devolução maior que o entregue nesta separação (disponível para devolver: ${Math.max(0, availableToReturn)}).`);
+      }
+
       await client.query(
         `INSERT INTO separation_returns (separation_id, product_id, quantity, status) VALUES ($1, $2, $3, 'pendente')`,
-        [id, item.product_id, item.quantity]
+        [id, item.product_id, returnQty]
       );
     }
     

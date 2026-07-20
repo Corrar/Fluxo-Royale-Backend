@@ -25,7 +25,17 @@ export const createTravelOrder = async (req: Request, res: Response) => {
     const initialStatus = status || 'pending';
     const toRes = await client.query(`INSERT INTO travel_orders (technicians, city, status, created_by) VALUES ($1, $2, $3, $4) RETURNING id`, [technicians, city, initialStatus, userId]);
     
-    for (const item of items) {
+    // Ordena para travar as linhas de stock sempre na mesma ordem (evita deadlocks)
+    const sortedItems = [...items].sort((a: any, b: any) => String(a.product_id).localeCompare(String(b.product_id)));
+
+    for (const item of sortedItems) {
+      // 🔒 Verifica o disponível com lock antes de reservar: sem isto a viagem
+      // reservava acima do físico e o "consumo" no acerto era clampado em zero,
+      // escondendo furo de estoque.
+      const st = await client.query(`SELECT (COALESCE(quantity_on_hand, 0) - COALESCE(quantity_reserved, 0)) as available FROM stock WHERE product_id = $1 FOR UPDATE`, [item.product_id]);
+      if (parseFloat(st.rows[0]?.available || 0) < item.quantity) {
+        throw new Error(`Estoque disponível insuficiente para o produto ID ${item.product_id}.`);
+      }
       await client.query(`INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3)`, [toRes.rows[0].id, item.product_id, item.quantity]);
       await client.query(`UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2`, [item.quantity, item.product_id]);
     }
@@ -169,7 +179,11 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
         const newItem: any = newItemsMap.get(oldItem.product_id);
         const diff = Number(newItem.quantity) - Number(oldItem.quantity_out);
         if (diff !== 0) {
-           await client.query('UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2', [diff, oldItem.product_id]);
+           if (diff > 0) {
+             const st = await client.query(`SELECT (COALESCE(quantity_on_hand, 0) - COALESCE(quantity_reserved, 0)) as available FROM stock WHERE product_id = $1 FOR UPDATE`, [oldItem.product_id]);
+             if (parseFloat(st.rows[0]?.available || 0) < diff) throw new Error(`Estoque disponível insuficiente para aumentar o produto ID ${oldItem.product_id}.`);
+           }
+           await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) + $1) WHERE product_id = $2', [diff, oldItem.product_id]);
            await client.query('UPDATE travel_order_items SET quantity_out = $1 WHERE id = $2', [newItem.quantity, oldItem.id]);
         }
       }
@@ -177,6 +191,8 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
 
     for (const item of items) {
       if (!oldItemsRes.rows.some(old => old.product_id === item.product_id)) {
+        const st = await client.query(`SELECT (COALESCE(quantity_on_hand, 0) - COALESCE(quantity_reserved, 0)) as available FROM stock WHERE product_id = $1 FOR UPDATE`, [item.product_id]);
+        if (parseFloat(st.rows[0]?.available || 0) < item.quantity) throw new Error(`Estoque disponível insuficiente para o produto ID ${item.product_id}.`);
         await client.query('INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3)', [id, item.product_id, item.quantity]);
         await client.query('UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2', [item.quantity, item.product_id]);
       }
@@ -210,8 +226,10 @@ export const deleteTravelOrder = async (req: Request, res: Response) => {
     // Buscamos todos os itens atrelados a esta viagem
     const itemsRes = await client.query('SELECT product_id, quantity_out, quantity_returned FROM travel_order_items WHERE travel_order_id = $1', [id]);
 
-    if (status === 'pending') {
-      // 1. Viagem estava aberta. Apenas limpamos o que estava reservado para ela.
+    if (status !== 'reconciled') {
+      // 1. Viagem ainda não passou pelo acerto (pending, awaiting_stock, etc.):
+      // limpamos o que estava reservado para ela. Antes só o status 'pending' era
+      // tratado e viagens 'awaiting_stock' apagadas deixavam reserva fantasma.
       for (const item of itemsRes.rows) {
         await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [item.quantity_out, item.product_id]);
       }

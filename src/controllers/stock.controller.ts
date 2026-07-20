@@ -100,19 +100,23 @@ export const updateStock = async (req: Request, res: Response) => {
     }
 
     const oldStock = await pool.query('SELECT quantity_on_hand, quantity_reserved, product_id FROM stock WHERE id = $1', [id]);
-    
+
     // 🛡️ CORREÇÃO TYPESCRIPT APLICADA:
-    let fields: string[] = []; 
-    let values: any[] = []; 
+    let fields: string[] = [];
+    let values: any[] = [];
     let index = 1;
-    
-    if (quantity_on_hand !== undefined) { 
-      fields.push(`quantity_on_hand = $${index++}`); 
-      values.push(quantity_on_hand); 
+
+    if (quantity_on_hand !== undefined) {
+      const qty = Number(quantity_on_hand);
+      if (isNaN(qty) || qty < 0) return res.status(400).json({ error: 'Quantidade em mãos inválida: deve ser um número maior ou igual a zero.' });
+      fields.push(`quantity_on_hand = $${index++}`);
+      values.push(qty);
     }
-    if (quantity_reserved !== undefined) { 
-      fields.push(`quantity_reserved = $${index++}`); 
-      values.push(quantity_reserved); 
+    if (quantity_reserved !== undefined) {
+      const qty = Number(quantity_reserved);
+      if (isNaN(qty) || qty < 0) return res.status(400).json({ error: 'Quantidade reservada inválida: deve ser um número maior ou igual a zero.' });
+      fields.push(`quantity_reserved = $${index++}`);
+      values.push(qty);
     }
     
     if (fields.length > 0) {
@@ -218,19 +222,26 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
       [sector, 'concluida', 'manual', client_service_id]
     );
 
-    for (const item of items) {
+    // Ordena por product_id para travar as linhas sempre na mesma ordem (evita deadlocks entre transações concorrentes)
+    const sortedItems = [...items].sort((a, b) => String(a.product_id).localeCompare(String(b.product_id)));
+
+    for (const item of sortedItems) {
       if (!item.product_id || !item.quantity) throw new Error("Item inválido.");
-      
-      const stCheck = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1 FOR UPDATE', [item.product_id]);
-      if(parseFloat(stCheck.rows[0]?.quantity_on_hand || 0) < item.quantity) {
-        throw new Error(`Estoque insuficiente ID ${item.product_id}.`);
+
+      const stCheck = await client.query('SELECT quantity_on_hand, quantity_reserved FROM stock WHERE product_id = $1 FOR UPDATE', [item.product_id]);
+      const onHand = parseFloat(stCheck.rows[0]?.quantity_on_hand || 0);
+      const reserved = parseFloat(stCheck.rows[0]?.quantity_reserved || 0);
+      // A retirada manual só pode consumir o saldo LIVRE (físico - reservado),
+      // senão ela "come" material já reservado para solicitações/separações e gera furo na entrega.
+      if (onHand - reserved < item.quantity) {
+        throw new Error(`Estoque disponível insuficiente ID ${item.product_id} (físico: ${onHand}, reservado: ${reserved}).`);
       }
-      
+
       await client.query(
-        'INSERT INTO separation_items (separation_id, product_id, quantity, observation) VALUES ($1, $2, $3, $4)', 
+        'INSERT INTO separation_items (separation_id, product_id, quantity, observation) VALUES ($1, $2, $3, $4)',
         [sepRes.rows[0].id, item.product_id, item.quantity, item.observation || null]
       );
-      
+
       await client.query('UPDATE stock SET quantity_on_hand = quantity_on_hand - $1 WHERE product_id = $2', [item.quantity, item.product_id]);
     }
 
@@ -310,8 +321,12 @@ export const getOpMaterialsForReturn = async (req: Request, res: Response) => {
 };
 
 export const registerReturn = async (req: Request, res: Response) => {
-  const { op_code, returns } = req.body; 
-  const userId = (req as any).user.id; 
+  const { op_code, returns } = req.body;
+  const userId = (req as any).user.id;
+
+  if (!returns || !Array.isArray(returns) || returns.length === 0) {
+    return res.status(400).json({ error: 'Nenhum item de devolução fornecido.' });
+  }
 
   const client = await pool.connect();
 
@@ -322,21 +337,41 @@ export const registerReturn = async (req: Request, res: Response) => {
     if (opResult.rows.length === 0) throw new Error('OP não encontrada no sistema.');
     const client_service_id = opResult.rows[0].id;
 
-    for (const item of returns) {
-      if (!item.product_id || !item.quantity || item.quantity <= 0) {
+    const sortedReturns = [...returns].sort((a: any, b: any) => String(a.product_id).localeCompare(String(b.product_id)));
+
+    for (const item of sortedReturns) {
+      const returnQty = Number(item.quantity);
+      if (!item.product_id || isNaN(returnQty) || returnQty <= 0) {
         throw new Error('Quantidade inválida para devolução.');
+      }
+
+      // Trava a linha do stock para serializar devoluções concorrentes do mesmo produto
+      await client.query('SELECT id FROM stock WHERE product_id = $1 FOR UPDATE', [item.product_id]);
+
+      // Nunca deixar devolver mais do que foi retirado na OP — senão o estoque infla do nada
+      const balance = await client.query(`
+          SELECT
+            COALESCE((SELECT SUM(si.quantity) FROM separations s JOIN separation_items si ON s.id = si.separation_id
+              WHERE s.client_service_id = $1 AND si.product_id = $2), 0) as total_withdrawn,
+            COALESCE((SELECT SUM(quantity) FROM op_returns
+              WHERE client_service_id = $1 AND product_id = $2), 0) as total_returned
+      `, [client_service_id, item.product_id]);
+
+      const availableToReturn = parseFloat(balance.rows[0].total_withdrawn) - parseFloat(balance.rows[0].total_returned);
+      if (returnQty > availableToReturn) {
+        throw new Error(`Devolução maior que o retirado na OP (disponível para devolver: ${availableToReturn}).`);
       }
 
       await client.query(`
           INSERT INTO op_returns (client_service_id, product_id, quantity, user_id, observation)
           VALUES ($1, $2, $3, $4, $5)
-      `, [client_service_id, item.product_id, item.quantity, userId, item.observation]);
+      `, [client_service_id, item.product_id, returnQty, userId, item.observation]);
 
       await client.query(`
-          UPDATE stock 
+          UPDATE stock
           SET quantity_on_hand = quantity_on_hand + $1
           WHERE product_id = $2
-      `, [item.quantity, item.product_id]);
+      `, [returnQty, item.product_id]);
     }
 
     await createLog(userId, 'OP_RETURN', { op_code, itemsReturned: returns.length }, getClientIp(req), client);
@@ -392,21 +427,14 @@ export const registerEntries = async (req: Request, res: Response) => {
         throw new Error(`Item inválido: falta Produto ou a Quantidade (${quantity}) é inválida.`);
       }
 
-      // 🛡️ CORREÇÃO 2: Atualiza a tabela Stock forçando o tipo numérico (::numeric)
-      const updateResult = await client.query(`
-        UPDATE stock 
-        SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1::numeric 
-        WHERE product_id = $2
-      `, [numericQty, product_id]);
-
-      // 🛡️ CORREÇÃO 3: Se o UPDATE afetou 0 linhas, significa que o produto não estava no stock. 
-      // Então, inserimos o produto pela primeira vez!
-      if (updateResult.rowCount === 0) {
-        await client.query(`
-          INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved) 
-          VALUES ($1, $2, 0)
-        `, [product_id, numericQty]);
-      }
+      // Upsert atômico: elimina a corrida "UPDATE 0 linhas → INSERT" que podia
+      // duplicar a linha de stock (ou abortar a transação) sob concorrência.
+      await client.query(`
+        INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved)
+        VALUES ($1, $2::numeric, 0)
+        ON CONFLICT (product_id)
+        DO UPDATE SET quantity_on_hand = COALESCE(stock.quantity_on_hand, 0) + $2::numeric
+      `, [product_id, numericQty]);
 
       // 3. 🟢 MAGIA AQUI: Inserimos o item na tabela xml_items, conectada ao log
       await client.query(

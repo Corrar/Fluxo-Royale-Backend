@@ -175,15 +175,17 @@ export const createRequest = async (req: Request, res: Response) => {
       let is3D = false;
 
       if (productId) {
-        // Busca a quantidade disponível E o status is_3d do produto
-        const productCheck = await client.query(
-            `SELECT p.is_3d, (COALESCE(s.quantity_on_hand, 0) - COALESCE(s.quantity_reserved, 0)) as available 
-             FROM products p LEFT JOIN stock s ON p.id = s.product_id 
-             WHERE p.id = $1 FOR UPDATE OF p`, 
+        // 🔒 Trava a linha do STOCK (e não a de products): todas as rotas que
+        // debitam/reservam estoque disputam a mesma linha, eliminando a corrida
+        // "dois fluxos leem o mesmo disponível e ambos reservam/debitam".
+        const stockLock = await client.query(
+            `SELECT (COALESCE(quantity_on_hand, 0) - COALESCE(quantity_reserved, 0)) as available
+             FROM stock WHERE product_id = $1 FOR UPDATE`,
             [productId]
         );
-        
-        const available = parseFloat(productCheck.rows[0]?.available || 0);
+        const productCheck = await client.query(`SELECT is_3d FROM products WHERE id = $1`, [productId]);
+
+        const available = parseFloat(stockLock.rows[0]?.available || 0);
         is3D = productCheck.rows[0]?.is_3d || false;
 
         // LÓGICA INTELIGENTE: ESTOQUE + FÁBRICA 3D
@@ -293,6 +295,18 @@ export const createRequest = async (req: Request, res: Response) => {
   }
 };
 
+// Para itens 3D a reserva no stock não é a quantidade pedida inteira:
+// na criação reserva-se só o que havia em prateleira e o resto vai para o Kanban.
+// Quando a produção conclui, o produzido entra em on_hand E em reserved.
+// Logo: reservado_real = pedido - demandas ainda não concluídas.
+const getReserved3DPortion = async (client: any, requestId: string, productId: string, requestedQty: number): Promise<number> => {
+  const dem = await client.query(
+    `SELECT COALESCE(SUM(quantity), 0) as pending FROM demands_3d WHERE request_id = $1 AND product_id = $2 AND status != 'Concluída'`,
+    [requestId, productId]
+  );
+  return Math.max(0, requestedQty - parseFloat(dem.rows[0].pending));
+};
+
 export const updateRequestStatus = async (req: Request, res: Response) => {
   const { id } = req.params;
   const userId = (req as any).user.id;
@@ -308,25 +322,41 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     if (!currentRes.rows[0]?.status) throw new Error("Solicitação não encontrada");
     const currentStatus = currentRes.rows[0].status;
 
+    // 🔒 Máquina de estados: bloqueia transições inválidas (ex.: entregar duas vezes,
+    // reabrir um pedido entregue) que causavam débito/crédito duplicado no estoque.
+    const allowedTransitions: Record<string, string[]> = {
+      'aprovado':  ['aberto'],
+      'entregue':  ['aberto', 'aprovado'],
+      'rejeitado': ['aberto', 'aprovado'],
+      'devolvido': ['entregue'],
+    };
+    if (!allowedTransitions[status] || !allowedTransitions[status].includes(currentStatus)) {
+      throw new Error(`Transição de status inválida: "${currentStatus}" → "${status}".`);
+    }
+
     // Se houve ajuste manual das quantidades pelo almoxarife antes da entrega
     if (adjusted_items && Array.isArray(adjusted_items)) {
        for (const adj of adjusted_items) {
-          const itemCheck = await client.query('SELECT product_id, quantity_requested, quantity_delivered FROM request_items WHERE id = $1', [adj.id]);
-          
+          const itemCheck = await client.query('SELECT ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.id = $1', [adj.id]);
+
           if (itemCheck.rows.length > 0) {
              const item = itemCheck.rows[0];
              const oldReserved = parseFloat(item.quantity_delivered ?? item.quantity_requested);
              const newReserved = parseFloat(adj.quantity_delivered);
-             
+             if (isNaN(newReserved) || newReserved < 0) throw new Error('Quantidade ajustada inválida.');
+
              await client.query('UPDATE request_items SET quantity_delivered = $1 WHERE id = $2', [newReserved, adj.id]);
-             
-             if (item.product_id && oldReserved !== newReserved && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
-                // Ao ajustar a quantidade no pedido, precisamos ajustar a reserva correspondente no stock
-                const stockVal = await client.query('SELECT quantity_reserved FROM stock WHERE product_id = $1', [item.product_id]);
-                if (parseFloat(stockVal.rows[0]?.quantity_reserved || 0) > 0) {
-                    const delta = newReserved - oldReserved;
-                    await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) + $1) WHERE product_id = $2', [delta, item.product_id]);
+
+             // Itens 3D têm reserva parcial (parte veio do Kanban): o ajuste de reserva
+             // não se aplica a eles — a liberação correta acontece na entrega/rejeição.
+             if (item.product_id && !item.is_3d && oldReserved !== newReserved && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
+                const delta = newReserved - oldReserved;
+                const stockVal = await client.query('SELECT quantity_on_hand, quantity_reserved FROM stock WHERE product_id = $1 FOR UPDATE', [item.product_id]);
+                if (delta > 0) {
+                    const available = parseFloat(stockVal.rows[0]?.quantity_on_hand || 0) - parseFloat(stockVal.rows[0]?.quantity_reserved || 0);
+                    if (available < delta) throw new Error(`Estoque disponível insuficiente para aumentar a quantidade do produto ID ${item.product_id}.`);
                 }
+                await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) + $1) WHERE product_id = $2', [delta, item.product_id]);
              }
           }
        }
@@ -337,27 +367,41 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     // Status: Entregue
     if (status === 'entregue' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
       for (const item of itemsRes.rows) {
-        if (item.product_id && !item.is_3d) { // Só desconta stock físico se NÃO FOR 3D
+        if (item.product_id) {
           const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
           const stockCheck = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1 FOR UPDATE', [item.product_id]);
           if (parseFloat(stockCheck.rows[0]?.quantity_on_hand || 0) < finalQty) throw new Error(`Furo de Estoque no produto ID ${item.product_id}.`);
-          await client.query(`UPDATE stock SET quantity_on_hand = quantity_on_hand - $1, quantity_reserved = GREATEST(0, quantity_reserved - $1) WHERE product_id = $2`, [finalQty, item.product_id]);
+          // Itens 3D também passam pelo stock físico (a produção concluída entra
+          // em on_hand + reserved), então a entrega TEM de debitar o físico e
+          // liberar a reserva — antes isso era pulado e o estoque ficava inflado
+          // para sempre, com reserva fantasma.
+          const reserveRelease = item.is_3d
+            ? await getReserved3DPortion(client, id, item.product_id, parseFloat(item.quantity_requested))
+            : finalQty;
+          await client.query(`UPDATE stock SET quantity_on_hand = quantity_on_hand - $1, quantity_reserved = GREATEST(0, quantity_reserved - $2) WHERE product_id = $3`, [finalQty, reserveRelease, item.product_id]);
         }
       }
-    } 
+    }
     // Status: Rejeitado
     else if (status === 'rejeitado' && (currentStatus === 'aberto' || currentStatus === 'aprovado')) {
       for (const item of itemsRes.rows) {
-        if (item.product_id && !item.is_3d) { // Só devolve reserva se NÃO FOR 3D
+        if (item.product_id) {
             const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
-            await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [finalQty, item.product_id]);
+            const reserveRelease = item.is_3d
+              ? await getReserved3DPortion(client, id, item.product_id, parseFloat(item.quantity_requested))
+              : finalQty;
+            await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [reserveRelease, item.product_id]);
         }
       }
+      // O pedido morreu: cancela as demandas 3D pendentes para a produção não
+      // fabricar (e reservar) material de um pedido rejeitado.
+      await client.query(`UPDATE demands_3d SET status = 'Cancelada' WHERE request_id = $1 AND status NOT IN ('Concluída', 'Cancelada')`, [id]);
     }
     // Status: Devolvido (Retornou para a prateleira) - Mantido para caso queiram devolver tudo de uma vez
     else if (status === 'devolvido' && currentStatus === 'entregue') {
       for (const item of itemsRes.rows) {
-        if (item.product_id && !item.is_3d) { // Só volta para prateleira se NÃO FOR 3D
+        if (item.product_id) {
+            // Como a entrega agora debita o físico também para 3D, a devolução credita ambos.
             const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
             await client.query(`UPDATE stock SET quantity_on_hand = quantity_on_hand + $1 WHERE product_id = $2`, [finalQty, item.product_id]);
         }
@@ -408,9 +452,15 @@ export const deleteRequest = async (req: Request, res: Response) => {
        // Puxa o status is_3d também para não tentar cancelar reservas de algo que nunca foi reservado
        itemsRes = await client.query('SELECT ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.request_id = $1', [id]);
        for (const item of itemsRes.rows) {
-         if (item.product_id && !item.is_3d) {
-            const finalQty = parseFloat(item.quantity_delivered ?? item.quantity_requested);
-            await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [finalQty, item.product_id]);
+         if (item.product_id) {
+            // Para 3D liberta apenas o que foi de facto reservado (parte pode ainda
+            // estar no Kanban sem reserva) — calculado ANTES de cancelar as demandas.
+            const finalQty = item.is_3d
+              ? await getReserved3DPortion(client, id, item.product_id, parseFloat(item.quantity_requested))
+              : parseFloat(item.quantity_delivered ?? item.quantity_requested);
+            if (finalQty > 0) {
+              await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2`, [finalQty, item.product_id]);
+            }
          }
        }
     }
@@ -486,8 +536,8 @@ export const partialReturnRequest = async (req: Request, res: Response) => {
       // 1. Atualiza o item do pedido com a nova quantidade devolvida
       await client.query('UPDATE request_items SET quantity_returned = COALESCE(quantity_returned, 0) + $1 WHERE id = $2', [returnQty, ret.request_item_id]);
 
-      // 2. Devolve ao stock físico (se não for 3D)
-      if (item.product_id && !item.is_3d) {
+      // 2. Devolve ao stock físico (itens 3D incluídos: a entrega agora debita o físico deles também)
+      if (item.product_id) {
           await client.query('UPDATE stock SET quantity_on_hand = quantity_on_hand + $1 WHERE product_id = $2', [returnQty, item.product_id]);
       }
 
