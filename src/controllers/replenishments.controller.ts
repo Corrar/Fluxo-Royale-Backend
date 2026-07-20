@@ -3,6 +3,7 @@ import { pool } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
+import { setStockAudit } from '../utils/stockAudit';
 
 export const getReplenishments = async (req: Request, res: Response) => {
   try {
@@ -51,6 +52,8 @@ export const updateReplenishment = async (req: Request, res: Response) => {
     if (!['pendente', 'em_preparo'].includes(repCheck.rows[0].status)) {
       throw new Error(`Não é possível editar uma reposição já processada (status: ${repCheck.rows[0].status}).`);
     }
+
+    await setStockAudit(client, 'REPOSICAO_EDICAO', userId, `reposicao:${id}`);
 
     await client.query(`UPDATE replenishments SET order_number = COALESCE($1, order_number), client_name = COALESCE($2, client_name), city_state = COALESCE($3, city_state), total_value = COALESCE($4, total_value) WHERE id = $5`, [order_number, client_name, city_state, total_value, id]);
 
@@ -111,6 +114,13 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
     if (!allowedFrom[action] || !allowedFrom[action].includes(repStatus)) {
       throw new Error(`Ação "${action}" não permitida no status atual ("${repStatus}").`);
     }
+
+    const auditActions: Record<string, string> = {
+      'reservar': 'REPOSICAO_RESERVA',
+      'entregar': 'REPOSICAO_ENTREGA',
+      'reverter': 'REPOSICAO_REVERSAO',
+    };
+    await setStockAudit(client, auditActions[action], userId, `reposicao:${id}`);
 
     const sortedAuthItems = [...items].sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)));
 
@@ -201,6 +211,8 @@ export const deleteReplenishment = async (req: Request, res: Response) => {
     const repCheck = await client.query('SELECT status FROM replenishments WHERE id = $1 FOR UPDATE', [id]);
     if (repCheck.rows.length === 0) throw new Error('Reposição não encontrada.');
     if (repCheck.rows[0].status === 'concluido' || repCheck.rows[0].status === 'cancelada') throw new Error('Não é possível inativar reposições concluídas ou já canceladas.');
+
+    await setStockAudit(client, 'REPOSICAO_CANCELAMENTO', userId, `reposicao:${id}`);
 
     if (repCheck.rows[0].status === 'em_preparo') {
        const itemsRes = await client.query('SELECT product_id, quantity FROM replenishment_items WHERE replenishment_id = $1', [id]);

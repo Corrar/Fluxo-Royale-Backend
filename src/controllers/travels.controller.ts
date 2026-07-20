@@ -3,6 +3,7 @@ import { pool } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
+import { setStockAudit } from '../utils/stockAudit';
 
 export const getTravelOrders = async (req: Request, res: Response) => {
   try {
@@ -24,7 +25,9 @@ export const createTravelOrder = async (req: Request, res: Response) => {
     await client.query('BEGIN');
     const initialStatus = status || 'pending';
     const toRes = await client.query(`INSERT INTO travel_orders (technicians, city, status, created_by) VALUES ($1, $2, $3, $4) RETURNING id`, [technicians, city, initialStatus, userId]);
-    
+
+    await setStockAudit(client, 'VIAGEM_RESERVA', userId, `viagem:${toRes.rows[0].id}`);
+
     // Ordena para travar as linhas de stock sempre na mesma ordem (evita deadlocks)
     const sortedItems = [...items].sort((a: any, b: any) => String(a.product_id).localeCompare(String(b.product_id)));
 
@@ -61,6 +64,8 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
     const toCheck = await client.query('SELECT status FROM travel_orders WHERE id = $1 FOR UPDATE', [id]);
     if (toCheck.rows.length === 0) throw new Error('Viagem não encontrada.');
     if (toCheck.rows[0].status === 'reconciled') throw new Error('Esta viagem já passou por acerto.');
+
+    await setStockAudit(client, 'VIAGEM_ACERTO', userId, `viagem:${id}`);
 
     const currentItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
     const returnedMap = new Map(returnedItems.map((i: any) => [i.product_id, i]));
@@ -166,6 +171,8 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
     if (orderRes.rows.length === 0) throw new Error('Viagem não encontrada.');
     if (orderRes.rows[0].status === 'reconciled') throw new Error('Não é possível editar uma viagem já concluída.');
 
+    await setStockAudit(client, 'VIAGEM_EDICAO', userId, `viagem:${id}`);
+
     await client.query('UPDATE travel_orders SET technicians = $1, city = $2, status = COALESCE($3, status) WHERE id = $4', [technicians, city, status, id]);
 
     const oldItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
@@ -222,6 +229,8 @@ export const deleteTravelOrder = async (req: Request, res: Response) => {
     
     if (orderRes.rows.length === 0) throw new Error('Viagem não encontrada.');
     const status = orderRes.rows[0].status;
+
+    await setStockAudit(client, 'VIAGEM_EXCLUSAO', userId, `viagem:${id}`);
 
     // Buscamos todos os itens atrelados a esta viagem
     const itemsRes = await client.query('SELECT product_id, quantity_out, quantity_returned FROM travel_order_items WHERE travel_order_id = $1', [id]);

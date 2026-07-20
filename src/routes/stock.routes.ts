@@ -2,14 +2,15 @@
 
 import { Router } from 'express';
 import { authenticate } from '../middlewares/auth';
-import { 
-  getStock, 
-  getStockReservations, 
-  updateStock, 
+import {
+  getStock,
+  getStockReservations,
+  updateStock,
   manualWithdrawal,
-  getOpMaterialsForReturn, 
+  getOpMaterialsForReturn,
   registerReturn,
-  registerEntries // A nova função do controller
+  registerEntries, // A nova função do controller
+  getStockMovements
 } from '../controllers/stock.controller';
 
 const router = Router();
@@ -30,6 +31,13 @@ router.use(authenticate);
  * @description Retorna a lista completa com o status atual do estoque.
  */
 router.get('/', getStock);
+
+/**
+ * @route GET /stock/movements
+ * @description Ledger de movimentações do estoque (histórico imutável, gravado por trigger).
+ * @query { product_id?, action?, days?, search?, limit? }
+ */
+router.get('/movements', getStockMovements);
 
 /**
  * @route GET /stock/:id/reservations

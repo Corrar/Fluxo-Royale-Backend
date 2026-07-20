@@ -6,6 +6,7 @@ import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { sendPushNotificationToRole } from '../utils/notifications';
 import { validatePositiveItems } from '../middlewares/validators';
+import { setStockAudit } from '../utils/stockAudit';
 
 export const getRequests = async (req: Request, res: Response) => {
   try {
@@ -158,7 +159,9 @@ export const createRequest = async (req: Request, res: Response) => {
       [userId, sector, 'aberto', client_service_id]
     );
     const requestId = reqRes.rows[0].id;
-    
+
+    await setStockAudit(client, 'SOLICITACAO_RESERVA', userId, `solicitacao:${requestId}`);
+
     const sortedItems = [...items].sort((a, b) => {
        if (!a.product_id) return 1; if (!b.product_id) return -1;
        return String(a.product_id).localeCompare(String(b.product_id));
@@ -334,6 +337,14 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
       throw new Error(`Transição de status inválida: "${currentStatus}" → "${status}".`);
     }
 
+    const auditActions: Record<string, string> = {
+      'aprovado': 'SOLICITACAO_APROVACAO',
+      'entregue': 'SOLICITACAO_ENTREGA',
+      'rejeitado': 'SOLICITACAO_REJEICAO',
+      'devolvido': 'SOLICITACAO_DEVOLUCAO',
+    };
+    await setStockAudit(client, auditActions[status], userId, `solicitacao:${id}`);
+
     // Se houve ajuste manual das quantidades pelo almoxarife antes da entrega
     if (adjusted_items && Array.isArray(adjusted_items)) {
        for (const adj of adjusted_items) {
@@ -445,6 +456,8 @@ export const deleteRequest = async (req: Request, res: Response) => {
     if (reqRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Não encontrada.' }); }
     const { status } = reqRes.rows[0];
 
+    await setStockAudit(client, 'SOLICITACAO_CANCELAMENTO', userId, `solicitacao:${id}`);
+
     if (status === 'rejeitado' || status === 'entregue' || status === 'devolvido') throw new Error('Não é possível cancelar no estado atual.');
     
     let itemsRes: any;
@@ -514,6 +527,8 @@ export const partialReturnRequest = async (req: Request, res: Response) => {
         throw new Error("Apenas solicitações 'entregues' podem ter itens devolvidos.");
     }
     const client_service_id = reqRes.rows[0].client_service_id;
+
+    await setStockAudit(client, 'SOLICITACAO_DEVOLUCAO_PARCIAL', userId, `solicitacao:${id}`);
 
     for (const ret of returns) {
       if (ret.quantity_to_return <= 0) continue;

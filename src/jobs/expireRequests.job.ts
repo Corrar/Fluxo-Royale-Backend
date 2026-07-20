@@ -1,11 +1,13 @@
 import { pool } from '../db';
 import { createLog } from '../utils/logger';
+import { setStockAudit } from '../utils/stockAudit';
 
 export const startExpireRequestsJob = () => {
   setInterval(async () => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await setStockAudit(client, 'EXPIRACAO_AUTOMATICA', null, 'cron:expire-requests');
       const { rows: expiredRequests } = await client.query(`
         SELECT id FROM requests
         WHERE status IN ('aberto', 'aprovado')

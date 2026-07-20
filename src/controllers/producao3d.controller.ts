@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { pool } from '../db';
+import { setStockAudit } from '../utils/stockAudit';
 
 // ==========================================
 // 1. CATÁLOGO DE PEÇAS 3D (Lê da tabela Products)
@@ -82,6 +83,13 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
     if (demandRes.rows.length === 0) throw new Error('Demanda não encontrada.');
     const demand = demandRes.rows[0];
     const oldStatus = demand.status;
+
+    await setStockAudit(
+      client,
+      status === 'Concluída' ? 'PRODUCAO_3D_ENTRADA' : 'PRODUCAO_3D_ESTORNO',
+      (req as any).user?.id || null,
+      `demanda_3d:${id}`
+    );
 
     await client.query('UPDATE demands_3d SET status = $1 WHERE id = $2', [status, id]);
 
@@ -187,6 +195,8 @@ export const createProduction = async (req: Request, res: Response) => {
 
     await client.query('BEGIN'); // Inicia a transação
 
+    await setStockAudit(client, 'PRODUCAO_3D_ENTRADA', operatorId, demandId ? `demanda_3d:${demandId}` : 'producao_3d:livre');
+
     // 1. REGISTAR A PRODUÇÃO
     const prodRes = await client.query(`
         INSERT INTO productions_3d 
@@ -236,6 +246,8 @@ export const deleteProduction = async (req: Request, res: Response) => {
     const prodRes = await client.query('SELECT product_id, quantity FROM productions_3d WHERE id = $1', [id]);
     if (prodRes.rows.length === 0) throw new Error("Produção não encontrada");
     const { product_id, quantity } = prodRes.rows[0];
+
+    await setStockAudit(client, 'PRODUCAO_3D_ESTORNO', operatorId, `producao_3d:${id}`);
 
     // 2. Apagar a produção
     await client.query('DELETE FROM productions_3d WHERE id = $1', [id]);

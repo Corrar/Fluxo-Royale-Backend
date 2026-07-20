@@ -6,6 +6,54 @@ import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { sendPushNotificationToRole } from '../utils/notifications';
 import { validatePositiveItems } from '../middlewares/validators';
+import { setStockAudit } from '../utils/stockAudit';
+
+// =========================================================================
+// CONSULTA DO LEDGER DE MOVIMENTAÇÕES (histórico imutável do estoque)
+// =========================================================================
+export const getStockMovements = async (req: Request, res: Response) => {
+  try {
+    const { product_id, action, days, search } = req.query;
+    const params: any[] = [];
+
+    params.push(String(Math.min(Number(days) || 30, 365)));
+    let where = `WHERE m.created_at > NOW() - ($${params.length} || ' days')::interval`;
+
+    if (product_id) {
+      params.push(product_id);
+      where += ` AND m.product_id = $${params.length}`;
+    }
+    if (action) {
+      params.push(action);
+      where += ` AND m.action = $${params.length}`;
+    }
+    if (search) {
+      params.push(`%${search}%`);
+      where += ` AND (p.name ILIKE $${params.length} OR p.sku ILIKE $${params.length})`;
+    }
+
+    params.push(Math.min(Number(req.query.limit) || 300, 1000));
+
+    const { rows } = await pool.query(`
+      SELECT m.id, m.product_id, m.on_hand_before, m.on_hand_after,
+             m.reserved_before, m.reserved_after, m.on_hand_delta, m.reserved_delta,
+             m.action, m.source, m.db_user, m.created_at,
+             p.name as product_name, p.sku as product_sku, p.unit as product_unit,
+             pf.name as user_name
+      FROM stock_movements m
+      LEFT JOIN products p ON p.id = m.product_id
+      LEFT JOIN profiles pf ON pf.id::text = m.user_id
+      ${where}
+      ORDER BY m.created_at DESC
+      LIMIT $${params.length}
+    `, params);
+
+    res.json(rows);
+  } catch (error: any) {
+    console.error('Erro ao buscar movimentações de estoque:', error);
+    res.status(500).json({ error: 'Erro ao buscar movimentações de estoque' });
+  }
+};
 
 export const getStock = async (req: Request, res: Response) => {
   try {
@@ -120,16 +168,28 @@ export const updateStock = async (req: Request, res: Response) => {
     }
     
     if (fields.length > 0) {
-      values.push(id);
-      await pool.query(`UPDATE stock SET ${fields.join(', ')} WHERE id = $${index}`, values);
-      
-      // Registrar log da alteração
-      if (oldStock.rows.length > 0) {
-         await createLog(userId, 'UPDATE_STOCK', { 
-           stock_id: id, 
-           old_qty: oldStock.rows[0].quantity_on_hand, 
-           new_qty: quantity_on_hand 
-         }, getClientIp(req));
+      // Transação própria para o contexto de auditoria valer no trigger do ledger
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await setStockAudit(client, 'AJUSTE_MANUAL', userId, `stock:${id}`);
+        values.push(id);
+        await client.query(`UPDATE stock SET ${fields.join(', ')} WHERE id = $${index}`, values);
+
+        // Registrar log da alteração
+        if (oldStock.rows.length > 0) {
+           await createLog(userId, 'UPDATE_STOCK', {
+             stock_id: id,
+             old_qty: oldStock.rows[0].quantity_on_hand,
+             new_qty: quantity_on_hand
+           }, getClientIp(req), client);
+        }
+        await client.query('COMMIT');
+      } catch (err) {
+        try { await client.query('ROLLBACK'); } catch(e) {}
+        throw err;
+      } finally {
+        client.release();
       }
     }
     res.json({ success: true });
@@ -218,9 +278,11 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
     // 🟢 INSERÇÃO DA SAÍDA MANUAL COM A OP
     // =========================================================================
     const sepRes = await client.query(
-      'INSERT INTO separations (destination, status, type, client_service_id) VALUES ($1, $2, $3, $4) RETURNING id', 
+      'INSERT INTO separations (destination, status, type, client_service_id) VALUES ($1, $2, $3, $4) RETURNING id',
       [sector, 'concluida', 'manual', client_service_id]
     );
+
+    await setStockAudit(client, 'SAIDA_MANUAL', userId, `separacao:${sepRes.rows[0].id}${op_code ? ` op:${op_code}` : ''}`);
 
     // Ordena por product_id para travar as linhas sempre na mesma ordem (evita deadlocks entre transações concorrentes)
     const sortedItems = [...items].sort((a, b) => String(a.product_id).localeCompare(String(b.product_id)));
@@ -337,6 +399,8 @@ export const registerReturn = async (req: Request, res: Response) => {
     if (opResult.rows.length === 0) throw new Error('OP não encontrada no sistema.');
     const client_service_id = opResult.rows[0].id;
 
+    await setStockAudit(client, 'DEVOLUCAO_OP', userId, `op:${op_code}`);
+
     const sortedReturns = [...returns].sort((a: any, b: any) => String(a.product_id).localeCompare(String(b.product_id)));
 
     for (const item of sortedReturns) {
@@ -415,6 +479,13 @@ export const registerEntries = async (req: Request, res: Response) => {
     );
 
     const logId = logRes.rows[0].id;
+
+    await setStockAudit(
+      client,
+      entries[0]?.type === 'REAPROVEITAMENTO' ? 'ENTRADA_REAPROVEITAMENTO' : 'ENTRADA_NFE',
+      userId,
+      `entrada:${logId}`
+    );
 
     for (const entry of entries) {
       const { product_id, quantity, type, observation } = entry;

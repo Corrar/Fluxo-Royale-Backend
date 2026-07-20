@@ -7,6 +7,7 @@ import { createServer } from 'http';
 import { globalLimiter } from './middlewares/rateLimiters';
 import { initSocket } from './config/socket';
 import { startExpireRequestsJob } from './jobs/expireRequests.job';
+import { ensureStockLedger } from './db/stockLedger';
 
 // --- Rotas (Routers) ---
 import authRouter from './routes/auth.routes';
@@ -112,6 +113,9 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // ==========================================
 // Tarefa agendada para expirar solicitações antigas automaticamente
 startExpireRequestsJob();
+
+// Garante a tabela + trigger do ledger de movimentações de estoque (idempotente)
+ensureStockLedger();
 
 // ==========================================
 // 4. REGISTRO DE ROTAS (API ENDPOINTS)

@@ -3,6 +3,7 @@ import { pool } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
+import { setStockAudit } from '../utils/stockAudit';
 
 export const getSeparations = async (req: Request, res: Response) => {
   try {
@@ -69,6 +70,8 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
       throw new Error(`Esta separação já foi processada (status atual: ${sepStatus}).`);
     }
 
+    await setStockAudit(client, action === 'entregar' ? 'SEPARACAO_ENTREGA' : 'SEPARACAO_RESERVA', userId, `separacao:${id}`);
+
     // Ordena para travar as linhas de stock sempre na mesma ordem (evita deadlocks)
     const sortedAuthItems = [...items].sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)));
 
@@ -124,6 +127,8 @@ export const deleteSeparation = async (req: Request, res: Response) => {
     if(sepRes.rows.length === 0) throw new Error("Pedido não encontrado");
     if(sepRes.rows[0].status === 'entregue' || sepRes.rows[0].status === 'cancelada') throw new Error("Não é possível inativar pedidos concluídos.");
 
+    await setStockAudit(client, 'SEPARACAO_CANCELAMENTO', userId, `separacao:${id}`);
+
     const itemsRes = await client.query('SELECT product_id, quantity FROM separation_items WHERE separation_id = $1', [id]);
     for (const item of itemsRes.rows) {
        await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, quantity_reserved - $1) WHERE product_id = $2', [item.quantity, item.product_id]);
@@ -162,6 +167,8 @@ export const updateSeparation = async (req: Request, res: Response) => {
     if (!['pendente', 'em_separacao'].includes(sepCheck.rows[0].status)) {
       throw new Error(`Não é possível editar uma separação já processada (status: ${sepCheck.rows[0].status}).`);
     }
+
+    await setStockAudit(client, 'SEPARACAO_EDICAO', userId, `separacao:${id}`);
 
     // 🟢 CORREÇÃO: Atualizamos o client_service_id na base de dados
     await client.query(
@@ -273,6 +280,8 @@ export const updateReturnStatus = async (req: Request, res: Response) => {
     const ret = retRes.rows[0];
 
     if (ret.status !== 'pendente') throw new Error('Esta devolução já foi processada.');
+
+    await setStockAudit(client, 'SEPARACAO_DEVOLUCAO', userId, `separacao:${ret.separation_id}`);
 
     await client.query('UPDATE separation_returns SET status = $1 WHERE id = $2', [status, returnId]);
 
