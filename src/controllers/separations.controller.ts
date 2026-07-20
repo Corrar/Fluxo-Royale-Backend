@@ -91,7 +91,10 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
             const st = await client.query('SELECT (quantity_on_hand - quantity_reserved) as available FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
             if (parseFloat(st.rows[0]?.available || 0) < diff) throw new Error(`Estoque insuficiente ID ${productId}`);
           }
-          await client.query(`UPDATE stock SET quantity_reserved = quantity_reserved + $1 WHERE product_id = $2`, [diff, productId]);
+          // GREATEST(0): um estorno (diff negativo) maior do que a reserva real
+          // deixava quantity_reserved NEGATIVO, inflando o "disponível" acima do
+          // físico — outros fluxos passavam a reservar material que não existe.
+          await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) + $1) WHERE product_id = $2`, [diff, productId]);
         } else if (action === 'entregar') {
           const stCheck = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
           if (parseFloat(stCheck.rows[0]?.quantity_on_hand || 0) < newQty) throw new Error(`Furo de Estoque! Saldo menor que a entrega (ID ${productId}).`);
