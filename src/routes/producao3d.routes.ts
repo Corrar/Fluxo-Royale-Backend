@@ -9,7 +9,7 @@ import {
   createProduction, // <-- ADICIONADO: Importação da função de criar
   deleteProduction  // <-- ADICIONADO: Importação da função de apagar
 } from '../controllers/producao3d.controller';
-import { authenticate } from '../middlewares/auth';
+import { authenticate, requirePermission } from '../middlewares/auth';
 
 const router = Router();
 
@@ -18,6 +18,10 @@ const router = Router();
  * O middleware verifica o token JWT antes de permitir o acesso.
  */
 router.use(authenticate);
+
+// 🔒 Escritas que MOVIMENTAM ESTOQUE exigem a permissão do módulo (antes qualquer
+// autenticado registrava/apagava produção e dava entrada/saída no estoque).
+const canWrite3D = requirePermission('producao_3d');
 
 // ==========================================
 // 🏗️ CATÁLOGO DE PEÇAS 3D (Lê da tabela Products)
@@ -36,8 +40,8 @@ router.put('/parts/:id', update3DPartDetails);
 // Lista as solicitações de peças 3D pendentes e em curso
 router.get('/demands', getDemands);
 
-// Altera o status de uma demanda (ex: mover de 'Aceita' para 'Concluída')
-router.put('/demands/:id/status', updateDemandStatus);
+// Altera o status de uma demanda (ex: mover de 'Aceita' para 'Concluída') — dá entrada no estoque
+router.put('/demands/:id/status', canWrite3D, updateDemandStatus);
 
 // ==========================================
 // 📊 HISTÓRICO E MÉTRICAS (Dashboard)
@@ -47,9 +51,9 @@ router.put('/demands/:id/status', updateDemandStatus);
 router.get('/productions', getProductions);
 
 // 🚀 REGISTRA uma nova produção e dá entrada automática no estoque
-router.post('/productions', createProduction);
+router.post('/productions', canWrite3D, createProduction);
 
 // 🗑️ REMOVE um registro de produção e reverte a quantidade no estoque
-router.delete('/productions/:id', deleteProduction);
+router.delete('/productions/:id', canWrite3D, deleteProduction);
 
 export default router;

@@ -4,9 +4,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
-
-// Define a chave secreta do JWT (Use variáveis de ambiente em produção)
-const JWT_SECRET = process.env.JWT_SECRET || 'sua-chave-secreta';
+import { JWT_SECRET } from '../config/env';
 
 /**
  * Função para gerenciar o Login do usuário

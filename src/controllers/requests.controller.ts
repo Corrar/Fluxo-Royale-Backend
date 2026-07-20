@@ -523,8 +523,10 @@ export const partialReturnRequest = async (req: Request, res: Response) => {
 
     await client.query('BEGIN');
 
-    // Verifica o status do pedido e se tem uma OP associada
-    const reqRes = await client.query('SELECT status, client_service_id FROM requests WHERE id = $1', [id]);
+    // 🔒 Trava a solicitação: sem o FOR UPDATE, dois cliques (ou dois almoxarifes)
+    // liam quantity_returned = 0 ao mesmo tempo, ambos passavam na validação e o
+    // físico era creditado em dobro. O lock serializa as devoluções concorrentes.
+    const reqRes = await client.query('SELECT status, client_service_id FROM requests WHERE id = $1 FOR UPDATE', [id]);
     if (!reqRes.rows[0] || reqRes.rows[0].status !== 'entregue') {
         throw new Error("Apenas solicitações 'entregues' podem ter itens devolvidos.");
     }
@@ -535,13 +537,14 @@ export const partialReturnRequest = async (req: Request, res: Response) => {
     for (const ret of returns) {
       if (ret.quantity_to_return <= 0) continue;
 
-      // Verifica o item específico
+      // Verifica o item específico (com lock da própria linha do item)
       const itemCheck = await client.query(
-          'SELECT product_id, quantity_delivered, quantity_requested, quantity_returned, is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.id = $1', 
+          'SELECT ri.product_id, ri.quantity_delivered, ri.quantity_requested, ri.quantity_returned, p.is_3d FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id WHERE ri.id = $1 FOR UPDATE OF ri',
           [ret.request_item_id]
       );
-      
+
       const item = itemCheck.rows[0];
+      if (!item) throw new Error('Item da solicitação não encontrado.');
       const delivered = parseFloat(item.quantity_delivered ?? item.quantity_requested);
       const alreadyReturned = parseFloat(item.quantity_returned ?? 0);
       const returnQty = parseFloat(ret.quantity_to_return);
