@@ -176,13 +176,12 @@ export const updateStock = async (req: Request, res: Response) => {
         values.push(id);
         await client.query(`UPDATE stock SET ${fields.join(', ')} WHERE id = $${index}`, values);
 
-        // Registrar log da alteração
+        // Registrar log da alteração com antes/depois
         if (oldStock.rows.length > 0) {
-           await createLog(userId, 'UPDATE_STOCK', {
-             stock_id: id,
-             old_qty: oldStock.rows[0].quantity_on_hand,
-             new_qty: quantity_on_hand
-           }, getClientIp(req), client);
+           const changes: any = { stock_id: { new: id } };
+           if (quantity_on_hand !== undefined) changes.estoque_fisico = { old: oldStock.rows[0].quantity_on_hand, new: Number(quantity_on_hand) };
+           if (quantity_reserved !== undefined) changes.reservado = { old: oldStock.rows[0].quantity_reserved, new: Number(quantity_reserved) };
+           await createLog(userId, 'UPDATE_STOCK', { changes }, getClientIp(req), client);
         }
         await client.query('COMMIT');
       } catch (err) {

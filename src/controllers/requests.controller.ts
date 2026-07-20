@@ -422,7 +422,9 @@ export const updateRequestStatus = async (req: Request, res: Response) => {
     await client.query('UPDATE requests SET status = $1, rejection_reason = $2 WHERE id = $3', [status, rejection_reason || null, id]);
     
     const logAction = status === 'entregue' ? 'ENTREGAR_SOLICITACAO' : status === 'rejeitado' ? 'REJEITAR_SOLICITACAO' : status === 'devolvido' ? 'DEVOLVER_SOLICITACAO' : 'ATUALIZAR_STATUS_SOLICITACAO';
-    await createLog(userId, logAction, { id_solicitacao: id, novo_status: status, motivo: rejection_reason || 'N/A' }, getClientIp(req), client);
+    const logChanges: any = { id_solicitacao: { new: id }, status: { old: currentStatus, new: status } };
+    if (rejection_reason) logChanges.motivo = { new: rejection_reason };
+    await createLog(userId, logAction, { changes: logChanges }, getClientIp(req), client);
     
     await client.query('COMMIT');
 

@@ -310,12 +310,16 @@ export const getAdminLogs = async (req: Request, res: Response) => {
     const params: any[] = [];
     let paramIndex = 1;
 
-    if (action && action !== 'ALL') { query += ` AND a.action = $${paramIndex}`; params.push(action); paramIndex++; }
+    // ILIKE parcial: o filtro da página envia prefixos como "CRIAR"/"EDITAR"
+    // que precisam casar com ações compostas (ex.: CRIAR_SOLICITACAO).
+    if (action && action !== 'ALL') { query += ` AND a.action ILIKE $${paramIndex}`; params.push(`%${action}%`); paramIndex++; }
     if (user) { query += ` AND (p.name ILIKE $${paramIndex} OR u.email ILIKE $${paramIndex})`; params.push(`%${user}%`); paramIndex++; }
     if (startDate) { query += ` AND a.created_at >= $${paramIndex}`; params.push(`${startDate} 00:00:00`); paramIndex++; }
     if (endDate) { query += ` AND a.created_at <= $${paramIndex}`; params.push(`${endDate} 23:59:59`); paramIndex++; }
 
-    query += ` ORDER BY a.created_at DESC LIMIT 100`;
+    const limit = Math.min(Number(req.query.limit) || 300, 1000);
+    params.push(limit);
+    query += ` ORDER BY a.created_at DESC LIMIT $${paramIndex}`;
     const { rows } = await pool.query(query, params);
     res.json(rows);
   } catch (error: any) { 

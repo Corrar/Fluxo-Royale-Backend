@@ -75,8 +75,11 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
     // Ordena para travar as linhas de stock sempre na mesma ordem (evita deadlocks)
     const sortedAuthItems = [...items].sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)));
 
+    // Acumula o antes/depois de cada item para a auditoria
+    const itemAudit: Array<{ label: string; old: number; new: number }> = [];
+
     for (const item of sortedAuthItems) {
-      const oldItem = await client.query('SELECT quantity, product_id FROM separation_items WHERE id = $1', [item.id]);
+      const oldItem = await client.query('SELECT si.quantity, si.product_id, p.name as product_name FROM separation_items si LEFT JOIN products p ON p.id = si.product_id WHERE si.id = $1', [item.id]);
       if (oldItem.rows.length > 0) {
         const oldQty = parseFloat(oldItem.rows[0].quantity || 0);
         // Preferir o INCREMENTO (a intenção do operador) quando enviado: a soma
@@ -91,6 +94,7 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
 
         const productId = oldItem.rows[0].product_id;
         const diff = newQty - oldQty;
+        if (newQty !== oldQty) itemAudit.push({ label: oldItem.rows[0].product_name || String(productId), old: oldQty, new: newQty });
         await client.query('UPDATE separation_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
 
         if (action === 'reservar') {
@@ -112,9 +116,15 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
 
     const newStatus = action === 'entregar' ? 'entregue' : 'em_separacao';
     await client.query(`UPDATE separations SET status = $1 ${action === 'entregar' ? ', sent_at = NOW()' : ''} WHERE id = $2`, [newStatus, id]);
-    
-    // 📝 LOG TRADUZIDO E MELHORADO
-    await createLog(userId, 'AUTORIZAR_SEPARACAO', { id_separacao: id, acao: action }, getClientIp(req), client);
+
+    // 📝 Auditoria com antes/depois: status e quantidade de cada item alterado
+    const sepChanges: any = {
+      id_separacao: { new: id },
+      acao: { new: action },
+      status: { old: sepStatus, new: newStatus },
+    };
+    itemAudit.forEach(c => { sepChanges[c.label] = { old: c.old, new: c.new }; });
+    await createLog(userId, 'AUTORIZAR_SEPARACAO', { changes: sepChanges }, getClientIp(req), client);
     await client.query('COMMIT');
     if ((req as any).io) (req as any).io.emit('separations_update');
     res.json({ success: true });

@@ -181,6 +181,9 @@ export const updateProduct = async (req: Request, res: Response) => {
       finalTagsForDB = JSON.stringify(parsedTags);
     }
 
+    // Snapshot ANTES da edição para a auditoria registar o antes/depois real
+    const oldRes = await client.query('SELECT * FROM products WHERE id = $1', [id]);
+
     // 🛡️ PROTEÇÃO 3: Usar "param !== undefined ? param : null" impede que os números zero (0) sejam ignorados!
     const { rows } = await client.query(
       `UPDATE products 
@@ -210,8 +213,18 @@ export const updateProduct = async (req: Request, res: Response) => {
     if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Produto não encontrado' }); }
     
     // 🟢 REMOVIDA a query que alterava o estoque diretamente aqui. Edição não mexe no stock!
-    
-    await createLog(userId, 'EDITAR_PRODUTO', { id_produto: id, nome: name, alteracoes: req.body }, getClientIp(req), client);
+
+    // Auditoria com antes/depois: só regista os campos que realmente mudaram
+    const oldRow = oldRes.rows[0] || {};
+    const newRow = rows[0];
+    const auditFields = ['sku', 'name', 'description', 'unit', 'min_stock', 'unit_price', 'sales_price', 'tags', 'is_3d', 'production_minutes', 'filament_grams'];
+    const changes: any = { produto: { new: newRow.name } };
+    for (const f of auditFields) {
+      if (String(oldRow[f] ?? '') !== String(newRow[f] ?? '')) {
+        changes[f] = { old: oldRow[f] ?? '—', new: newRow[f] ?? '—' };
+      }
+    }
+    await createLog(userId, 'EDITAR_PRODUTO', { changes }, getClientIp(req), client);
     await client.query('COMMIT');
     res.json(rows[0]);
   } catch (error: any) {
@@ -279,13 +292,19 @@ export const updateProductPrices = async (req: Request, res: Response) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const oldRes = await client.query('SELECT name, unit_price, sales_price FROM products WHERE id = $1', [id]);
     // Aqui usamos o mesmo princípio, o valor deve poder ser 0
     const { rows } = await client.query(
       `UPDATE products SET unit_price = COALESCE($1, unit_price), sales_price = COALESCE($2, sales_price) WHERE id = $3 RETURNING *`,
       [parsePriceInput(unit_price), parsePriceInput(sales_price), id]
     );
     if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Produto não encontrado' }); }
-    await createLog(userId, 'ATUALIZAR_PRECOS', { id_produto: id, novos_precos: { unit_price, sales_price } }, getClientIp(req), client);
+
+    const oldRow = oldRes.rows[0] || {};
+    const priceChanges: any = { produto: { new: oldRow.name } };
+    if (String(oldRow.unit_price ?? '') !== String(rows[0].unit_price ?? '')) priceChanges.preco_unitario = { old: oldRow.unit_price ?? '—', new: rows[0].unit_price };
+    if (String(oldRow.sales_price ?? '') !== String(rows[0].sales_price ?? '')) priceChanges.preco_venda = { old: oldRow.sales_price ?? '—', new: rows[0].sales_price };
+    await createLog(userId, 'ATUALIZAR_PRECOS', { changes: priceChanges }, getClientIp(req), client);
     await client.query('COMMIT');
     res.json(rows[0]);
   } catch (error: any) {

@@ -124,8 +124,11 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
 
     const sortedAuthItems = [...items].sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)));
 
+    // Acumula o antes/depois de cada item para a auditoria
+    const itemAudit: Array<{ label: string; old: number; new: number }> = [];
+
     for (const item of sortedAuthItems) {
-      const oldItem = await client.query('SELECT quantity, product_id, qty_requested FROM replenishment_items WHERE id = $1', [item.id]);
+      const oldItem = await client.query('SELECT ri.quantity, ri.product_id, ri.qty_requested, p.name as product_name FROM replenishment_items ri LEFT JOIN products p ON p.id = ri.product_id WHERE ri.id = $1', [item.id]);
       if (oldItem.rows.length > 0) {
         const oldQty = parseFloat(oldItem.rows[0].quantity || 0);
         const newQty = item.quantity !== undefined ? parseFloat(item.quantity) : oldQty;
@@ -133,6 +136,7 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
 
         const productId = oldItem.rows[0].product_id;
         const diff = newQty - oldQty;
+        if (newQty !== oldQty) itemAudit.push({ label: oldItem.rows[0].product_name || String(productId), old: oldQty, new: newQty });
 
         if (action === 'reservar') {
           await client.query('UPDATE replenishment_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
@@ -191,8 +195,15 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
 
     await client.query(`UPDATE replenishments SET status = $1 ${extraUpdate} WHERE id = $2`, extraParams);
     
-    // 📝 LOG TRADUZIDO E MELHORADO
-    await createLog(userId, 'AUTORIZAR_REPOSICAO', { id_reposicao: id, acao: action, codigo_rastreio: tracking_code || 'Não informado' }, getClientIp(req), client);
+    // 📝 Auditoria com antes/depois: status e quantidade de cada item alterado
+    const repChanges: any = {
+      id_reposicao: { new: id },
+      acao: { new: action },
+      status: { old: repStatus, new: newStatus },
+    };
+    if (tracking_code) repChanges.codigo_rastreio = { new: tracking_code };
+    itemAudit.forEach(c => { repChanges[c.label] = { old: c.old, new: c.new }; });
+    await createLog(userId, 'AUTORIZAR_REPOSICAO', { changes: repChanges }, getClientIp(req), client);
     await client.query('COMMIT');
     if ((req as any).io) { (req as any).io.emit('stock_updated'); }
     res.json({ success: true });
