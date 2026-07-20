@@ -79,7 +79,7 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
     const itemAudit: Array<{ label: string; old: number; new: number }> = [];
 
     for (const item of sortedAuthItems) {
-      const oldItem = await client.query('SELECT si.quantity, si.product_id, p.name as product_name FROM separation_items si LEFT JOIN products p ON p.id = si.product_id WHERE si.id = $1', [item.id]);
+      const oldItem = await client.query('SELECT si.quantity, si.product_id, p.sku as product_sku FROM separation_items si LEFT JOIN products p ON p.id = si.product_id WHERE si.id = $1', [item.id]);
       if (oldItem.rows.length > 0) {
         const oldQty = parseFloat(oldItem.rows[0].quantity || 0);
         // Preferir o INCREMENTO (a intenção do operador) quando enviado: a soma
@@ -94,7 +94,7 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
 
         const productId = oldItem.rows[0].product_id;
         const diff = newQty - oldQty;
-        if (newQty !== oldQty) itemAudit.push({ label: oldItem.rows[0].product_name || String(productId), old: oldQty, new: newQty });
+        if (newQty !== oldQty) itemAudit.push({ label: oldItem.rows[0].product_sku || String(productId), old: oldQty, new: newQty });
         await client.query('UPDATE separation_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
 
         if (action === 'reservar') {

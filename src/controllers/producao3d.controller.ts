@@ -84,6 +84,13 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
     const demand = demandRes.rows[0];
     const oldStatus = demand.status;
 
+    // SKU para identificar o produto nos logs de auditoria (legibilidade)
+    let demandSku: string | null = null;
+    if (demand.product_id) {
+      const skuRes = await client.query('SELECT sku FROM products WHERE id = $1', [demand.product_id]);
+      demandSku = skuRes.rows[0]?.sku || null;
+    }
+
     await setStockAudit(
       client,
       status === 'Concluída' ? 'PRODUCAO_3D_ENTRADA' : 'PRODUCAO_3D_ESTORNO',
@@ -116,7 +123,7 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
             await client.query(
                 `INSERT INTO audit_logs (user_id, action, details)
                  VALUES ($1, $2, $3)`,
-                [(req as any).user.id, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ product_id: demand.product_id, quantity: demand.quantity, reason: 'Produção 3D Concluída' })]
+                [(req as any).user.id, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ produto: demandSku || demand.product_id, quantidade: demand.quantity, motivo: 'Produção 3D Concluída' })]
             );
         }
 
@@ -145,7 +152,7 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
             await client.query(
                 `INSERT INTO audit_logs (user_id, action, details)
                  VALUES ($1, $2, $3)`,
-                [(req as any).user.id, 'SAIDA_ESTOQUE_3D', JSON.stringify({ product_id: demand.product_id, quantity: demand.quantity, reason: 'Demanda 3D reaberta (crédito revertido)' })]
+                [(req as any).user.id, 'SAIDA_ESTOQUE_3D', JSON.stringify({ produto: demandSku || demand.product_id, quantidade: demand.quantity, motivo: 'Demanda 3D reaberta (crédito revertido)' })]
             );
         }
     }
@@ -216,11 +223,12 @@ export const createProduction = async (req: Request, res: Response) => {
     `, [partId, quantity]);
 
     // 3. REGISTAR O HISTÓRICO DE MOVIMENTAÇÃO (Tabela de Auditoria do seu Sistema)
+    const skuRes = await client.query('SELECT sku FROM products WHERE id = $1', [partId]);
     const reason = demandId ? 'Produção 3D (Demanda Kanban)' : 'Produção 3D (Estoque Livre)';
     await client.query(`
-        INSERT INTO audit_logs (user_id, action, details) 
+        INSERT INTO audit_logs (user_id, action, details)
         VALUES ($1, $2, $3)
-    `, [operatorId, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ product_id: partId, quantity, reason })]);
+    `, [operatorId, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ produto: skuRes.rows[0]?.sku || partId, quantidade: quantity, motivo: reason })]);
 
     await client.query('COMMIT'); // Guarda tudo!
     res.status(201).json(prodRes.rows[0]);
@@ -260,10 +268,11 @@ export const deleteProduction = async (req: Request, res: Response) => {
     `, [product_id, quantity]);
 
     // 4. Registar no histórico (Auditoria)
+    const skuRes = await client.query('SELECT sku FROM products WHERE id = $1', [product_id]);
     await client.query(`
-        INSERT INTO audit_logs (user_id, action, details) 
+        INSERT INTO audit_logs (user_id, action, details)
         VALUES ($1, $2, $3)
-    `, [operatorId, 'SAIDA_ESTOQUE_3D', JSON.stringify({ product_id, quantity, reason: 'Correção: Apagou registo de Produção 3D' })]);
+    `, [operatorId, 'SAIDA_ESTOQUE_3D', JSON.stringify({ produto: skuRes.rows[0]?.sku || product_id, quantidade: quantity, motivo: 'Correção: Apagou registo de Produção 3D' })]);
 
     await client.query('COMMIT');
     res.json({ success: true });

@@ -67,7 +67,7 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
 
     await setStockAudit(client, 'VIAGEM_ACERTO', userId, `viagem:${id}`);
 
-    const currentItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
+    const currentItemsRes = await client.query('SELECT ti.id, ti.product_id, ti.quantity_out, p.sku as product_sku FROM travel_order_items ti LEFT JOIN products p ON p.id = ti.product_id WHERE ti.travel_order_id = $1', [id]);
     const returnedMap = new Map(returnedItems.map((i: any) => [i.product_id, i]));
 
     for (const oldItem of currentItemsRes.rows) {
@@ -96,9 +96,9 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
           await client.query(`UPDATE stock SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1) WHERE product_id = $2`, [consumed, oldItem.product_id]);
           
           // 📝 LOG TRADUZIDO
-          await createLog(userId, 'CONFRONTO_SAIDA', { 
-              id_viagem: id, 
-              id_produto: oldItem.product_id, 
+          await createLog(userId, 'CONFRONTO_SAIDA', {
+              id_viagem: id,
+              produto: oldItem.product_sku || oldItem.product_id,
               quantidade: consumed,
               tipo_confronto: 'Consumido'
           }, getClientIp(req), client);
@@ -107,9 +107,9 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
       // 2. MATERIAL DEVOLVIDO AO ESTOQUE (Gera Log de Entrada apenas - o físico já lá estava porque era apenas reserva)
       if (returnedToStock > 0) {
           // 📝 LOG TRADUZIDO
-          await createLog(userId, 'CONFRONTO_ENTRADA', { 
-              id_viagem: id, 
-              id_produto: oldItem.product_id, 
+          await createLog(userId, 'CONFRONTO_ENTRADA', {
+              id_viagem: id,
+              produto: oldItem.product_sku || oldItem.product_id,
               quantidade: returnedToStock,
               tipo_confronto: 'Devolvido'
           }, getClientIp(req), client);
@@ -120,9 +120,9 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
           await client.query(`UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`, [extra, oldItem.product_id]);
           
           // 📝 LOG TRADUZIDO
-          await createLog(userId, 'CONFRONTO_ENTRADA_EXTRA', { 
-              id_viagem: id, 
-              id_produto: oldItem.product_id, 
+          await createLog(userId, 'CONFRONTO_ENTRADA_EXTRA', {
+              id_viagem: id,
+              produto: oldItem.product_sku || oldItem.product_id,
               quantidade: extra,
               tipo_confronto: 'Extra'
           }, getClientIp(req), client);
@@ -134,11 +134,13 @@ export const reconcileTravelOrder = async (req: Request, res: Response) => {
         if (!currentItemsRes.rows.some(old => old.product_id === retItem.product_id) && retItem.returnedQuantity > 0) {
             await client.query(`INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out, quantity_returned, status) VALUES ($1, $2, 0, $3, 'extra')`, [id, retItem.product_id, retItem.returnedQuantity]);
             await client.query(`UPDATE stock SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1 WHERE product_id = $2`, [retItem.returnedQuantity, retItem.product_id]);
-            
+
+            const skuRes = await client.query('SELECT sku FROM products WHERE id = $1', [retItem.product_id]);
+
             // 📝 LOG TRADUZIDO
-            await createLog(userId, 'CONFRONTO_ENTRADA_EXTRA', { 
-                id_viagem: id, 
-                id_produto: retItem.product_id, 
+            await createLog(userId, 'CONFRONTO_ENTRADA_EXTRA', {
+                id_viagem: id,
+                produto: skuRes.rows[0]?.sku || retItem.product_id,
                 quantidade: retItem.returnedQuantity,
                 tipo_confronto: 'Extra Puro'
             }, getClientIp(req), client);

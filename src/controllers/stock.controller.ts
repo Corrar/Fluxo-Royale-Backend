@@ -147,7 +147,7 @@ export const updateStock = async (req: Request, res: Response) => {
        }
     }
 
-    const oldStock = await pool.query('SELECT quantity_on_hand, quantity_reserved, product_id FROM stock WHERE id = $1', [id]);
+    const oldStock = await pool.query('SELECT s.quantity_on_hand, s.quantity_reserved, s.product_id, p.sku FROM stock s LEFT JOIN products p ON p.id = s.product_id WHERE s.id = $1', [id]);
 
     // 🛡️ CORREÇÃO TYPESCRIPT APLICADA:
     let fields: string[] = [];
@@ -176,9 +176,9 @@ export const updateStock = async (req: Request, res: Response) => {
         values.push(id);
         await client.query(`UPDATE stock SET ${fields.join(', ')} WHERE id = $${index}`, values);
 
-        // Registrar log da alteração com antes/depois
+        // Registrar log da alteração com antes/depois (identificado pelo SKU)
         if (oldStock.rows.length > 0) {
-           const changes: any = { stock_id: { new: id } };
+           const changes: any = { produto: { new: oldStock.rows[0].sku || oldStock.rows[0].product_id } };
            if (quantity_on_hand !== undefined) changes.estoque_fisico = { old: oldStock.rows[0].quantity_on_hand, new: Number(quantity_on_hand) };
            if (quantity_reserved !== undefined) changes.reservado = { old: oldStock.rows[0].quantity_reserved, new: Number(quantity_reserved) };
            await createLog(userId, 'UPDATE_STOCK', { changes }, getClientIp(req), client);

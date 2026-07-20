@@ -218,7 +218,7 @@ export const updateProduct = async (req: Request, res: Response) => {
     const oldRow = oldRes.rows[0] || {};
     const newRow = rows[0];
     const auditFields = ['sku', 'name', 'description', 'unit', 'min_stock', 'unit_price', 'sales_price', 'tags', 'is_3d', 'production_minutes', 'filament_grams'];
-    const changes: any = { produto: { new: newRow.name } };
+    const changes: any = { produto: { new: newRow.sku || newRow.name } };
     for (const f of auditFields) {
       if (String(oldRow[f] ?? '') !== String(newRow[f] ?? '')) {
         changes[f] = { old: oldRow[f] ?? '—', new: newRow[f] ?? '—' };
@@ -292,7 +292,7 @@ export const updateProductPrices = async (req: Request, res: Response) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const oldRes = await client.query('SELECT name, unit_price, sales_price FROM products WHERE id = $1', [id]);
+    const oldRes = await client.query('SELECT name, sku, unit_price, sales_price FROM products WHERE id = $1', [id]);
     // Aqui usamos o mesmo princípio, o valor deve poder ser 0
     const { rows } = await client.query(
       `UPDATE products SET unit_price = COALESCE($1, unit_price), sales_price = COALESCE($2, sales_price) WHERE id = $3 RETURNING *`,
@@ -301,7 +301,7 @@ export const updateProductPrices = async (req: Request, res: Response) => {
     if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Produto não encontrado' }); }
 
     const oldRow = oldRes.rows[0] || {};
-    const priceChanges: any = { produto: { new: oldRow.name } };
+    const priceChanges: any = { produto: { new: oldRow.sku || oldRow.name } };
     if (String(oldRow.unit_price ?? '') !== String(rows[0].unit_price ?? '')) priceChanges.preco_unitario = { old: oldRow.unit_price ?? '—', new: rows[0].unit_price };
     if (String(oldRow.sales_price ?? '') !== String(rows[0].sales_price ?? '')) priceChanges.preco_venda = { old: oldRow.sales_price ?? '—', new: rows[0].sales_price };
     await createLog(userId, 'ATUALIZAR_PRECOS', { changes: priceChanges }, getClientIp(req), client);

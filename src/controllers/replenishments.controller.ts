@@ -128,7 +128,7 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
     const itemAudit: Array<{ label: string; old: number; new: number }> = [];
 
     for (const item of sortedAuthItems) {
-      const oldItem = await client.query('SELECT ri.quantity, ri.product_id, ri.qty_requested, p.name as product_name FROM replenishment_items ri LEFT JOIN products p ON p.id = ri.product_id WHERE ri.id = $1', [item.id]);
+      const oldItem = await client.query('SELECT ri.quantity, ri.product_id, ri.qty_requested, p.sku as product_sku FROM replenishment_items ri LEFT JOIN products p ON p.id = ri.product_id WHERE ri.id = $1', [item.id]);
       if (oldItem.rows.length > 0) {
         const oldQty = parseFloat(oldItem.rows[0].quantity || 0);
         const newQty = item.quantity !== undefined ? parseFloat(item.quantity) : oldQty;
@@ -136,7 +136,7 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
 
         const productId = oldItem.rows[0].product_id;
         const diff = newQty - oldQty;
-        if (newQty !== oldQty) itemAudit.push({ label: oldItem.rows[0].product_name || String(productId), old: oldQty, new: newQty });
+        if (newQty !== oldQty) itemAudit.push({ label: oldItem.rows[0].product_sku || String(productId), old: oldQty, new: newQty });
 
         if (action === 'reservar') {
           await client.query('UPDATE replenishment_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
