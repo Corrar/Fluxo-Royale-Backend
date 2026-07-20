@@ -79,8 +79,15 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
       const oldItem = await client.query('SELECT quantity, product_id FROM separation_items WHERE id = $1', [item.id]);
       if (oldItem.rows.length > 0) {
         const oldQty = parseFloat(oldItem.rows[0].quantity || 0);
-        const newQty = parseFloat(item.quantity);
-        if (isNaN(newQty) || newQty < 0) throw new Error("Quantidade inválida.");
+        // Preferir o INCREMENTO (a intenção do operador) quando enviado: a soma
+        // é feita sobre o valor ATUAL do banco, sob o lock da transação. Com a
+        // quantidade absoluta, uma tela com cache defasado sobrescrevia o
+        // trabalho de outro usuário (ex.: A soma +5, B soma +3 achando que o
+        // total era 0 → o pedido caía para 3 em vez de 8, liberando reserva).
+        const newQty = item.increment !== undefined
+          ? oldQty + parseFloat(item.increment)
+          : parseFloat(item.quantity);
+        if (isNaN(newQty) || newQty < 0) throw new Error("Quantidade inválida (o estorno não pode ser maior que o já separado).");
 
         const productId = oldItem.rows[0].product_id;
         const diff = newQty - oldQty;
