@@ -31,13 +31,16 @@ export const createTravelOrder = async (req: Request, res: Response) => {
     // Ordena para travar as linhas de stock sempre na mesma ordem (evita deadlocks)
     const sortedItems = [...items].sort((a: any, b: any) => String(a.product_id).localeCompare(String(b.product_id)));
 
+    // Viagens em 'awaiting_stock' (Pendência de Compra) PODEM reservar acima do
+    // disponível de propósito: a reserva "trava" o material para a viagem e o
+    // excedente vira pendência. Só viagens normais exigem disponibilidade.
+    const enforceAvailability = initialStatus !== 'awaiting_stock';
+
     for (const item of sortedItems) {
-      // 🔒 Verifica o disponível com lock antes de reservar: sem isto a viagem
-      // reservava acima do físico e o "consumo" no acerto era clampado em zero,
-      // escondendo furo de estoque.
+      // 🔒 Lock na linha do stock para a leitura/reserva ser atômica entre fluxos
       const st = await client.query(`SELECT (COALESCE(quantity_on_hand, 0) - COALESCE(quantity_reserved, 0)) as available FROM stock WHERE product_id = $1 FOR UPDATE`, [item.product_id]);
-      if (parseFloat(st.rows[0]?.available || 0) < item.quantity) {
-        throw new Error(`Estoque disponível insuficiente para o produto ID ${item.product_id}.`);
+      if (enforceAvailability && parseFloat(st.rows[0]?.available || 0) < item.quantity) {
+        throw new Error(`Estoque disponível insuficiente para o produto ID ${item.product_id}. Se for intencional, registe a viagem como Pendência de Compra.`);
       }
       await client.query(`INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3)`, [toRes.rows[0].id, item.product_id, item.quantity]);
       await client.query(`UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2`, [item.quantity, item.product_id]);
@@ -177,6 +180,10 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
 
     await client.query('UPDATE travel_orders SET technicians = $1, city = $2, status = COALESCE($3, status) WHERE id = $4', [technicians, city, status, id]);
 
+    // Mesmo critério da criação: pendências de compra podem reservar acima do disponível
+    const effectiveStatus = status || orderRes.rows[0].status;
+    const enforceAvailability = effectiveStatus !== 'awaiting_stock';
+
     const oldItemsRes = await client.query('SELECT id, product_id, quantity_out FROM travel_order_items WHERE travel_order_id = $1', [id]);
     const newItemsMap = new Map(items.map((i: any) => [i.product_id, i]));
 
@@ -190,7 +197,7 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
         if (diff !== 0) {
            if (diff > 0) {
              const st = await client.query(`SELECT (COALESCE(quantity_on_hand, 0) - COALESCE(quantity_reserved, 0)) as available FROM stock WHERE product_id = $1 FOR UPDATE`, [oldItem.product_id]);
-             if (parseFloat(st.rows[0]?.available || 0) < diff) throw new Error(`Estoque disponível insuficiente para aumentar o produto ID ${oldItem.product_id}.`);
+             if (enforceAvailability && parseFloat(st.rows[0]?.available || 0) < diff) throw new Error(`Estoque disponível insuficiente para aumentar o produto ID ${oldItem.product_id}. Se for intencional, mantenha a viagem como Pendência de Compra.`);
            }
            await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) + $1) WHERE product_id = $2', [diff, oldItem.product_id]);
            await client.query('UPDATE travel_order_items SET quantity_out = $1 WHERE id = $2', [newItem.quantity, oldItem.id]);
@@ -201,7 +208,7 @@ export const updateTravelOrder = async (req: Request, res: Response) => {
     for (const item of items) {
       if (!oldItemsRes.rows.some(old => old.product_id === item.product_id)) {
         const st = await client.query(`SELECT (COALESCE(quantity_on_hand, 0) - COALESCE(quantity_reserved, 0)) as available FROM stock WHERE product_id = $1 FOR UPDATE`, [item.product_id]);
-        if (parseFloat(st.rows[0]?.available || 0) < item.quantity) throw new Error(`Estoque disponível insuficiente para o produto ID ${item.product_id}.`);
+        if (enforceAvailability && parseFloat(st.rows[0]?.available || 0) < item.quantity) throw new Error(`Estoque disponível insuficiente para o produto ID ${item.product_id}. Se for intencional, mantenha a viagem como Pendência de Compra.`);
         await client.query('INSERT INTO travel_order_items (travel_order_id, product_id, quantity_out) VALUES ($1, $2, $3)', [id, item.product_id, item.quantity]);
         await client.query('UPDATE stock SET quantity_reserved = COALESCE(quantity_reserved, 0) + $1 WHERE product_id = $2', [item.quantity, item.product_id]);
       }
