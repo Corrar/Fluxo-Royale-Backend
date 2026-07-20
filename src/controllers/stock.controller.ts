@@ -207,9 +207,9 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
   
   // Incluímos absolutamente todos os setores usados no sistema
   const VALID_SECTORS = [
-    "Elétrica", "Flow", "Esteira", "Lavadora", "Usinagem", 
+    "Elétrica", "Flow", "Esteira", "Lavadora", "Usinagem",
     "Desenvolvimento", "Protótipo", "Engenharia", "Outros",
-    "Viagem", "Terceiros", "Acumulador", "Reposição"
+    "Viagem", "Terceiros", "Acumulador", "Reposição", "Escritório"
   ];
 
   // Transforma o setor recebido e a lista para letras maiúsculas.
