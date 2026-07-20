@@ -229,8 +229,9 @@ export const createRequest = async (req: Request, res: Response) => {
       }
       
       // Regista o item na solicitação original (Aparece no painel do Almoxarife para entregar o que já tem)
+      // unit_price = preço do produto NO MOMENTO do pedido (custo histórico congelado)
       await client.query(
-        'INSERT INTO request_items (request_id, product_id, custom_product_name, quantity_requested, observation, client_service) VALUES ($1, $2, $3, $4, $5, $6)', 
+        'INSERT INTO request_items (request_id, product_id, custom_product_name, quantity_requested, observation, client_service, unit_price) VALUES ($1, $2, $3, $4, $5, $6, (SELECT unit_price FROM products WHERE id = $2))',
         [requestId, productId, customName, item.quantity, item.observation || null, item.client_service || null]
       );
     }

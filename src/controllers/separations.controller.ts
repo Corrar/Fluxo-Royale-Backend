@@ -36,7 +36,7 @@ export const createSeparation = async (req: Request, res: Response) => {
     );
     
     for (const item of items) {
-      await client.query(`INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity, observation) VALUES ($1, $2, $3, 0, $4)`, [sepRes.rows[0].id, item.product_id, item.quantity, item.observation || null]);
+      await client.query(`INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity, observation, unit_price) VALUES ($1, $2, $3, 0, $4, (SELECT unit_price FROM products WHERE id = $2))`, [sepRes.rows[0].id, item.product_id, item.quantity, item.observation || null]);
     }
     
     // 📝 LOG TRADUZIDO E MELHORADO
@@ -217,7 +217,7 @@ export const updateSeparation = async (req: Request, res: Response) => {
       if (exists) {
         await client.query('UPDATE separation_items SET qty_requested = $1 WHERE id = $2', [item.quantity, exists.id]);
       } else {
-        await client.query(`INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity) VALUES ($1, $2, $3, 0)`, [id, item.product_id, item.quantity]);
+        await client.query(`INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity, unit_price) VALUES ($1, $2, $3, 0, (SELECT unit_price FROM products WHERE id = $2))`, [id, item.product_id, item.quantity]);
       }
     }
 

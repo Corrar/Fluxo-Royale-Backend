@@ -158,10 +158,10 @@ export const getGeneralReports = async (req: Request, res: Response) => {
              cs.op_code, 
              s.client_name as solicitante,
              s.status as status,
-             p.name as produto, p.sku, p.unit as unidade, 
-             si.quantity as quantidade, 
-             COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario 
-      FROM separation_items si 
+             p.name as produto, p.sku, p.unit as unidade,
+             si.quantity as quantidade,
+             COALESCE(CAST(NULLIF(CAST(si.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario
+      FROM separation_items si
       JOIN separations s ON si.separation_id = s.id 
       JOIN products p ON si.product_id = p.id 
       LEFT JOIN client_services cs ON s.client_service_id = cs.id 
@@ -175,10 +175,10 @@ export const getGeneralReports = async (req: Request, res: Response) => {
              cs.op_code, pf.name as solicitante, 
              COALESCE(p.name, ri.custom_product_name) as produto, 
              p.sku, p.unit as unidade, 
-             COALESCE(ri.quantity_delivered, ri.quantity_requested) as quantidade, 
-             r.status, 
-             COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario 
-      FROM request_items ri 
+             COALESCE(ri.quantity_delivered, ri.quantity_requested) as quantidade,
+             r.status,
+             COALESCE(CAST(NULLIF(CAST(ri.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario
+      FROM request_items ri
       JOIN requests r ON ri.request_id = r.id 
       LEFT JOIN products p ON ri.product_id = p.id 
       LEFT JOIN profiles pf ON r.requester_id = pf.id 
@@ -193,10 +193,10 @@ export const getGeneralReports = async (req: Request, res: Response) => {
              'Cliente: ' || COALESCE(rep.client_name, 'N/A') as destino_setor, 
              NULL as op_code, rep.client_name as solicitante, 
              p.name as produto, p.sku, p.unit as unidade, 
-             ri.quantity as quantidade, 
-             rep.status, 
-             COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario 
-      FROM replenishment_items ri 
+             ri.quantity as quantidade,
+             rep.status,
+             COALESCE(CAST(NULLIF(CAST(ri.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario
+      FROM replenishment_items ri
       JOIN replenishments rep ON ri.replenishment_id = rep.id 
       LEFT JOIN products p ON ri.product_id = p.id 
       WHERE rep.created_at >= $1 AND rep.created_at <= $2 
@@ -235,12 +235,12 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       const opsQuery = `
         SELECT 
           si.id, 
-          si.quantity as quantidade, 
-          p.name as produto, 
-          COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario, 
-          cs.op_code, 
-          cs.status as op_status, 
-          s.destination as destino_setor, 
+          si.quantity as quantidade,
+          p.name as produto,
+          COALESCE(CAST(NULLIF(CAST(si.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario,
+          cs.op_code,
+          cs.status as op_status,
+          s.destination as destino_setor,
           COALESCE(s.sent_at, s.created_at) as data
         FROM separation_items si
         JOIN separations s ON si.separation_id = s.id
@@ -252,12 +252,12 @@ export const getGeneralReports = async (req: Request, res: Response) => {
 
         SELECT 
           ri.id, 
-          COALESCE(ri.quantity_delivered, ri.quantity_requested) as quantidade, 
-          COALESCE(p.name, ri.custom_product_name) as produto, 
-          COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario, 
-          cs.op_code, 
-          cs.status as op_status, 
-          COALESCE(pf.sector, r.sector) as destino_setor, 
+          COALESCE(ri.quantity_delivered, ri.quantity_requested) as quantidade,
+          COALESCE(p.name, ri.custom_product_name) as produto,
+          COALESCE(CAST(NULLIF(CAST(ri.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario,
+          cs.op_code,
+          cs.status as op_status,
+          COALESCE(pf.sector, r.sector) as destino_setor,
           r.created_at as data
         FROM request_items ri
         JOIN requests r ON ri.request_id = r.id

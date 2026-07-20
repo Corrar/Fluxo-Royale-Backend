@@ -100,6 +100,13 @@ export const ensureStockLedger = async () => {
       FOR EACH ROW EXECUTE FUNCTION fn_log_stock_movement();
     `);
 
+    // 💰 Preço histórico: grava o custo unitário NO MOMENTO da movimentação
+    // (colunas nullable — registros antigos ficam null e o relatório usa o
+    // preço atual do produto como fallback via COALESCE).
+    await pool.query(`ALTER TABLE separation_items ADD COLUMN IF NOT EXISTS unit_price NUMERIC;`);
+    await pool.query(`ALTER TABLE request_items ADD COLUMN IF NOT EXISTS unit_price NUMERIC;`);
+    await pool.query(`ALTER TABLE replenishment_items ADD COLUMN IF NOT EXISTS unit_price NUMERIC;`);
+
     console.log('📒 Ledger de movimentações de estoque (stock_movements) pronto.');
   } catch (err) {
     console.error('❌ Falha ao preparar o ledger de movimentações de estoque:', err);

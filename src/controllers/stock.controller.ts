@@ -299,7 +299,7 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
       }
 
       await client.query(
-        'INSERT INTO separation_items (separation_id, product_id, quantity, observation) VALUES ($1, $2, $3, $4)',
+        'INSERT INTO separation_items (separation_id, product_id, quantity, observation, unit_price) VALUES ($1, $2, $3, $4, (SELECT unit_price FROM products WHERE id = $2))',
         [sepRes.rows[0].id, item.product_id, item.quantity, item.observation || null]
       );
 

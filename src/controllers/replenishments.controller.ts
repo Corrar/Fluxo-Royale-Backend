@@ -24,7 +24,7 @@ export const createReplenishment = async (req: Request, res: Response) => {
     await client.query('BEGIN');
     const repRes = await client.query(`INSERT INTO replenishments (order_number, client_name, city_state, status, total_value) VALUES ($1, $2, $3, $4, $5) RETURNING id`, [order_number, client_name, city_state, status || 'pendente', total_value || 0]);
     for (const item of items) {
-      await client.query(`INSERT INTO replenishment_items (replenishment_id, product_id, qty_requested, quantity) VALUES ($1, $2, $3, 0)`, [repRes.rows[0].id, item.product_id, item.qty_requested]);
+      await client.query(`INSERT INTO replenishment_items (replenishment_id, product_id, qty_requested, quantity, unit_price) VALUES ($1, $2, $3, 0, (SELECT unit_price FROM products WHERE id = $2))`, [repRes.rows[0].id, item.product_id, item.qty_requested]);
     }
     
     // 📝 LOG TRADUZIDO E MELHORADO
@@ -74,7 +74,7 @@ export const updateReplenishment = async (req: Request, res: Response) => {
     }
     for (const item of items) {
       if (!existingItemsRes.rows.some((old: any) => old.product_id === item.product_id)) {
-        await client.query(`INSERT INTO replenishment_items (replenishment_id, product_id, qty_requested, quantity) VALUES ($1, $2, $3, 0)`, [id, item.product_id, item.qty_requested]);
+        await client.query(`INSERT INTO replenishment_items (replenishment_id, product_id, qty_requested, quantity, unit_price) VALUES ($1, $2, $3, 0, (SELECT unit_price FROM products WHERE id = $2))`, [id, item.product_id, item.qty_requested]);
       }
     }
     
