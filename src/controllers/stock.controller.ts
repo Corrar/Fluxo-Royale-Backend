@@ -506,9 +506,11 @@ export const registerEntries = async (req: Request, res: Response) => {
         DO UPDATE SET quantity_on_hand = COALESCE(stock.quantity_on_hand, 0) + $2::numeric
       `, [product_id, numericQty]);
 
-      // 3. 🟢 MAGIA AQUI: Inserimos o item na tabela xml_items, conectada ao log
+      // 3. 🟢 MAGIA AQUI: Inserimos o item na tabela xml_items, conectada ao log.
+      // unit_price = preço do produto NO MOMENTO da entrada (custo congelado —
+      // editar o preço do produto depois não altera o valor desta entrada).
       await client.query(
-        "INSERT INTO xml_items (xml_log_id, product_id, quantity) VALUES ($1, $2, $3)", 
+        "INSERT INTO xml_items (xml_log_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, (SELECT unit_price FROM products WHERE id = $2))",
         [logId, product_id, numericQty]
       );
     }

@@ -106,6 +106,8 @@ export const ensureStockLedger = async () => {
     await pool.query(`ALTER TABLE separation_items ADD COLUMN IF NOT EXISTS unit_price NUMERIC;`);
     await pool.query(`ALTER TABLE request_items ADD COLUMN IF NOT EXISTS unit_price NUMERIC;`);
     await pool.query(`ALTER TABLE replenishment_items ADD COLUMN IF NOT EXISTS unit_price NUMERIC;`);
+    // Entradas manuais (NFe/reaproveitamento) — congela o custo no lançamento
+    await pool.query(`ALTER TABLE xml_items ADD COLUMN IF NOT EXISTS unit_price NUMERIC;`);
 
     console.log('📒 Ledger de movimentações de estoque (stock_movements) pronto.');
   } catch (err) {

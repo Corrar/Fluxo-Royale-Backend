@@ -145,7 +145,7 @@ export const getGeneralReports = async (req: Request, res: Response) => {
     // TAMBÉM GARANTIMOS QUE O CAMPO "origem_nome" E "origem" SÃO LIDOS PARA O REPORTS.TSX RECONHECER O REUSO!
     const entradasRes = await pool.query(`
       SELECT xl.created_at as data, 'Entrada' as tipo, xl.file_name as origem, xl.file_name as origem_nome, p.name as produto, p.sku, p.unit as unidade, xi.quantity as quantidade,
-             COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario
+             COALESCE(CAST(NULLIF(CAST(xi.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario
       FROM xml_items xi
       JOIN products p ON xi.product_id = p.id
       JOIN xml_logs xl ON xi.xml_log_id = xl.id
