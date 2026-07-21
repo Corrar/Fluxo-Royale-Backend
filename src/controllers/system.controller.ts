@@ -144,11 +144,12 @@ export const getGeneralReports = async (req: Request, res: Response) => {
     // 🟢 CORREÇÃO CRÍTICA AQUI: Filtrar pela data do LOG (xl.created_at) em vez do item (xi.created_at)
     // TAMBÉM GARANTIMOS QUE O CAMPO "origem_nome" E "origem" SÃO LIDOS PARA O REPORTS.TSX RECONHECER O REUSO!
     const entradasRes = await pool.query(`
-      SELECT xl.created_at as data, 'Entrada' as tipo, xl.file_name as origem, xl.file_name as origem_nome, p.name as produto, p.sku, p.unit as unidade, xi.quantity as quantidade 
-      FROM xml_items xi 
-      JOIN products p ON xi.product_id = p.id 
-      JOIN xml_logs xl ON xi.xml_log_id = xl.id 
-      WHERE xl.created_at >= $1 AND xl.created_at <= $2 
+      SELECT xl.created_at as data, 'Entrada' as tipo, xl.file_name as origem, xl.file_name as origem_nome, p.name as produto, p.sku, p.unit as unidade, xi.quantity as quantidade,
+             COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario
+      FROM xml_items xi
+      JOIN products p ON xi.product_id = p.id
+      JOIN xml_logs xl ON xi.xml_log_id = xl.id
+      WHERE xl.created_at >= $1 AND xl.created_at <= $2
       ORDER BY xl.created_at DESC`, [start, end]);
     
     const separacoesRes = await pool.query(`
