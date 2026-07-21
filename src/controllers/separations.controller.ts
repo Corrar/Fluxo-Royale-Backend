@@ -3,6 +3,7 @@ import { pool } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
+import { setStockAudit } from '../utils/stockAudit';
 
 export const getSeparations = async (req: Request, res: Response) => {
   try {
@@ -35,7 +36,7 @@ export const createSeparation = async (req: Request, res: Response) => {
     );
     
     for (const item of items) {
-      await client.query(`INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity, observation) VALUES ($1, $2, $3, 0, $4)`, [sepRes.rows[0].id, item.product_id, item.quantity, item.observation || null]);
+      await client.query(`INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity, observation, unit_price) VALUES ($1, $2, $3, 0, $4, (SELECT unit_price FROM products WHERE id = $2))`, [sepRes.rows[0].id, item.product_id, item.quantity, item.observation || null]);
     }
     
     // 📝 LOG TRADUZIDO E MELHORADO
@@ -60,15 +61,40 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
     const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     if (userCheck.rows[0]?.role !== 'admin' && userCheck.rows[0]?.role !== 'almoxarife') throw new Error('Acesso negado.');
 
-    for (const item of items) {
-      const oldItem = await client.query('SELECT quantity, product_id FROM separation_items WHERE id = $1', [item.id]);
+    // 🔒 Trava a separação e valida o status atual: sem isto, dois cliques em
+    // "entregar" (ou duas abas abertas) debitavam o estoque em dobro.
+    const sepCheck = await client.query('SELECT status FROM separations WHERE id = $1 FOR UPDATE', [id]);
+    if (sepCheck.rows.length === 0) throw new Error('Separação não encontrada.');
+    const sepStatus = sepCheck.rows[0].status;
+    if (!['pendente', 'em_separacao'].includes(sepStatus)) {
+      throw new Error(`Esta separação já foi processada (status atual: ${sepStatus}).`);
+    }
+
+    await setStockAudit(client, action === 'entregar' ? 'SEPARACAO_ENTREGA' : 'SEPARACAO_RESERVA', userId, `separacao:${id}`);
+
+    // Ordena para travar as linhas de stock sempre na mesma ordem (evita deadlocks)
+    const sortedAuthItems = [...items].sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)));
+
+    // Acumula o antes/depois de cada item para a auditoria
+    const itemAudit: Array<{ label: string; old: number; new: number }> = [];
+
+    for (const item of sortedAuthItems) {
+      const oldItem = await client.query('SELECT si.quantity, si.product_id, p.sku as product_sku FROM separation_items si LEFT JOIN products p ON p.id = si.product_id WHERE si.id = $1', [item.id]);
       if (oldItem.rows.length > 0) {
         const oldQty = parseFloat(oldItem.rows[0].quantity || 0);
-        const newQty = parseFloat(item.quantity);
-        if (isNaN(newQty) || newQty < 0) throw new Error("Quantidade inválida.");
+        // Preferir o INCREMENTO (a intenção do operador) quando enviado: a soma
+        // é feita sobre o valor ATUAL do banco, sob o lock da transação. Com a
+        // quantidade absoluta, uma tela com cache defasado sobrescrevia o
+        // trabalho de outro usuário (ex.: A soma +5, B soma +3 achando que o
+        // total era 0 → o pedido caía para 3 em vez de 8, liberando reserva).
+        const newQty = item.increment !== undefined
+          ? oldQty + parseFloat(item.increment)
+          : parseFloat(item.quantity);
+        if (isNaN(newQty) || newQty < 0) throw new Error("Quantidade inválida (o estorno não pode ser maior que o já separado).");
 
         const productId = oldItem.rows[0].product_id;
         const diff = newQty - oldQty;
+        if (newQty !== oldQty) itemAudit.push({ label: oldItem.rows[0].product_sku || String(productId), old: oldQty, new: newQty });
         await client.query('UPDATE separation_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
 
         if (action === 'reservar') {
@@ -76,7 +102,10 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
             const st = await client.query('SELECT (quantity_on_hand - quantity_reserved) as available FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
             if (parseFloat(st.rows[0]?.available || 0) < diff) throw new Error(`Estoque insuficiente ID ${productId}`);
           }
-          await client.query(`UPDATE stock SET quantity_reserved = quantity_reserved + $1 WHERE product_id = $2`, [diff, productId]);
+          // GREATEST(0): um estorno (diff negativo) maior do que a reserva real
+          // deixava quantity_reserved NEGATIVO, inflando o "disponível" acima do
+          // físico — outros fluxos passavam a reservar material que não existe.
+          await client.query(`UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) + $1) WHERE product_id = $2`, [diff, productId]);
         } else if (action === 'entregar') {
           const stCheck = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1 FOR UPDATE', [productId]);
           if (parseFloat(stCheck.rows[0]?.quantity_on_hand || 0) < newQty) throw new Error(`Furo de Estoque! Saldo menor que a entrega (ID ${productId}).`);
@@ -87,9 +116,15 @@ export const authorizeSeparation = async (req: Request, res: Response) => {
 
     const newStatus = action === 'entregar' ? 'entregue' : 'em_separacao';
     await client.query(`UPDATE separations SET status = $1 ${action === 'entregar' ? ', sent_at = NOW()' : ''} WHERE id = $2`, [newStatus, id]);
-    
-    // 📝 LOG TRADUZIDO E MELHORADO
-    await createLog(userId, 'AUTORIZAR_SEPARACAO', { id_separacao: id, acao: action }, getClientIp(req), client);
+
+    // 📝 Auditoria com antes/depois: status e quantidade de cada item alterado
+    const sepChanges: any = {
+      id_separacao: { new: id },
+      acao: { new: action },
+      status: { old: sepStatus, new: newStatus },
+    };
+    itemAudit.forEach(c => { sepChanges[c.label] = { old: c.old, new: c.new }; });
+    await createLog(userId, 'AUTORIZAR_SEPARACAO', { changes: sepChanges }, getClientIp(req), client);
     await client.query('COMMIT');
     if ((req as any).io) (req as any).io.emit('separations_update');
     res.json({ success: true });
@@ -111,6 +146,8 @@ export const deleteSeparation = async (req: Request, res: Response) => {
     const sepRes = await client.query('SELECT status FROM separations WHERE id = $1 FOR UPDATE', [id]);
     if(sepRes.rows.length === 0) throw new Error("Pedido não encontrado");
     if(sepRes.rows[0].status === 'entregue' || sepRes.rows[0].status === 'cancelada') throw new Error("Não é possível inativar pedidos concluídos.");
+
+    await setStockAudit(client, 'SEPARACAO_CANCELAMENTO', userId, `separacao:${id}`);
 
     const itemsRes = await client.query('SELECT product_id, quantity FROM separation_items WHERE separation_id = $1', [id]);
     for (const item of itemsRes.rows) {
@@ -143,6 +180,16 @@ export const updateSeparation = async (req: Request, res: Response) => {
     const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
     if (userCheck.rows[0]?.role !== 'admin' && userCheck.rows[0]?.role !== 'almoxarife') throw new Error('Acesso negado.');
 
+    // 🔒 Não permitir editar separações já entregues/canceladas: remover itens aqui
+    // libertava reservas que já não existiam, zerando reservas de OUTROS pedidos.
+    const sepCheck = await client.query('SELECT status FROM separations WHERE id = $1 FOR UPDATE', [id]);
+    if (sepCheck.rows.length === 0) throw new Error('Separação não encontrada.');
+    if (!['pendente', 'em_separacao'].includes(sepCheck.rows[0].status)) {
+      throw new Error(`Não é possível editar uma separação já processada (status: ${sepCheck.rows[0].status}).`);
+    }
+
+    await setStockAudit(client, 'SEPARACAO_EDICAO', userId, `separacao:${id}`);
+
     // 🟢 CORREÇÃO: Atualizamos o client_service_id na base de dados
     await client.query(
       `UPDATE separations SET client_name = $1, production_order = $2, destination = $3, client_service_id = $4 WHERE id = $5`,
@@ -170,7 +217,7 @@ export const updateSeparation = async (req: Request, res: Response) => {
       if (exists) {
         await client.query('UPDATE separation_items SET qty_requested = $1 WHERE id = $2', [item.quantity, exists.id]);
       } else {
-        await client.query(`INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity) VALUES ($1, $2, $3, 0)`, [id, item.product_id, item.quantity]);
+        await client.query(`INSERT INTO separation_items (separation_id, product_id, qty_requested, quantity, unit_price) VALUES ($1, $2, $3, 0, (SELECT unit_price FROM products WHERE id = $2))`, [id, item.product_id, item.quantity]);
       }
     }
 
@@ -196,10 +243,30 @@ export const createReturn = async (req: Request, res: Response) => {
 
   try {
     await client.query('BEGIN');
+    // Trava a separação para serializar devoluções concorrentes do mesmo pedido
+    const sepCheck = await client.query('SELECT status FROM separations WHERE id = $1 FOR UPDATE', [id]);
+    if (sepCheck.rows.length === 0) throw new Error('Separação não encontrada.');
+
     for (const item of items) {
+      const returnQty = Number(item.quantity);
+      if (!item.product_id || isNaN(returnQty) || returnQty <= 0) throw new Error('Quantidade de devolução inválida.');
+
+      // Nunca deixar devolver mais do que foi entregue (descontando devoluções já
+      // registadas, pendentes ou aprovadas) — senão o estoque infla na aprovação.
+      const balance = await client.query(`
+        SELECT
+          COALESCE((SELECT SUM(quantity) FROM separation_items WHERE separation_id = $1 AND product_id = $2), 0) as delivered,
+          COALESCE((SELECT SUM(quantity) FROM separation_returns WHERE separation_id = $1 AND product_id = $2 AND status IN ('pendente', 'aprovado')), 0) as already_returned
+      `, [id, item.product_id]);
+
+      const availableToReturn = parseFloat(balance.rows[0].delivered) - parseFloat(balance.rows[0].already_returned);
+      if (returnQty > availableToReturn) {
+        throw new Error(`Devolução maior que o entregue nesta separação (disponível para devolver: ${Math.max(0, availableToReturn)}).`);
+      }
+
       await client.query(
         `INSERT INTO separation_returns (separation_id, product_id, quantity, status) VALUES ($1, $2, $3, 'pendente')`,
-        [id, item.product_id, item.quantity]
+        [id, item.product_id, returnQty]
       );
     }
     
@@ -233,6 +300,8 @@ export const updateReturnStatus = async (req: Request, res: Response) => {
     const ret = retRes.rows[0];
 
     if (ret.status !== 'pendente') throw new Error('Esta devolução já foi processada.');
+
+    await setStockAudit(client, 'SEPARACAO_DEVOLUCAO', userId, `separacao:${ret.separation_id}`);
 
     await client.query('UPDATE separation_returns SET status = $1 WHERE id = $2', [status, returnId]);
 

@@ -6,6 +6,54 @@ import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { sendPushNotificationToRole } from '../utils/notifications';
 import { validatePositiveItems } from '../middlewares/validators';
+import { setStockAudit } from '../utils/stockAudit';
+
+// =========================================================================
+// CONSULTA DO LEDGER DE MOVIMENTAÇÕES (histórico imutável do estoque)
+// =========================================================================
+export const getStockMovements = async (req: Request, res: Response) => {
+  try {
+    const { product_id, action, days, search } = req.query;
+    const params: any[] = [];
+
+    params.push(String(Math.min(Number(days) || 30, 365)));
+    let where = `WHERE m.created_at > NOW() - ($${params.length} || ' days')::interval`;
+
+    if (product_id) {
+      params.push(product_id);
+      where += ` AND m.product_id = $${params.length}`;
+    }
+    if (action) {
+      params.push(action);
+      where += ` AND m.action = $${params.length}`;
+    }
+    if (search) {
+      params.push(`%${search}%`);
+      where += ` AND (p.name ILIKE $${params.length} OR p.sku ILIKE $${params.length})`;
+    }
+
+    params.push(Math.min(Number(req.query.limit) || 300, 1000));
+
+    const { rows } = await pool.query(`
+      SELECT m.id, m.product_id, m.on_hand_before, m.on_hand_after,
+             m.reserved_before, m.reserved_after, m.on_hand_delta, m.reserved_delta,
+             m.action, m.source, m.db_user, m.created_at,
+             p.name as product_name, p.sku as product_sku, p.unit as product_unit,
+             pf.name as user_name
+      FROM stock_movements m
+      LEFT JOIN products p ON p.id = m.product_id
+      LEFT JOIN profiles pf ON pf.id::text = m.user_id
+      ${where}
+      ORDER BY m.created_at DESC
+      LIMIT $${params.length}
+    `, params);
+
+    res.json(rows);
+  } catch (error: any) {
+    console.error('Erro ao buscar movimentações de estoque:', error);
+    res.status(500).json({ error: 'Erro ao buscar movimentações de estoque' });
+  }
+};
 
 export const getStock = async (req: Request, res: Response) => {
   try {
@@ -99,33 +147,48 @@ export const updateStock = async (req: Request, res: Response) => {
        }
     }
 
-    const oldStock = await pool.query('SELECT quantity_on_hand, quantity_reserved, product_id FROM stock WHERE id = $1', [id]);
-    
+    const oldStock = await pool.query('SELECT s.quantity_on_hand, s.quantity_reserved, s.product_id, p.sku FROM stock s LEFT JOIN products p ON p.id = s.product_id WHERE s.id = $1', [id]);
+
     // 🛡️ CORREÇÃO TYPESCRIPT APLICADA:
-    let fields: string[] = []; 
-    let values: any[] = []; 
+    let fields: string[] = [];
+    let values: any[] = [];
     let index = 1;
-    
-    if (quantity_on_hand !== undefined) { 
-      fields.push(`quantity_on_hand = $${index++}`); 
-      values.push(quantity_on_hand); 
+
+    if (quantity_on_hand !== undefined) {
+      const qty = Number(quantity_on_hand);
+      if (isNaN(qty) || qty < 0) return res.status(400).json({ error: 'Quantidade em mãos inválida: deve ser um número maior ou igual a zero.' });
+      fields.push(`quantity_on_hand = $${index++}`);
+      values.push(qty);
     }
-    if (quantity_reserved !== undefined) { 
-      fields.push(`quantity_reserved = $${index++}`); 
-      values.push(quantity_reserved); 
+    if (quantity_reserved !== undefined) {
+      const qty = Number(quantity_reserved);
+      if (isNaN(qty) || qty < 0) return res.status(400).json({ error: 'Quantidade reservada inválida: deve ser um número maior ou igual a zero.' });
+      fields.push(`quantity_reserved = $${index++}`);
+      values.push(qty);
     }
     
     if (fields.length > 0) {
-      values.push(id);
-      await pool.query(`UPDATE stock SET ${fields.join(', ')} WHERE id = $${index}`, values);
-      
-      // Registrar log da alteração
-      if (oldStock.rows.length > 0) {
-         await createLog(userId, 'UPDATE_STOCK', { 
-           stock_id: id, 
-           old_qty: oldStock.rows[0].quantity_on_hand, 
-           new_qty: quantity_on_hand 
-         }, getClientIp(req));
+      // Transação própria para o contexto de auditoria valer no trigger do ledger
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await setStockAudit(client, 'AJUSTE_MANUAL', userId, `stock:${id}`);
+        values.push(id);
+        await client.query(`UPDATE stock SET ${fields.join(', ')} WHERE id = $${index}`, values);
+
+        // Registrar log da alteração com antes/depois (identificado pelo SKU)
+        if (oldStock.rows.length > 0) {
+           const changes: any = { produto: { new: oldStock.rows[0].sku || oldStock.rows[0].product_id } };
+           if (quantity_on_hand !== undefined) changes.estoque_fisico = { old: oldStock.rows[0].quantity_on_hand, new: Number(quantity_on_hand) };
+           if (quantity_reserved !== undefined) changes.reservado = { old: oldStock.rows[0].quantity_reserved, new: Number(quantity_reserved) };
+           await createLog(userId, 'UPDATE_STOCK', { changes }, getClientIp(req), client);
+        }
+        await client.query('COMMIT');
+      } catch (err) {
+        try { await client.query('ROLLBACK'); } catch(e) {}
+        throw err;
+      } finally {
+        client.release();
       }
     }
     res.json({ success: true });
@@ -144,9 +207,9 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
   
   // Incluímos absolutamente todos os setores usados no sistema
   const VALID_SECTORS = [
-    "Elétrica", "Flow", "Esteira", "Lavadora", "Usinagem", 
+    "Elétrica", "Flow", "Esteira", "Lavadora", "Usinagem",
     "Desenvolvimento", "Protótipo", "Engenharia", "Outros",
-    "Viagem", "Terceiros", "Acumulador", "Reposição"
+    "Viagem", "Terceiros", "Acumulador", "Reposição", "Escritório"
   ];
 
   // Transforma o setor recebido e a lista para letras maiúsculas.
@@ -214,23 +277,32 @@ export const manualWithdrawal = async (req: Request, res: Response) => {
     // 🟢 INSERÇÃO DA SAÍDA MANUAL COM A OP
     // =========================================================================
     const sepRes = await client.query(
-      'INSERT INTO separations (destination, status, type, client_service_id) VALUES ($1, $2, $3, $4) RETURNING id', 
+      'INSERT INTO separations (destination, status, type, client_service_id) VALUES ($1, $2, $3, $4) RETURNING id',
       [sector, 'concluida', 'manual', client_service_id]
     );
 
-    for (const item of items) {
+    await setStockAudit(client, 'SAIDA_MANUAL', userId, `separacao:${sepRes.rows[0].id}${op_code ? ` op:${op_code}` : ''}`);
+
+    // Ordena por product_id para travar as linhas sempre na mesma ordem (evita deadlocks entre transações concorrentes)
+    const sortedItems = [...items].sort((a, b) => String(a.product_id).localeCompare(String(b.product_id)));
+
+    for (const item of sortedItems) {
       if (!item.product_id || !item.quantity) throw new Error("Item inválido.");
-      
-      const stCheck = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1 FOR UPDATE', [item.product_id]);
-      if(parseFloat(stCheck.rows[0]?.quantity_on_hand || 0) < item.quantity) {
-        throw new Error(`Estoque insuficiente ID ${item.product_id}.`);
+
+      const stCheck = await client.query('SELECT quantity_on_hand, quantity_reserved FROM stock WHERE product_id = $1 FOR UPDATE', [item.product_id]);
+      const onHand = parseFloat(stCheck.rows[0]?.quantity_on_hand || 0);
+      const reserved = parseFloat(stCheck.rows[0]?.quantity_reserved || 0);
+      // A retirada manual só pode consumir o saldo LIVRE (físico - reservado),
+      // senão ela "come" material já reservado para solicitações/separações e gera furo na entrega.
+      if (onHand - reserved < item.quantity) {
+        throw new Error(`Estoque disponível insuficiente ID ${item.product_id} (físico: ${onHand}, reservado: ${reserved}).`);
       }
-      
+
       await client.query(
-        'INSERT INTO separation_items (separation_id, product_id, quantity, observation) VALUES ($1, $2, $3, $4)', 
+        'INSERT INTO separation_items (separation_id, product_id, quantity, observation, unit_price) VALUES ($1, $2, $3, $4, (SELECT unit_price FROM products WHERE id = $2))',
         [sepRes.rows[0].id, item.product_id, item.quantity, item.observation || null]
       );
-      
+
       await client.query('UPDATE stock SET quantity_on_hand = quantity_on_hand - $1 WHERE product_id = $2', [item.quantity, item.product_id]);
     }
 
@@ -310,8 +382,12 @@ export const getOpMaterialsForReturn = async (req: Request, res: Response) => {
 };
 
 export const registerReturn = async (req: Request, res: Response) => {
-  const { op_code, returns } = req.body; 
-  const userId = (req as any).user.id; 
+  const { op_code, returns } = req.body;
+  const userId = (req as any).user.id;
+
+  if (!returns || !Array.isArray(returns) || returns.length === 0) {
+    return res.status(400).json({ error: 'Nenhum item de devolução fornecido.' });
+  }
 
   const client = await pool.connect();
 
@@ -322,21 +398,43 @@ export const registerReturn = async (req: Request, res: Response) => {
     if (opResult.rows.length === 0) throw new Error('OP não encontrada no sistema.');
     const client_service_id = opResult.rows[0].id;
 
-    for (const item of returns) {
-      if (!item.product_id || !item.quantity || item.quantity <= 0) {
+    await setStockAudit(client, 'DEVOLUCAO_OP', userId, `op:${op_code}`);
+
+    const sortedReturns = [...returns].sort((a: any, b: any) => String(a.product_id).localeCompare(String(b.product_id)));
+
+    for (const item of sortedReturns) {
+      const returnQty = Number(item.quantity);
+      if (!item.product_id || isNaN(returnQty) || returnQty <= 0) {
         throw new Error('Quantidade inválida para devolução.');
+      }
+
+      // Trava a linha do stock para serializar devoluções concorrentes do mesmo produto
+      await client.query('SELECT id FROM stock WHERE product_id = $1 FOR UPDATE', [item.product_id]);
+
+      // Nunca deixar devolver mais do que foi retirado na OP — senão o estoque infla do nada
+      const balance = await client.query(`
+          SELECT
+            COALESCE((SELECT SUM(si.quantity) FROM separations s JOIN separation_items si ON s.id = si.separation_id
+              WHERE s.client_service_id = $1 AND si.product_id = $2), 0) as total_withdrawn,
+            COALESCE((SELECT SUM(quantity) FROM op_returns
+              WHERE client_service_id = $1 AND product_id = $2), 0) as total_returned
+      `, [client_service_id, item.product_id]);
+
+      const availableToReturn = parseFloat(balance.rows[0].total_withdrawn) - parseFloat(balance.rows[0].total_returned);
+      if (returnQty > availableToReturn) {
+        throw new Error(`Devolução maior que o retirado na OP (disponível para devolver: ${availableToReturn}).`);
       }
 
       await client.query(`
           INSERT INTO op_returns (client_service_id, product_id, quantity, user_id, observation)
           VALUES ($1, $2, $3, $4, $5)
-      `, [client_service_id, item.product_id, item.quantity, userId, item.observation]);
+      `, [client_service_id, item.product_id, returnQty, userId, item.observation]);
 
       await client.query(`
-          UPDATE stock 
+          UPDATE stock
           SET quantity_on_hand = quantity_on_hand + $1
           WHERE product_id = $2
-      `, [item.quantity, item.product_id]);
+      `, [returnQty, item.product_id]);
     }
 
     await createLog(userId, 'OP_RETURN', { op_code, itemsReturned: returns.length }, getClientIp(req), client);
@@ -381,6 +479,13 @@ export const registerEntries = async (req: Request, res: Response) => {
 
     const logId = logRes.rows[0].id;
 
+    await setStockAudit(
+      client,
+      entries[0]?.type === 'REAPROVEITAMENTO' ? 'ENTRADA_REAPROVEITAMENTO' : 'ENTRADA_NFE',
+      userId,
+      `entrada:${logId}`
+    );
+
     for (const entry of entries) {
       const { product_id, quantity, type, observation } = entry;
 
@@ -392,25 +497,20 @@ export const registerEntries = async (req: Request, res: Response) => {
         throw new Error(`Item inválido: falta Produto ou a Quantidade (${quantity}) é inválida.`);
       }
 
-      // 🛡️ CORREÇÃO 2: Atualiza a tabela Stock forçando o tipo numérico (::numeric)
-      const updateResult = await client.query(`
-        UPDATE stock 
-        SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1::numeric 
-        WHERE product_id = $2
-      `, [numericQty, product_id]);
+      // Upsert atômico: elimina a corrida "UPDATE 0 linhas → INSERT" que podia
+      // duplicar a linha de stock (ou abortar a transação) sob concorrência.
+      await client.query(`
+        INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved)
+        VALUES ($1, $2::numeric, 0)
+        ON CONFLICT (product_id)
+        DO UPDATE SET quantity_on_hand = COALESCE(stock.quantity_on_hand, 0) + $2::numeric
+      `, [product_id, numericQty]);
 
-      // 🛡️ CORREÇÃO 3: Se o UPDATE afetou 0 linhas, significa que o produto não estava no stock. 
-      // Então, inserimos o produto pela primeira vez!
-      if (updateResult.rowCount === 0) {
-        await client.query(`
-          INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved) 
-          VALUES ($1, $2, 0)
-        `, [product_id, numericQty]);
-      }
-
-      // 3. 🟢 MAGIA AQUI: Inserimos o item na tabela xml_items, conectada ao log
+      // 3. 🟢 MAGIA AQUI: Inserimos o item na tabela xml_items, conectada ao log.
+      // unit_price = preço do produto NO MOMENTO da entrada (custo congelado —
+      // editar o preço do produto depois não altera o valor desta entrada).
       await client.query(
-        "INSERT INTO xml_items (xml_log_id, product_id, quantity) VALUES ($1, $2, $3)", 
+        "INSERT INTO xml_items (xml_log_id, product_id, quantity, unit_price) VALUES ($1, $2, $3, (SELECT unit_price FROM products WHERE id = $2))",
         [logId, product_id, numericQty]
       );
     }

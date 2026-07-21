@@ -144,11 +144,12 @@ export const getGeneralReports = async (req: Request, res: Response) => {
     // 🟢 CORREÇÃO CRÍTICA AQUI: Filtrar pela data do LOG (xl.created_at) em vez do item (xi.created_at)
     // TAMBÉM GARANTIMOS QUE O CAMPO "origem_nome" E "origem" SÃO LIDOS PARA O REPORTS.TSX RECONHECER O REUSO!
     const entradasRes = await pool.query(`
-      SELECT xl.created_at as data, 'Entrada' as tipo, xl.file_name as origem, xl.file_name as origem_nome, p.name as produto, p.sku, p.unit as unidade, xi.quantity as quantidade 
-      FROM xml_items xi 
-      JOIN products p ON xi.product_id = p.id 
-      JOIN xml_logs xl ON xi.xml_log_id = xl.id 
-      WHERE xl.created_at >= $1 AND xl.created_at <= $2 
+      SELECT xl.created_at as data, 'Entrada' as tipo, xl.file_name as origem, xl.file_name as origem_nome, p.name as produto, p.sku, p.unit as unidade, xi.quantity as quantidade,
+             COALESCE(CAST(NULLIF(CAST(xi.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario
+      FROM xml_items xi
+      JOIN products p ON xi.product_id = p.id
+      JOIN xml_logs xl ON xi.xml_log_id = xl.id
+      WHERE xl.created_at >= $1 AND xl.created_at <= $2
       ORDER BY xl.created_at DESC`, [start, end]);
     
     const separacoesRes = await pool.query(`
@@ -158,10 +159,10 @@ export const getGeneralReports = async (req: Request, res: Response) => {
              cs.op_code, 
              s.client_name as solicitante,
              s.status as status,
-             p.name as produto, p.sku, p.unit as unidade, 
-             si.quantity as quantidade, 
-             COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario 
-      FROM separation_items si 
+             p.name as produto, p.sku, p.unit as unidade,
+             si.quantity as quantidade,
+             COALESCE(CAST(NULLIF(CAST(si.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario
+      FROM separation_items si
       JOIN separations s ON si.separation_id = s.id 
       JOIN products p ON si.product_id = p.id 
       LEFT JOIN client_services cs ON s.client_service_id = cs.id 
@@ -175,10 +176,10 @@ export const getGeneralReports = async (req: Request, res: Response) => {
              cs.op_code, pf.name as solicitante, 
              COALESCE(p.name, ri.custom_product_name) as produto, 
              p.sku, p.unit as unidade, 
-             COALESCE(ri.quantity_delivered, ri.quantity_requested) as quantidade, 
-             r.status, 
-             COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario 
-      FROM request_items ri 
+             COALESCE(ri.quantity_delivered, ri.quantity_requested) as quantidade,
+             r.status,
+             COALESCE(CAST(NULLIF(CAST(ri.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario
+      FROM request_items ri
       JOIN requests r ON ri.request_id = r.id 
       LEFT JOIN products p ON ri.product_id = p.id 
       LEFT JOIN profiles pf ON r.requester_id = pf.id 
@@ -193,10 +194,10 @@ export const getGeneralReports = async (req: Request, res: Response) => {
              'Cliente: ' || COALESCE(rep.client_name, 'N/A') as destino_setor, 
              NULL as op_code, rep.client_name as solicitante, 
              p.name as produto, p.sku, p.unit as unidade, 
-             ri.quantity as quantidade, 
-             rep.status, 
-             COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario 
-      FROM replenishment_items ri 
+             ri.quantity as quantidade,
+             rep.status,
+             COALESCE(CAST(NULLIF(CAST(ri.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario
+      FROM replenishment_items ri
       JOIN replenishments rep ON ri.replenishment_id = rep.id 
       LEFT JOIN products p ON ri.product_id = p.id 
       WHERE rep.created_at >= $1 AND rep.created_at <= $2 
@@ -235,12 +236,12 @@ export const getGeneralReports = async (req: Request, res: Response) => {
       const opsQuery = `
         SELECT 
           si.id, 
-          si.quantity as quantidade, 
-          p.name as produto, 
-          COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario, 
-          cs.op_code, 
-          cs.status as op_status, 
-          s.destination as destino_setor, 
+          si.quantity as quantidade,
+          p.name as produto,
+          COALESCE(CAST(NULLIF(CAST(si.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario,
+          cs.op_code,
+          cs.status as op_status,
+          s.destination as destino_setor,
           COALESCE(s.sent_at, s.created_at) as data
         FROM separation_items si
         JOIN separations s ON si.separation_id = s.id
@@ -252,12 +253,12 @@ export const getGeneralReports = async (req: Request, res: Response) => {
 
         SELECT 
           ri.id, 
-          COALESCE(ri.quantity_delivered, ri.quantity_requested) as quantidade, 
-          COALESCE(p.name, ri.custom_product_name) as produto, 
-          COALESCE(CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario, 
-          cs.op_code, 
-          cs.status as op_status, 
-          COALESCE(pf.sector, r.sector) as destino_setor, 
+          COALESCE(ri.quantity_delivered, ri.quantity_requested) as quantidade,
+          COALESCE(p.name, ri.custom_product_name) as produto,
+          COALESCE(CAST(NULLIF(CAST(ri.unit_price AS TEXT), '') AS NUMERIC), CAST(NULLIF(CAST(p.unit_price AS TEXT), '') AS NUMERIC), 0) as preco_unitario,
+          cs.op_code,
+          cs.status as op_status,
+          COALESCE(pf.sector, r.sector) as destino_setor,
           r.created_at as data
         FROM request_items ri
         JOIN requests r ON ri.request_id = r.id
@@ -310,12 +311,16 @@ export const getAdminLogs = async (req: Request, res: Response) => {
     const params: any[] = [];
     let paramIndex = 1;
 
-    if (action && action !== 'ALL') { query += ` AND a.action = $${paramIndex}`; params.push(action); paramIndex++; }
+    // ILIKE parcial: o filtro da página envia prefixos como "CRIAR"/"EDITAR"
+    // que precisam casar com ações compostas (ex.: CRIAR_SOLICITACAO).
+    if (action && action !== 'ALL') { query += ` AND a.action ILIKE $${paramIndex}`; params.push(`%${action}%`); paramIndex++; }
     if (user) { query += ` AND (p.name ILIKE $${paramIndex} OR u.email ILIKE $${paramIndex})`; params.push(`%${user}%`); paramIndex++; }
     if (startDate) { query += ` AND a.created_at >= $${paramIndex}`; params.push(`${startDate} 00:00:00`); paramIndex++; }
     if (endDate) { query += ` AND a.created_at <= $${paramIndex}`; params.push(`${endDate} 23:59:59`); paramIndex++; }
 
-    query += ` ORDER BY a.created_at DESC LIMIT 100`;
+    const limit = Math.min(Number(req.query.limit) || 300, 1000);
+    params.push(limit);
+    query += ` ORDER BY a.created_at DESC LIMIT $${paramIndex}`;
     const { rows } = await pool.query(query, params);
     res.json(rows);
   } catch (error: any) { 

@@ -4,9 +4,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
-
-// Define a chave secreta do JWT (Use variáveis de ambiente em produção)
-const JWT_SECRET = process.env.JWT_SECRET || 'sua-chave-secreta';
+import { JWT_SECRET } from '../config/env';
 
 /**
  * Função para gerenciar o Login do usuário
@@ -23,17 +21,20 @@ export const login = async (req: Request, res: Response): Promise<Response | voi
 
     // Validação 1: Verifica se o usuário existe
     if (!user) {
+        await createLog(null, 'LOGIN_FALHOU', { email_tentado: email, motivo: 'Usuário não encontrado' }, getClientIp(req));
         return res.status(400).json({ error: 'Usuário não encontrado' });
     }
-    
+
     // Validação 2: Verifica se a conta está ativa
     if (user.is_active === false) {
+        await createLog(user.id, 'LOGIN_FALHOU', { email_tentado: email, motivo: 'Conta suspensa pelo administrador' }, getClientIp(req));
         return res.status(403).json({ error: 'Acesso bloqueado. Conta suspensa pelo administrador.' });
     }
 
     // Validação 3: Verifica se a senha está correta usando o bcrypt
     const validPassword = await bcrypt.compare(password, user.encrypted_password);
     if (!validPassword) {
+        await createLog(user.id, 'LOGIN_FALHOU', { email_tentado: email, motivo: 'Senha incorreta' }, getClientIp(req));
         return res.status(400).json({ error: 'Senha incorreta' });
     }
 
@@ -73,7 +74,7 @@ export const login = async (req: Request, res: Response): Promise<Response | voi
     const userPermissions = permRes.rows.map((r: { page_key: string }) => r.page_key);
     
     // Registra o login no sistema de auditoria
-    await createLog(user.id, 'LOGIN', { message: 'Login realizado' }, getClientIp(req));
+    await createLog(user.id, 'LOGIN', { email, cargo: profiles[0].role, setor: profiles[0].sector }, getClientIp(req));
 
     // O RETURN final garante que o Express encerre a requisição entregando os dados
     return res.json({ token, user, profile: profiles[0], permissions: userPermissions });
@@ -84,6 +85,21 @@ export const login = async (req: Request, res: Response): Promise<Response | voi
   }
 };
 
+
+/**
+ * Regista a saída (logout) do usuário no sistema de auditoria.
+ * Chamado pelo frontend antes de descartar o token.
+ */
+export const logout = async (req: Request, res: Response): Promise<Response | void> => {
+  try {
+    const userId = (req as any).user?.id || null;
+    await createLog(userId, 'LOGOUT', { motivo: req.body?.reason || 'Saída manual' }, getClientIp(req));
+    return res.json({ success: true });
+  } catch (error) {
+    // Logout nunca deve falhar para o usuário
+    return res.json({ success: true });
+  }
+};
 
 /**
  * Função para gerenciar o Registro de novos usuários

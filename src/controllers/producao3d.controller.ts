@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { pool } from '../db';
+import { setStockAudit } from '../utils/stockAudit';
 
 // ==========================================
 // 1. CATÁLOGO DE PEÇAS 3D (Lê da tabela Products)
@@ -74,36 +75,88 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
   
   try {
     await client.query('BEGIN');
-    
+
+    // 🔒 Lê o status anterior com lock: o crédito de estoque só acontece na
+    // TRANSIÇÃO para 'Concluída' (e é revertido ao sair dela). Antes, arrastar o
+    // cartão para fora e de volta creditava o estoque em dobro a cada passagem.
+    const demandRes = await client.query('SELECT request_id, quantity, product_id, status FROM demands_3d WHERE id = $1 FOR UPDATE', [id]);
+    if (demandRes.rows.length === 0) throw new Error('Demanda não encontrada.');
+    const demand = demandRes.rows[0];
+    const oldStatus = demand.status;
+
+    // SKU para identificar o produto nos logs de auditoria (legibilidade)
+    let demandSku: string | null = null;
+    if (demand.product_id) {
+      const skuRes = await client.query('SELECT sku FROM products WHERE id = $1', [demand.product_id]);
+      demandSku = skuRes.rows[0]?.sku || null;
+    }
+
+    await setStockAudit(
+      client,
+      status === 'Concluída' ? 'PRODUCAO_3D_ENTRADA' : 'PRODUCAO_3D_ESTORNO',
+      (req as any).user?.id || null,
+      `demanda_3d:${id}`
+    );
+
     await client.query('UPDATE demands_3d SET status = $1 WHERE id = $2', [status, id]);
 
-    if (status === 'Concluída') {
-        const demandRes = await client.query('SELECT request_id, quantity, product_id FROM demands_3d WHERE id = $1', [id]);
-        const demand = demandRes.rows[0];
-
+    if (status === 'Concluída' && oldStatus !== 'Concluída') {
         if (demand.product_id) {
-            // 1. Entrada no estoque físico
+            // Verifica se a solicitação de origem ainda está viva: se sim, o produzido
+            // entra reservado para ela; se não (entregue/rejeitada), entra como estoque
+            // livre — antes a reserva ficava presa para sempre.
+            let requestAlive = false;
+            if (demand.request_id) {
+                const reqCheck = await client.query('SELECT status FROM requests WHERE id = $1', [demand.request_id]);
+                requestAlive = ['aberto', 'aprovado'].includes(reqCheck.rows[0]?.status);
+            }
+
             await client.query(
-                `UPDATE stock 
-                 SET quantity_on_hand = COALESCE(quantity_on_hand, 0) + $1,
-                     quantity_reserved = COALESCE(quantity_reserved, 0) + $1
-                 WHERE product_id = $2`,
-                [demand.quantity, demand.product_id]
+                `INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (product_id)
+                 DO UPDATE SET quantity_on_hand = COALESCE(stock.quantity_on_hand, 0) + $2,
+                               quantity_reserved = COALESCE(stock.quantity_reserved, 0) + $3`,
+                [demand.product_id, demand.quantity, requestAlive ? demand.quantity : 0]
             );
 
-            // 2. Regista no histórico de auditoria oficial do sistema
             await client.query(
-                `INSERT INTO audit_logs (user_id, action, details) 
+                `INSERT INTO audit_logs (user_id, action, details)
                  VALUES ($1, $2, $3)`,
-                [(req as any).user.id, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ product_id: demand.product_id, quantity: demand.quantity, reason: 'Produção 3D Concluída' })]
+                [(req as any).user.id, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ produto: demandSku || demand.product_id, quantidade: demand.quantity, motivo: 'Produção 3D Concluída' })]
             );
         }
 
         if (demand.request_id) {
-            await client.query(`UPDATE requests SET status = 'aprovado' WHERE id = $1`, [demand.request_id]);
+            // Só reabre para 'aprovado' se ainda estiver 'aberto' — antes isto
+            // ressuscitava pedidos já entregues e permitia entrega (e débito) dupla.
+            await client.query(`UPDATE requests SET status = 'aprovado' WHERE id = $1 AND status = 'aberto'`, [demand.request_id]);
+        }
+    } else if (oldStatus === 'Concluída' && status !== 'Concluída') {
+        // Saiu de 'Concluída': desfaz o crédito para manter a simetria.
+        // Só devolve a reserva se o pedido de origem ainda estiver vivo (mesmo
+        // critério do crédito) para não roubar reserva de outros pedidos.
+        if (demand.product_id) {
+            let requestAlive = false;
+            if (demand.request_id) {
+                const reqCheck = await client.query('SELECT status FROM requests WHERE id = $1', [demand.request_id]);
+                requestAlive = ['aberto', 'aprovado'].includes(reqCheck.rows[0]?.status);
+            }
+            await client.query(
+                `UPDATE stock
+                 SET quantity_on_hand = GREATEST(0, COALESCE(quantity_on_hand, 0) - $1),
+                     quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $2)
+                 WHERE product_id = $3`,
+                [demand.quantity, requestAlive ? demand.quantity : 0, demand.product_id]
+            );
+            await client.query(
+                `INSERT INTO audit_logs (user_id, action, details)
+                 VALUES ($1, $2, $3)`,
+                [(req as any).user.id, 'SAIDA_ESTOQUE_3D', JSON.stringify({ produto: demandSku || demand.product_id, quantidade: demand.quantity, motivo: 'Demanda 3D reaberta (crédito revertido)' })]
+            );
         }
     }
-    
+
     await client.query('COMMIT');
     res.json({ success: true });
   } catch (error) {
@@ -140,9 +193,16 @@ export const createProduction = async (req: Request, res: Response) => {
   const operatorId = (req as any).user?.id || null; 
   
   const client = await pool.connect();
-  
+
   try {
+    const numericQty = Number(quantity);
+    if (!partId || isNaN(numericQty) || numericQty <= 0) {
+      return res.status(400).json({ error: 'Produção inválida: informe a peça e uma quantidade maior que zero.' });
+    }
+
     await client.query('BEGIN'); // Inicia a transação
+
+    await setStockAudit(client, 'PRODUCAO_3D_ENTRADA', operatorId, demandId ? `demanda_3d:${demandId}` : 'producao_3d:livre');
 
     // 1. REGISTAR A PRODUÇÃO
     const prodRes = await client.query(`
@@ -163,11 +223,12 @@ export const createProduction = async (req: Request, res: Response) => {
     `, [partId, quantity]);
 
     // 3. REGISTAR O HISTÓRICO DE MOVIMENTAÇÃO (Tabela de Auditoria do seu Sistema)
+    const skuRes = await client.query('SELECT sku FROM products WHERE id = $1', [partId]);
     const reason = demandId ? 'Produção 3D (Demanda Kanban)' : 'Produção 3D (Estoque Livre)';
     await client.query(`
-        INSERT INTO audit_logs (user_id, action, details) 
+        INSERT INTO audit_logs (user_id, action, details)
         VALUES ($1, $2, $3)
-    `, [operatorId, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ product_id: partId, quantity, reason })]);
+    `, [operatorId, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ produto: skuRes.rows[0]?.sku || partId, quantidade: quantity, motivo: reason })]);
 
     await client.query('COMMIT'); // Guarda tudo!
     res.status(201).json(prodRes.rows[0]);
@@ -194,6 +255,8 @@ export const deleteProduction = async (req: Request, res: Response) => {
     if (prodRes.rows.length === 0) throw new Error("Produção não encontrada");
     const { product_id, quantity } = prodRes.rows[0];
 
+    await setStockAudit(client, 'PRODUCAO_3D_ESTORNO', operatorId, `producao_3d:${id}`);
+
     // 2. Apagar a produção
     await client.query('DELETE FROM productions_3d WHERE id = $1', [id]);
 
@@ -205,10 +268,11 @@ export const deleteProduction = async (req: Request, res: Response) => {
     `, [product_id, quantity]);
 
     // 4. Registar no histórico (Auditoria)
+    const skuRes = await client.query('SELECT sku FROM products WHERE id = $1', [product_id]);
     await client.query(`
-        INSERT INTO audit_logs (user_id, action, details) 
+        INSERT INTO audit_logs (user_id, action, details)
         VALUES ($1, $2, $3)
-    `, [operatorId, 'SAIDA_ESTOQUE_3D', JSON.stringify({ product_id, quantity, reason: 'Correção: Apagou registo de Produção 3D' })]);
+    `, [operatorId, 'SAIDA_ESTOQUE_3D', JSON.stringify({ produto: skuRes.rows[0]?.sku || product_id, quantidade: quantity, motivo: 'Correção: Apagou registo de Produção 3D' })]);
 
     await client.query('COMMIT');
     res.json({ success: true });

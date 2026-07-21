@@ -1,8 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { pool } from '../db'; // Necessário para a consulta de permissões
-
-const JWT_SECRET = process.env.JWT_SECRET || 'sua-chave-secreta';
+import { JWT_SECRET } from '../config/env';
 
 // 1. CRIAMOS UMA INTERFACE PARA O REQUEST
 // Isto ensina ao TypeScript que o nosso 'req' pode conter um 'user' decodificado
@@ -99,15 +98,6 @@ export const requirePermission = (requiredAction: string) => {
           userPermissions.push(row.page_key.trim());
         }
       });
-
-      // ==========================================
-      // 🛠️ RAIO-X: VERIFICAÇÃO NO TERMINAL
-      // ==========================================
-      console.log(`\n--- TENTATIVA DE ACESSO ---`);
-      console.log(`👤 Utilizador ID: ${userId} | Cargo: ${safeRole}`);
-      console.log(`🔑 Permissão Exigida: '${requiredAction}'`);
-      console.log(`📋 Permissões Encontradas no Banco:`, userPermissions);
-      console.log(`---------------------------\n`);
 
       // 4. Verificação de Segurança (limpa a ação exigida também para garantir correspondência exata)
       if (userPermissions.includes(requiredAction.trim())) {

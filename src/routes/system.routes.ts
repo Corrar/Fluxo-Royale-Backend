@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { authenticate } from '../middlewares/auth';
+import { authenticate, authorizeRole } from '../middlewares/auth';
 import { 
   getDashboardStats, 
   getManagerialReports, 
@@ -28,6 +28,7 @@ router.get('/admin/logs', getAdminLogs);
 
 // Configurações do Sistema (Aviso de Login, etc.)
 router.get('/admin/settings', getSettings);    // <-- NOVA ROTA: Ler as definições
-router.put('/admin/settings', updateSetting);  // <-- NOVA ROTA: Guardar as definições
+// 🔒 Alterar configurações globais é exclusivo de admin (antes qualquer autenticado gravava)
+router.put('/admin/settings', authorizeRole(['admin']), updateSetting);
 
 export default router;

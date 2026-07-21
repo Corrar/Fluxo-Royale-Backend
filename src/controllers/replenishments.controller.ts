@@ -3,6 +3,7 @@ import { pool } from '../db';
 import { createLog } from '../utils/logger';
 import { getClientIp } from '../utils/ip';
 import { validatePositiveItems } from '../middlewares/validators';
+import { setStockAudit } from '../utils/stockAudit';
 
 export const getReplenishments = async (req: Request, res: Response) => {
   try {
@@ -23,7 +24,7 @@ export const createReplenishment = async (req: Request, res: Response) => {
     await client.query('BEGIN');
     const repRes = await client.query(`INSERT INTO replenishments (order_number, client_name, city_state, status, total_value) VALUES ($1, $2, $3, $4, $5) RETURNING id`, [order_number, client_name, city_state, status || 'pendente', total_value || 0]);
     for (const item of items) {
-      await client.query(`INSERT INTO replenishment_items (replenishment_id, product_id, qty_requested, quantity) VALUES ($1, $2, $3, 0)`, [repRes.rows[0].id, item.product_id, item.qty_requested]);
+      await client.query(`INSERT INTO replenishment_items (replenishment_id, product_id, qty_requested, quantity, unit_price) VALUES ($1, $2, $3, 0, (SELECT unit_price FROM products WHERE id = $2))`, [repRes.rows[0].id, item.product_id, item.qty_requested]);
     }
     
     // 📝 LOG TRADUZIDO E MELHORADO
@@ -44,13 +45,27 @@ export const updateReplenishment = async (req: Request, res: Response) => {
   try {
     validatePositiveItems(items);
     await client.query('BEGIN');
+
+    // 🔒 Bloqueia edição de reposições já concluídas/canceladas
+    const repCheck = await client.query('SELECT status FROM replenishments WHERE id = $1 FOR UPDATE', [id]);
+    if (repCheck.rows.length === 0) throw new Error('Reposição não encontrada.');
+    if (!['pendente', 'em_preparo'].includes(repCheck.rows[0].status)) {
+      throw new Error(`Não é possível editar uma reposição já processada (status: ${repCheck.rows[0].status}).`);
+    }
+
+    await setStockAudit(client, 'REPOSICAO_EDICAO', userId, `reposicao:${id}`);
+
     await client.query(`UPDATE replenishments SET order_number = COALESCE($1, order_number), client_name = COALESCE($2, client_name), city_state = COALESCE($3, city_state), total_value = COALESCE($4, total_value) WHERE id = $5`, [order_number, client_name, city_state, total_value, id]);
 
-    const existingItemsRes = await client.query('SELECT id, product_id FROM replenishment_items WHERE replenishment_id = $1', [id]);
+    const existingItemsRes = await client.query('SELECT id, product_id, quantity FROM replenishment_items WHERE replenishment_id = $1', [id]);
     const newItemsMap = new Map(items.map((i: any) => [i.product_id, i]));
 
     for (const oldItem of existingItemsRes.rows) {
       if (!newItemsMap.has(oldItem.product_id)) {
+        // Se o item removido já tinha reserva feita, liberta-a — antes a reserva ficava presa para sempre
+        if (parseFloat(oldItem.quantity || 0) > 0) {
+          await client.query('UPDATE stock SET quantity_reserved = GREATEST(0, COALESCE(quantity_reserved, 0) - $1) WHERE product_id = $2', [oldItem.quantity, oldItem.product_id]);
+        }
         await client.query('DELETE FROM replenishment_items WHERE id = $1', [oldItem.id]);
       } else {
         const newItem: any = newItemsMap.get(oldItem.product_id);
@@ -59,7 +74,7 @@ export const updateReplenishment = async (req: Request, res: Response) => {
     }
     for (const item of items) {
       if (!existingItemsRes.rows.some((old: any) => old.product_id === item.product_id)) {
-        await client.query(`INSERT INTO replenishment_items (replenishment_id, product_id, qty_requested, quantity) VALUES ($1, $2, $3, 0)`, [id, item.product_id, item.qty_requested]);
+        await client.query(`INSERT INTO replenishment_items (replenishment_id, product_id, qty_requested, quantity, unit_price) VALUES ($1, $2, $3, 0, (SELECT unit_price FROM products WHERE id = $2))`, [id, item.product_id, item.qty_requested]);
       }
     }
     
@@ -83,15 +98,51 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    for (const item of items) {
-      const oldItem = await client.query('SELECT quantity, product_id, qty_requested FROM replenishment_items WHERE id = $1', [item.id]);
+
+    // 🔒 Trava a reposição e valida a transição de status. Sem isto:
+    // - "entregar" duas vezes debitava o estoque em dobro;
+    // - "reverter" repetido (ou a partir de um estado não-entregue) inflava o físico do nada.
+    const repCheck = await client.query('SELECT status FROM replenishments WHERE id = $1 FOR UPDATE', [id]);
+    if (repCheck.rows.length === 0) throw new Error('Reposição não encontrada.');
+    const repStatus = repCheck.rows[0].status;
+
+    const allowedFrom: Record<string, string[]> = {
+      'reservar': ['pendente', 'em_preparo'],
+      'entregar': ['pendente', 'em_preparo'],
+      'reverter': ['concluido'],
+    };
+    if (!allowedFrom[action] || !allowedFrom[action].includes(repStatus)) {
+      throw new Error(`Ação "${action}" não permitida no status atual ("${repStatus}").`);
+    }
+
+    const auditActions: Record<string, string> = {
+      'reservar': 'REPOSICAO_RESERVA',
+      'entregar': 'REPOSICAO_ENTREGA',
+      'reverter': 'REPOSICAO_REVERSAO',
+    };
+    await setStockAudit(client, auditActions[action], userId, `reposicao:${id}`);
+
+    const sortedAuthItems = [...items].sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)));
+
+    // Acumula o antes/depois de cada item para a auditoria
+    const itemAudit: Array<{ label: string; old: number; new: number }> = [];
+
+    for (const item of sortedAuthItems) {
+      const oldItem = await client.query('SELECT ri.quantity, ri.product_id, ri.qty_requested, p.sku as product_sku FROM replenishment_items ri LEFT JOIN products p ON p.id = ri.product_id WHERE ri.id = $1', [item.id]);
       if (oldItem.rows.length > 0) {
         const oldQty = parseFloat(oldItem.rows[0].quantity || 0);
-        const newQty = item.quantity !== undefined ? parseFloat(item.quantity) : oldQty;
-        if (isNaN(newQty) || newQty < 0) throw new Error("Quantidade inválida.");
+        // Prefere o INCREMENTO (intenção do operador) somado sobre o valor atual
+        // do banco, sob o lock — evita que uma tela com cache defasado sobrescreva
+        // e reduza a reserva feita por outro almoxarife. quantity absoluta ainda
+        // é aceita para retrocompatibilidade.
+        const newQty = item.increment !== undefined
+          ? oldQty + parseFloat(item.increment)
+          : (item.quantity !== undefined ? parseFloat(item.quantity) : oldQty);
+        if (isNaN(newQty) || newQty < 0) throw new Error("Quantidade inválida (o estorno não pode ser maior que o já separado).");
 
         const productId = oldItem.rows[0].product_id;
         const diff = newQty - oldQty;
+        if (newQty !== oldQty) itemAudit.push({ label: oldItem.rows[0].product_sku || String(productId), old: oldQty, new: newQty });
 
         if (action === 'reservar') {
           await client.query('UPDATE replenishment_items SET quantity = $1 WHERE id = $2', [newQty, item.id]);
@@ -150,8 +201,15 @@ export const authorizeReplenishment = async (req: Request, res: Response) => {
 
     await client.query(`UPDATE replenishments SET status = $1 ${extraUpdate} WHERE id = $2`, extraParams);
     
-    // 📝 LOG TRADUZIDO E MELHORADO
-    await createLog(userId, 'AUTORIZAR_REPOSICAO', { id_reposicao: id, acao: action, codigo_rastreio: tracking_code || 'Não informado' }, getClientIp(req), client);
+    // 📝 Auditoria com antes/depois: status e quantidade de cada item alterado
+    const repChanges: any = {
+      id_reposicao: { new: id },
+      acao: { new: action },
+      status: { old: repStatus, new: newStatus },
+    };
+    if (tracking_code) repChanges.codigo_rastreio = { new: tracking_code };
+    itemAudit.forEach(c => { repChanges[c.label] = { old: c.old, new: c.new }; });
+    await createLog(userId, 'AUTORIZAR_REPOSICAO', { changes: repChanges }, getClientIp(req), client);
     await client.query('COMMIT');
     if ((req as any).io) { (req as any).io.emit('stock_updated'); }
     res.json({ success: true });
@@ -170,6 +228,8 @@ export const deleteReplenishment = async (req: Request, res: Response) => {
     const repCheck = await client.query('SELECT status FROM replenishments WHERE id = $1 FOR UPDATE', [id]);
     if (repCheck.rows.length === 0) throw new Error('Reposição não encontrada.');
     if (repCheck.rows[0].status === 'concluido' || repCheck.rows[0].status === 'cancelada') throw new Error('Não é possível inativar reposições concluídas ou já canceladas.');
+
+    await setStockAudit(client, 'REPOSICAO_CANCELAMENTO', userId, `reposicao:${id}`);
 
     if (repCheck.rows[0].status === 'em_preparo') {
        const itemsRes = await client.query('SELECT product_id, quantity FROM replenishment_items WHERE replenishment_id = $1', [id]);

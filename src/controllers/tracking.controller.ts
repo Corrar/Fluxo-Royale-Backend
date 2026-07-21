@@ -2,7 +2,10 @@ import { Request, Response } from 'express';
 import axios from 'axios';
 import { pool } from '../db';
 
-const WONCA_API_KEY = "bNamHEjNg2ibpZgOkZDNHuGbuoVhvMap-X_MZKDK20U";
+// ⚠️ A chave deve vir da variável de ambiente WONCA_API_KEY (configurar no Render).
+// A chave que estava exposta aqui no código foi removida e DEVE ser rotacionada
+// no painel da Wonca — considere-a comprometida por ter sido versionada.
+const WONCA_API_KEY = process.env.WONCA_API_KEY || '';
 const API_LIMIT = 1000;
 
 // =======================================================

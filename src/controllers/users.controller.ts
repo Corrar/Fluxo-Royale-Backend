@@ -82,12 +82,14 @@ export const deleteUser = async (req: Request, res: Response) => {
 };
 
 export const heartbeat = async (req: Request, res: Response) => {
-  const { id } = req.params;
-  try { 
+  // 🔒 IDOR: sempre usa o id do TOKEN, nunca o do path — antes um usuário podia
+  // inflar/manipular as horas trabalhadas (ponto) de qualquer outro.
+  const id = (req as any).user.id;
+  try {
     await pool.query(`UPDATE users SET total_minutes = COALESCE(total_minutes, 0) + 1, last_active = NOW() WHERE id = $1`, [id]);
-    res.json({ success: true }); 
-  } catch (error) { 
-    res.json({ success: false }); 
+    res.json({ success: true });
+  } catch (error) {
+    res.json({ success: false });
   }
 };
 
