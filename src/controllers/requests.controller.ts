@@ -207,19 +207,22 @@ export const createRequest = async (req: Request, res: Response) => {
                 );
             }
 
-            // 2. Se FALTAR peças, vai para a fábrica produzir
-            if (missingQty > 0) {
-                const kanbanOpNumber = op_code ? op_code : 'Interno';
-                
-                // INFORMA O QUANTO JÁ TEM NO ESTOQUE DIRETAMENTE NAS NOTAS DO KANBAN
-                const notesInfo = `⚠️ RESUMO DO PEDIDO:\n- A Produzir: ${missingQty} un.\n- Já em Estoque: ${reservedQty} un.\n- Total Solicitado: ${item.quantity} un.\n\n📝 OBSERVAÇÕES:\n${item.observation || 'Nenhuma'}`;
+            // 2. TODA solicitação 3D cai no Quadro de Demandas do operador 3D —
+            //    mesmo quando já há peças em estoque (missingQty = 0). Nesse caso
+            //    não há o que imprimir, mas o operador ainda "conclui" a demanda
+            //    para dar baixa (liberando a reserva e entregando ao solicitante).
+            //    demand.quantity = quantidade A PRODUZIR (a porção de prateleira já
+            //    está reservada); a baixa na conclusão usa getReserved3DPortion.
+            const kanbanOpNumber = op_code ? op_code : 'Interno';
 
-                await client.query(
-                   `INSERT INTO demands_3d (product_id, request_id, quantity, op_number, priority, notes) 
-                    VALUES ($1, $2, $3, $4, $5, $6)`,
-                   [productId, requestId, missingQty, kanbanOpNumber, priority, notesInfo]
-                );
-            }
+            // INFORMA O QUANTO JÁ TEM NO ESTOQUE DIRETAMENTE NAS NOTAS DO KANBAN
+            const notesInfo = `⚠️ RESUMO DO PEDIDO:\n- A Produzir: ${missingQty} un.\n- Já em Estoque: ${reservedQty} un.\n- Total Solicitado: ${item.quantity} un.\n\n📝 OBSERVAÇÕES:\n${item.observation || 'Nenhuma'}`;
+
+            await client.query(
+               `INSERT INTO demands_3d (product_id, request_id, quantity, op_number, priority, notes, status)
+                VALUES ($1, $2, $3, $4, $5, $6, 'Em análise')`,
+               [productId, requestId, missingQty, kanbanOpNumber, priority, notesInfo]
+            );
         } 
         // LÓGICA NORMAL PARA PRODUTOS NÃO 3D
         else {

@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
 import { pool } from '../db';
 import { setStockAudit } from '../utils/stockAudit';
+import { createLog } from '../utils/logger';
+import { getClientIp } from '../utils/ip';
 
 // ==========================================
 // 1. CATÁLOGO DE PEÇAS 3D (Lê da tabela Products)
@@ -71,8 +73,11 @@ export const getDemands = async (req: Request, res: Response) => {
 export const updateDemandStatus = async (req: Request, res: Response) => {
   const { id } = req.params;
   const { status } = req.body;
+  const userId = (req as any).user?.id || null;
   const client = await pool.connect();
-  
+
+  let deliveredRequestId: string | null = null; // p/ avisar o front após o commit
+
   try {
     await client.query('BEGIN');
 
@@ -94,23 +99,25 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
     await setStockAudit(
       client,
       status === 'Concluída' ? 'PRODUCAO_3D_ENTRADA' : 'PRODUCAO_3D_ESTORNO',
-      (req as any).user?.id || null,
+      userId,
       `demanda_3d:${id}`
     );
 
     await client.query('UPDATE demands_3d SET status = $1 WHERE id = $2', [status, id]);
 
     if (status === 'Concluída' && oldStatus !== 'Concluída') {
-        if (demand.product_id) {
-            // Verifica se a solicitação de origem ainda está viva: se sim, o produzido
-            // entra reservado para ela; se não (entregue/rejeitada), entra como estoque
-            // livre — antes a reserva ficava presa para sempre.
-            let requestAlive = false;
-            if (demand.request_id) {
-                const reqCheck = await client.query('SELECT status FROM requests WHERE id = $1', [demand.request_id]);
-                requestAlive = ['aberto', 'aprovado'].includes(reqCheck.rows[0]?.status);
-            }
+        // Verifica se a solicitação de origem ainda está viva: se sim, o produzido
+        // entra reservado para ela; se não (entregue/rejeitada), entra como estoque
+        // livre — antes a reserva ficava presa para sempre.
+        let requestAlive = false;
+        if (demand.request_id) {
+            const reqCheck = await client.query('SELECT status FROM requests WHERE id = $1', [demand.request_id]);
+            requestAlive = ['aberto', 'aprovado'].includes(reqCheck.rows[0]?.status);
+        }
 
+        // 1️⃣ ENTRADA FÍSICA do que foi produzido (demand.quantity = a produzir).
+        //    Quando não há nada a produzir (demand.quantity = 0) isto é um no-op.
+        if (demand.product_id && Number(demand.quantity) > 0) {
             await client.query(
                 `INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved)
                  VALUES ($1, $2, $3)
@@ -123,20 +130,88 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
             await client.query(
                 `INSERT INTO audit_logs (user_id, action, details)
                  VALUES ($1, $2, $3)`,
-                [(req as any).user.id, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ produto: demandSku || demand.product_id, quantidade: demand.quantity, motivo: 'Produção 3D Concluída' })]
+                [userId, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ produto: demandSku || demand.product_id, quantidade: demand.quantity, motivo: 'Produção 3D Concluída' })]
             );
         }
 
-        if (demand.request_id) {
-            // Só reabre para 'aprovado' se ainda estiver 'aberto' — antes isto
-            // ressuscitava pedidos já entregues e permitia entrega (e débito) dupla.
-            await client.query(`UPDATE requests SET status = 'aprovado' WHERE id = $1 AND status = 'aberto'`, [demand.request_id]);
+        // 2️⃣ BAIXA AUTOMÁTICA NA SOLICITAÇÃO: quando o operador 3D conclui a
+        //    ÚLTIMA demanda de um pedido 100% 3D, o próprio ato de finalizar já
+        //    entrega o pedido (debita o físico, libera a reserva) — o almoxarife
+        //    não precisa fazer nada. Antes, concluir só creditava estoque e
+        //    deixava o pedido em aberto ("somente fazendo entrada").
+        if (requestAlive && demand.request_id) {
+            const reqLock = await client.query('SELECT status FROM requests WHERE id = $1 FOR UPDATE', [demand.request_id]);
+            const reqStatus = reqLock.rows[0]?.status;
+
+            if (reqStatus === 'aberto' || reqStatus === 'aprovado') {
+                const pending = await client.query(
+                    `SELECT COUNT(*)::int AS n FROM demands_3d
+                     WHERE request_id = $1 AND status NOT IN ('Concluída', 'Cancelada', 'Rejeitada')`,
+                    [demand.request_id]
+                );
+                const itemsRes = await client.query(
+                    `SELECT ri.id, ri.product_id, ri.quantity_requested, ri.quantity_delivered, p.is_3d
+                     FROM request_items ri LEFT JOIN products p ON ri.product_id = p.id
+                     WHERE ri.request_id = $1`,
+                    [demand.request_id]
+                );
+                const allItems3D = itemsRes.rows.length > 0 &&
+                    itemsRes.rows.every((it: any) => it.product_id && it.is_3d);
+
+                if (pending.rows[0].n === 0 && allItems3D) {
+                    // Contexto de auditoria da baixa (o débito é uma ENTREGA, não uma entrada)
+                    await setStockAudit(client, 'SOLICITACAO_ENTREGA', userId, `solicitacao:${demand.request_id}`);
+
+                    for (const it of itemsRes.rows) {
+                        const finalQty = parseFloat(it.quantity_delivered ?? it.quantity_requested);
+                        // Reserva a liberar = porção realmente reservada (prateleira +
+                        // produzido), i.e. pedido menos o que ainda estaria no Kanban.
+                        const pend = await client.query(
+                            `SELECT COALESCE(SUM(quantity), 0) AS pending FROM demands_3d
+                             WHERE request_id = $1 AND product_id = $2 AND status NOT IN ('Concluída', 'Cancelada', 'Rejeitada')`,
+                            [demand.request_id, it.product_id]
+                        );
+                        const reserveRelease = Math.max(0, parseFloat(it.quantity_requested) - parseFloat(pend.rows[0].pending));
+
+                        const stockCheck = await client.query('SELECT quantity_on_hand FROM stock WHERE product_id = $1 FOR UPDATE', [it.product_id]);
+                        if (parseFloat(stockCheck.rows[0]?.quantity_on_hand || 0) < finalQty) {
+                            throw new Error('Furo de estoque ao dar baixa automática na solicitação 3D.');
+                        }
+                        await client.query(
+                            `UPDATE stock
+                             SET quantity_on_hand = quantity_on_hand - $1,
+                                 quantity_reserved = GREATEST(0, quantity_reserved - $2)
+                             WHERE product_id = $3`,
+                            [finalQty, reserveRelease, it.product_id]
+                        );
+                        await client.query('UPDATE request_items SET quantity_delivered = $1 WHERE id = $2', [finalQty, it.id]);
+                    }
+
+                    await client.query(`UPDATE requests SET status = 'entregue' WHERE id = $1`, [demand.request_id]);
+                    await createLog(userId, 'ENTREGAR_SOLICITACAO', {
+                        changes: { id_solicitacao: { new: demand.request_id }, status: { old: reqStatus, new: 'entregue' }, origem: { new: 'Baixa automática pela Produção 3D' } }
+                    }, getClientIp(req), client);
+                    deliveredRequestId = demand.request_id;
+                } else {
+                    // Ainda há itens não-3D ou outras demandas pendentes: o pedido
+                    // fica com o almoxarife (reabre p/ 'aprovado' se estava 'aberto').
+                    await client.query(`UPDATE requests SET status = 'aprovado' WHERE id = $1 AND status = 'aberto'`, [demand.request_id]);
+                }
+            }
         }
     } else if (oldStatus === 'Concluída' && status !== 'Concluída') {
         // Saiu de 'Concluída': desfaz o crédito para manter a simetria.
+        // Se a solicitação já recebeu baixa (entregue), reabrir corromperia o
+        // estoque — bloqueia com mensagem clara.
+        if (demand.request_id) {
+            const reqCheck = await client.query('SELECT status FROM requests WHERE id = $1', [demand.request_id]);
+            if (reqCheck.rows[0]?.status === 'entregue') {
+                throw new Error('Não é possível reabrir: a solicitação já recebeu baixa (entregue).');
+            }
+        }
         // Só devolve a reserva se o pedido de origem ainda estiver vivo (mesmo
         // critério do crédito) para não roubar reserva de outros pedidos.
-        if (demand.product_id) {
+        if (demand.product_id && Number(demand.quantity) > 0) {
             let requestAlive = false;
             if (demand.request_id) {
                 const reqCheck = await client.query('SELECT status FROM requests WHERE id = $1', [demand.request_id]);
@@ -152,16 +227,23 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
             await client.query(
                 `INSERT INTO audit_logs (user_id, action, details)
                  VALUES ($1, $2, $3)`,
-                [(req as any).user.id, 'SAIDA_ESTOQUE_3D', JSON.stringify({ produto: demandSku || demand.product_id, quantidade: demand.quantity, motivo: 'Demanda 3D reaberta (crédito revertido)' })]
+                [userId, 'SAIDA_ESTOQUE_3D', JSON.stringify({ produto: demandSku || demand.product_id, quantidade: demand.quantity, motivo: 'Demanda 3D reaberta (crédito revertido)' })]
             );
         }
     }
 
     await client.query('COMMIT');
-    res.json({ success: true });
-  } catch (error) {
+
+    // 🔔 Avisa o front em tempo real: estoque mudou e (se houve baixa) o pedido foi entregue
+    if ((req as any).io) {
+        if (demand.product_id) (req as any).io.emit('stock_updated', { changedProducts: [demand.product_id] });
+        if (deliveredRequestId) (req as any).io.emit('request_updated', { id: deliveredRequestId, status: 'entregue' });
+    }
+
+    res.json({ success: true, delivered: !!deliveredRequestId });
+  } catch (error: any) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: 'Erro ao mover demanda no Kanban' });
+    res.status(500).json({ error: error.message || 'Erro ao mover demanda no Kanban' });
   } finally {
     client.release();
   }

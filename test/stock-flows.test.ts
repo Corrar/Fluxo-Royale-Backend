@@ -9,6 +9,9 @@ const testDb = vi.hoisted(() => {
   mem.public.registerFunction({
     name: 'gen_random_uuid',
     returns: DataType.uuid,
+    // impure: sem isto o pg-mem memoiza o retorno e gera PKs duplicadas quando
+    // a mesma transação insere várias linhas com DEFAULT gen_random_uuid().
+    impure: true,
     implementation: () => randomUUID(),
   });
   // pg-mem não suporta as subqueries correlacionadas com json_agg/json_build_object
@@ -211,6 +214,52 @@ describe('Produção 3D', () => {
     await run(updateDemandStatus, mockReq({ params: { id: demId }, body: { status: 'Concluída' } }));
     s = await getStock(pool, pid);
     expect(s.onHand).toBe(5);
+  });
+
+  it('toda solicitação 3D cria uma demanda no Quadro (mesmo sem estoque)', async () => {
+    const pid = await seedProduct(pool, { onHand: 0, is3d: true });
+    const c = await run(createRequest, mockReq({ body: { sector: '3D', op_code: undefined, items: [{ product_id: pid, quantity: 3 }] } }));
+    expect(c.statusCode).toBe(201);
+
+    const dem = await pool.query('SELECT quantity, status, request_id FROM demands_3d WHERE request_id = $1', [c.body.id]);
+    expect(dem.rows.length).toBe(1);
+    expect(Number(dem.rows[0].quantity)).toBe(3); // a produzir = 3
+    expect(dem.rows[0].status).toBe('Em análise'); // cai na Fila do operador 3D
+  });
+
+  it('concluir a demanda produz E dá baixa na solicitação (pedido 100% 3D)', async () => {
+    const pid = await seedProduct(pool, { onHand: 0, is3d: true });
+    const c = await run(createRequest, mockReq({ body: { sector: '3D', items: [{ product_id: pid, quantity: 3 }] } }));
+    const demId = (await pool.query('SELECT id FROM demands_3d WHERE request_id = $1', [c.body.id])).rows[0].id;
+
+    const r = await run(updateDemandStatus, mockReq({ params: { id: demId }, body: { status: 'Concluída' } }));
+    expect(r.statusCode).toBe(200);
+    expect(r.body.delivered).toBe(true);
+
+    // Produziu 3 e entregou 3 → estoque zerado, sem reserva fantasma
+    const s = await getStock(pool, pid);
+    expect(s.onHand).toBe(0);
+    expect(s.reserved).toBe(0);
+
+    // Solicitação recebeu baixa automaticamente
+    const req = await pool.query('SELECT status FROM requests WHERE id = $1', [c.body.id]);
+    expect(req.rows[0].status).toBe('entregue');
+  });
+
+  it('baixa 3D com peça já em estoque consome a prateleira sem furo', async () => {
+    const pid = await seedProduct(pool, { onHand: 5, is3d: true });
+    const c = await run(createRequest, mockReq({ body: { sector: '3D', items: [{ product_id: pid, quantity: 2 }] } }));
+    // reservou 2 da prateleira, nada a produzir (missingQty = 0)
+    let s = await getStock(pool, pid);
+    expect(s.reserved).toBe(2);
+    const demId = (await pool.query('SELECT id FROM demands_3d WHERE request_id = $1', [c.body.id])).rows[0].id;
+
+    await run(updateDemandStatus, mockReq({ params: { id: demId }, body: { status: 'Concluída' } }));
+    s = await getStock(pool, pid);
+    expect(s.onHand).toBe(3);    // 5 - 2 entregues
+    expect(s.reserved).toBe(0);  // reserva liberada
+    const req = await pool.query('SELECT status FROM requests WHERE id = $1', [c.body.id]);
+    expect(req.rows[0].status).toBe('entregue');
   });
 });
 
