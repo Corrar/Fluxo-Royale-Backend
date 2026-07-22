@@ -40,7 +40,7 @@ import { applySchema, seedProduct, getStock } from './setup/schema';
 import { createRequest, updateRequestStatus, deleteRequest } from '../src/controllers/requests.controller';
 import { manualWithdrawal, registerReturn } from '../src/controllers/stock.controller';
 import { createSeparation, authorizeSeparation } from '../src/controllers/separations.controller';
-import { createProduction, updateDemandStatus } from '../src/controllers/producao3d.controller';
+import { createProduction, updateDemandStatus, getProductions } from '../src/controllers/producao3d.controller';
 import { createReplenishment, authorizeReplenishment } from '../src/controllers/replenishments.controller';
 import { createTravelOrder, reconcileTravelOrder } from '../src/controllers/travels.controller';
 
@@ -246,13 +246,25 @@ describe('Produção 3D', () => {
     expect(req.rows[0].status).toBe('entregue');
   });
 
-  it('registrar produção no Quadro aparece no histórico (productions_3d)', async () => {
+  it('finalizar no Quadro registra a produção no dia, com tempo/filamento/operador', async () => {
+    // Peça com tempo e filamento definidos no catálogo
     const pid = await seedProduct(pool, { onHand: 0, is3d: true });
+    await pool.query('UPDATE products SET production_minutes = 30, filament_grams = 20 WHERE id = $1', [pid]);
     const dem = await pool.query(`INSERT INTO demands_3d (product_id, quantity, status) VALUES ($1, 4, 'Em desenvolvimento') RETURNING id`, [pid]);
+
+    const before = Date.now();
     await run(updateDemandStatus, mockReq({ params: { id: dem.rows[0].id }, body: { status: 'Concluída' } }));
-    const prod = await pool.query('SELECT quantity, demand_id FROM productions_3d WHERE demand_id = $1', [dem.rows[0].id]);
-    expect(prod.rows.length).toBe(1);
-    expect(Number(prod.rows[0].quantity)).toBe(4);
+
+    // Aparece via a MESMA rota que a página Histórico de Produção consome
+    const hist = await run(getProductions, mockReq({}));
+    const rec = hist.body.find((p: any) => String(p.demandId) === String(dem.rows[0].id));
+    expect(rec).toBeTruthy();
+    expect(Number(rec.quantity)).toBe(4);
+    expect(Number(rec.totalMinutes)).toBe(120);   // 30 min * 4
+    expect(Number(rec.filamentGrams)).toBe(80);   // 20 g * 4
+    expect(rec.operator).toBe('Almox');           // nome do operador (join profiles)
+    // Data = momento da finalização (agrupada no dia de hoje no Histórico)
+    expect(new Date(rec.date).getTime()).toBeGreaterThanOrEqual(before - 1000);
   });
 
   it('não credita em dobro: produção manual + finalizar no Quadro', async () => {
