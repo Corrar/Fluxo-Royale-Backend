@@ -117,21 +117,41 @@ export const updateDemandStatus = async (req: Request, res: Response) => {
 
         // 1️⃣ ENTRADA FÍSICA do que foi produzido (demand.quantity = a produzir).
         //    Quando não há nada a produzir (demand.quantity = 0) isto é um no-op.
+        //    IDEMPOTÊNCIA: se já existe uma produção registada para esta demanda
+        //    (operador usou a página "Registrar Produção"), o estoque já foi
+        //    creditado lá — não credita de novo (evita conflito de estoque em
+        //    dobro entre o Quadro de Demandas e a página de Produção).
         if (demand.product_id && Number(demand.quantity) > 0) {
-            await client.query(
-                `INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (product_id)
-                 DO UPDATE SET quantity_on_hand = COALESCE(stock.quantity_on_hand, 0) + $2,
-                               quantity_reserved = COALESCE(stock.quantity_reserved, 0) + $3`,
-                [demand.product_id, demand.quantity, requestAlive ? demand.quantity : 0]
-            );
+            const existingProd = await client.query('SELECT 1 FROM productions_3d WHERE demand_id = $1 LIMIT 1', [id]);
 
-            await client.query(
-                `INSERT INTO audit_logs (user_id, action, details)
-                 VALUES ($1, $2, $3)`,
-                [userId, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ produto: demandSku || demand.product_id, quantidade: demand.quantity, motivo: 'Produção 3D Concluída' })]
-            );
+            if (existingProd.rows.length === 0) {
+                await client.query(
+                    `INSERT INTO stock (product_id, quantity_on_hand, quantity_reserved)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (product_id)
+                     DO UPDATE SET quantity_on_hand = COALESCE(stock.quantity_on_hand, 0) + $2,
+                                   quantity_reserved = COALESCE(stock.quantity_reserved, 0) + $3`,
+                    [demand.product_id, demand.quantity, requestAlive ? demand.quantity : 0]
+                );
+
+                // Registra a produção para aparecer no Histórico de Produção e nas
+                // métricas do Dashboard 3D — antes, finalizar pelo Quadro creditava
+                // estoque mas NÃO registava a produção (ficava invisível no painel).
+                const partInfo = await client.query('SELECT production_minutes, filament_grams FROM products WHERE id = $1', [demand.product_id]);
+                const totalMinutes = Number(partInfo.rows[0]?.production_minutes || 0) * Number(demand.quantity);
+                const filamentGrams = Number(partInfo.rows[0]?.filament_grams || 0) * Number(demand.quantity);
+                await client.query(
+                    `INSERT INTO productions_3d (product_id, demand_id, quantity, operator_id, total_minutes, filament_grams, date)
+                     VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+                    [demand.product_id, id, demand.quantity, userId, totalMinutes, filamentGrams]
+                );
+
+                await client.query(
+                    `INSERT INTO audit_logs (user_id, action, details)
+                     VALUES ($1, $2, $3)`,
+                    [userId, 'ENTRADA_ESTOQUE_3D', JSON.stringify({ produto: demandSku || demand.product_id, quantidade: demand.quantity, motivo: 'Produção 3D Concluída' })]
+                );
+            }
         }
 
         // 2️⃣ BAIXA AUTOMÁTICA NA SOLICITAÇÃO: quando o operador 3D conclui a
@@ -283,6 +303,17 @@ export const createProduction = async (req: Request, res: Response) => {
     }
 
     await client.query('BEGIN'); // Inicia a transação
+
+    // 🛡️ Anti-conflito de estoque: se esta produção está vinculada a uma demanda
+    // que JÁ foi finalizada no Quadro (Concluída), o estoque já foi creditado por
+    // aquela finalização — registar de novo aqui creditaria em dobro. Bloqueia.
+    if (demandId) {
+      const demChk = await client.query('SELECT status FROM demands_3d WHERE id = $1', [demandId]);
+      if (demChk.rows[0]?.status === 'Concluída') {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Esta demanda já foi finalizada no Quadro de Demandas — a produção e a entrada de estoque já foram registadas.' });
+      }
+    }
 
     await setStockAudit(client, 'PRODUCAO_3D_ENTRADA', operatorId, demandId ? `demanda_3d:${demandId}` : 'producao_3d:livre');
 

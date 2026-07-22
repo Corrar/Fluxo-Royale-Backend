@@ -246,6 +246,37 @@ describe('Produção 3D', () => {
     expect(req.rows[0].status).toBe('entregue');
   });
 
+  it('registrar produção no Quadro aparece no histórico (productions_3d)', async () => {
+    const pid = await seedProduct(pool, { onHand: 0, is3d: true });
+    const dem = await pool.query(`INSERT INTO demands_3d (product_id, quantity, status) VALUES ($1, 4, 'Em desenvolvimento') RETURNING id`, [pid]);
+    await run(updateDemandStatus, mockReq({ params: { id: dem.rows[0].id }, body: { status: 'Concluída' } }));
+    const prod = await pool.query('SELECT quantity, demand_id FROM productions_3d WHERE demand_id = $1', [dem.rows[0].id]);
+    expect(prod.rows.length).toBe(1);
+    expect(Number(prod.rows[0].quantity)).toBe(4);
+  });
+
+  it('não credita em dobro: produção manual + finalizar no Quadro', async () => {
+    const pid = await seedProduct(pool, { onHand: 0, is3d: true });
+    const dem = await pool.query(`INSERT INTO demands_3d (product_id, quantity, status) VALUES ($1, 5, 'Em desenvolvimento') RETURNING id`, [pid]);
+    const demId = dem.rows[0].id;
+
+    // Operador registra a produção pela página de Produção (credita +5)
+    await run(createProduction, mockReq({ body: { partId: pid, demandId: demId, quantity: 5, totalMinutes: 50, filamentGrams: 80, date: '2026-01-01T00:00:00Z' } }));
+    let s = await getStock(pool, pid);
+    expect(s.onHand).toBe(5);
+
+    // Depois finaliza no Quadro: NÃO credita de novo (produção já existe)
+    await run(updateDemandStatus, mockReq({ params: { id: demId }, body: { status: 'Concluída' } }));
+    s = await getStock(pool, pid);
+    expect(s.onHand).toBe(5); // continua 5, não 10
+
+    // E bloqueia registrar produção de novo p/ uma demanda já concluída
+    const blocked = await run(createProduction, mockReq({ body: { partId: pid, demandId: demId, quantity: 5, totalMinutes: 50, filamentGrams: 80, date: '2026-01-01T00:00:00Z' } }));
+    expect(blocked.statusCode).toBe(409);
+    s = await getStock(pool, pid);
+    expect(s.onHand).toBe(5);
+  });
+
   it('baixa 3D com peça já em estoque consome a prateleira sem furo', async () => {
     const pid = await seedProduct(pool, { onHand: 5, is3d: true });
     const c = await run(createRequest, mockReq({ body: { sector: '3D', items: [{ product_id: pid, quantity: 2 }] } }));
