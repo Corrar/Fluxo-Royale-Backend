@@ -9,6 +9,7 @@ import { initSocket } from './config/socket';
 import { startExpireRequestsJob } from './jobs/expireRequests.job';
 import { ensureStockLedger } from './db/stockLedger';
 import { ensureIndexes } from './db/ensureIndexes';
+import { ensure3DCostTables } from './db/ensure3DCost';
 
 // --- Rotas (Routers) ---
 import authRouter from './routes/auth.routes';
@@ -120,6 +121,9 @@ ensureStockLedger();
 
 // Garante os índices de performance (idempotente)
 ensureIndexes();
+
+// Garante as tabelas de custos/precificação da Fábrica 3D (idempotente)
+ensure3DCostTables();
 
 // ==========================================
 // 4. REGISTRO DE ROTAS (API ENDPOINTS)

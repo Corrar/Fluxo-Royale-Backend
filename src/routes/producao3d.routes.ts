@@ -1,14 +1,20 @@
 // src/routes/producao3d.routes.ts
 import { Router } from 'express';
-import { 
-  get3DParts, 
-  update3DPartDetails, 
-  getDemands, 
-  updateDemandStatus, 
+import {
+  get3DParts,
+  update3DPartDetails,
+  getDemands,
+  updateDemandStatus,
   getProductions,
   createProduction, // <-- ADICIONADO: Importação da função de criar
   deleteProduction  // <-- ADICIONADO: Importação da função de apagar
 } from '../controllers/producao3d.controller';
+import {
+  getFilaments, createFilament, updateFilament, deleteFilament,
+  getPrinters, createPrinter, updatePrinter, deletePrinter,
+  getConfig3D, updateConfig3D,
+  getPartsCosting, updatePartCosting, getFinancialReport,
+} from '../controllers/producao3dCosts.controller';
 import { authenticate, requirePermission } from '../middlewares/auth';
 
 const router = Router();
@@ -59,5 +65,31 @@ router.post('/productions', canAdd3D, createProduction);
 
 // 🗑️ REMOVE um registro de produção e reverte a quantidade no estoque
 router.delete('/productions/:id', canDelete3D, deleteProduction);
+
+// ==========================================
+// 🧮 CUSTOS E PRECIFICAÇÃO (Fábrica 3D)
+// ==========================================
+// Leitura liberada a todos do módulo 3D; escrita exige a permissão granular.
+
+// Filamentos
+router.get('/filaments', getFilaments);
+router.post('/filaments', canAdd3D, createFilament);
+router.put('/filaments/:id', canEdit3D, updateFilament);
+router.delete('/filaments/:id', canDelete3D, deleteFilament);
+
+// Impressoras
+router.get('/printers', getPrinters);
+router.post('/printers', canAdd3D, createPrinter);
+router.put('/printers/:id', canEdit3D, updatePrinter);
+router.delete('/printers/:id', canDelete3D, deletePrinter);
+
+// Configuração global de custos
+router.get('/config', getConfig3D);
+router.put('/config', canEdit3D, updateConfig3D);
+
+// Precificação das peças + dashboard financeiro
+router.get('/costing', getPartsCosting);
+router.put('/costing/:id', canEdit3D, updatePartCosting);
+router.get('/financial-report', getFinancialReport);
 
 export default router;

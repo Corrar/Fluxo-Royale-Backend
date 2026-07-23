@@ -43,6 +43,7 @@ import { createSeparation, authorizeSeparation } from '../src/controllers/separa
 import { createProduction, updateDemandStatus, getProductions } from '../src/controllers/producao3d.controller';
 import { createReplenishment, authorizeReplenishment } from '../src/controllers/replenishments.controller';
 import { createTravelOrder, reconcileTravelOrder } from '../src/controllers/travels.controller';
+import { computeCost } from '../src/controllers/producao3dCosts.controller';
 
 const pool = testDb.pool;
 
@@ -388,5 +389,36 @@ describe('Devolução de OP', () => {
     const ok = await run(registerReturn, mockReq({ body: { op_code: 'OP-1', returns: [{ product_id: pid, quantity: 2, observation: 'x' }] } }));
     expect(ok.statusCode).toBe(201);
     expect((await getStock(pool, pid)).onHand).toBe(physBefore + 2);
+  });
+});
+
+// =========================================================================
+// CUSTOS 3D — fórmula de custo/preço/lucro (protótipo royale_fabrica3d)
+// =========================================================================
+describe('Custos e precificação 3D', () => {
+  const config = { energia_kwh: 0.92, imposto_perc: 6, margem_perc: 45, mao_obra_hora: 28, perda_perc: 5 };
+  const filament = { preco_kg: 114 };
+  const printer = { valor: 22000, vida_horas: 15000, potencia_w: 350, manutencao_ano: 1800, horas_ano: 4000 };
+
+  it('calcula custo, preço de venda e margem corretamente', () => {
+    const piece = { filament_grams: 42, production_minutes: 90, finishing_minutes: 5 };
+    const c = computeCost(piece, filament, printer, config);
+    expect(c.custoTotal).toBeCloseTo(10.7187, 2);
+    expect(c.precoVenda).toBeCloseTo(21.8749, 2);
+    expect(c.lucro).toBeCloseTo(9.8437, 2);
+    expect(c.margemReal).toBeCloseTo(45, 1); // margem configurada se realiza
+  });
+
+  it('sem impressora/filamento não quebra (custos zeram)', () => {
+    const c = computeCost({ filament_grams: 10, production_minutes: 30, finishing_minutes: 0 }, null, null, config);
+    expect(c.custoFilamento).toBe(0);
+    expect(c.custoEnergia).toBe(0);
+    expect(c.custoTotal).toBe(0);
+  });
+
+  it('aplica a perda percentual sobre o filamento', () => {
+    const semPerda = computeCost({ filament_grams: 100, production_minutes: 0, finishing_minutes: 0 }, filament, null, { ...config, perda_perc: 0 });
+    const comPerda = computeCost({ filament_grams: 100, production_minutes: 0, finishing_minutes: 0 }, filament, null, { ...config, perda_perc: 10 });
+    expect(comPerda.custoFilamento).toBeCloseTo(semPerda.custoFilamento * 1.1, 4);
   });
 });
