@@ -12,9 +12,18 @@ export const getRequests = async (req: Request, res: Response) => {
   try {
     const query = `
       WITH FilteredRequests AS (
-          SELECT * FROM requests 
-          WHERE status IN ('aberto', 'aprovado') 
-             OR date_trunc('month', created_at) = date_trunc('month', NOW())
+          SELECT * FROM requests
+          WHERE (status IN ('aberto', 'aprovado')
+                 OR date_trunc('month', created_at) = date_trunc('month', NOW()))
+            -- Solicitações 100% 3D não aparecem no painel do almoxarife: quem
+            -- as resolve é o operador 3D pelo Quadro de Demandas (produz + baixa).
+            -- Mantém apenas pedidos com ao menos um item NÃO-3D (ou item avulso).
+            AND EXISTS (
+              SELECT 1 FROM request_items ri2
+              LEFT JOIN products p2 ON ri2.product_id = p2.id
+              WHERE ri2.request_id = requests.id
+                AND (ri2.product_id IS NULL OR COALESCE(p2.is_3d, false) = false)
+            )
           ORDER BY created_at DESC LIMIT 1000
       )
       SELECT r.*, 
@@ -170,12 +179,17 @@ export const createRequest = async (req: Request, res: Response) => {
     // =========================================================================
     // 🌉 4. A PONTE MÁGICA: RESERVA NORMAL OU ENVIO PARA O KANBAN 3D
     // =========================================================================
+    // Pedidos 100% 3D não vão para o painel do almoxarife (o operador 3D resolve
+    // pelo Quadro). Marcamos se há algum item não-3D/avulso para decidir a notificação.
+    let anyNon3D = false;
     for (const item of sortedItems) {
       const isCustom = item.product_id === 'custom' || !item.product_id;
       const productId = isCustom ? null : item.product_id;
       const customName = isCustom ? item.custom_name : null;
       const priority = item.priority || 'Média'; // Lê a prioridade do frontend
       let is3D = false;
+
+      if (isCustom) anyNon3D = true; // item avulso é tarefa do almoxarife
 
       if (productId) {
         // 🔒 Trava a linha do STOCK (e não a de products): todas as rotas que
@@ -190,6 +204,7 @@ export const createRequest = async (req: Request, res: Response) => {
 
         const available = parseFloat(stockLock.rows[0]?.available || 0);
         is3D = productCheck.rows[0]?.is_3d || false;
+        if (!is3D) anyNon3D = true; // item de estoque comum → painel do almoxarife
 
         // LÓGICA INTELIGENTE: ESTOQUE + FÁBRICA 3D
         if (is3D) {
@@ -254,16 +269,20 @@ export const createRequest = async (req: Request, res: Response) => {
     const { rows: fullReqRows } = await client.query(fullReqQuery, [requestId]);
     
     if ((req as any).io) {
-        const notificationData = { id: `req-${requestId}-${Date.now()}`, message: `📢 Nova solicitação do setor: ${sector}`, action: 'Ver Pedidos', type: 'solicitacao' };
-        (req as any).io.to(['almoxarife', 'admin', 'escritorio']).emit('new_request_notification', notificationData);
-        
-        // 🟢 Otimização: O front-end já captura 'new_request' e adiciona no topo da lista. (Correto)
-        (req as any).io.to(['almoxarife', 'admin', 'escritorio']).emit('new_request', fullReqRows[0]);
-        
+        // Pedido 100% 3D NÃO vai para o painel do almoxarife — não notifica nem
+        // injeta na lista de Requests. O Quadro de Demandas atualiza via stock_updated.
+        if (anyNon3D) {
+            const notificationData = { id: `req-${requestId}-${Date.now()}`, message: `📢 Nova solicitação do setor: ${sector}`, action: 'Ver Pedidos', type: 'solicitacao' };
+            (req as any).io.to(['almoxarife', 'admin', 'escritorio']).emit('new_request_notification', notificationData);
+
+            // 🟢 Otimização: O front-end já captura 'new_request' e adiciona no topo da lista. (Correto)
+            (req as any).io.to(['almoxarife', 'admin', 'escritorio']).emit('new_request', fullReqRows[0]);
+        }
+
         // 🟢 Otimização: Em vez de 'refresh_stock', enviamos os produtos específicos alterados.
         const changedProducts = sortedItems.map(item => item.product_id).filter(id => id && id !== 'custom');
         if (changedProducts.length > 0) {
-            (req as any).io.emit('stock_updated', { changedProducts }); 
+            (req as any).io.emit('stock_updated', { changedProducts });
         }
     }
 
@@ -286,7 +305,10 @@ export const createRequest = async (req: Request, res: Response) => {
     const avisoOp = op_code ? `\nOP: ${op_code}` : `\nOP: Isento (EPI/Ferramenta/Insumo)`;
     const mensagemPersonalizada = `Setor: ${sector}${avisoOp}\nData/Hora: ${dataFormatada} - ${horaFormatada}\nMateriais:${listaMateriais}`;
 
-    sendPushNotificationToRole('almoxarife', `Novo Pedido de ${nomeSolicitante}`, mensagemPersonalizada, '/requests');
+    // Push ao almoxarife só quando há item que ele precisa entregar (não-3D)
+    if (anyNon3D) {
+      sendPushNotificationToRole('almoxarife', `Novo Pedido de ${nomeSolicitante}`, mensagemPersonalizada, '/requests');
+    }
 
     res.status(201).json({ success: true, id: requestId });
   } catch (error: any) {
