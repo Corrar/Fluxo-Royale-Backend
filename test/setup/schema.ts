@@ -34,12 +34,34 @@ export const applySchema = async (pool: any) => {
       is_3d BOOLEAN DEFAULT false,
       production_minutes NUMERIC DEFAULT 0,
       filament_grams NUMERIC DEFAULT 0,
+      finishing_minutes NUMERIC DEFAULT 0,
+      filament_id UUID,
+      printer_id UUID,
       image_url TEXT,
       active BOOLEAN DEFAULT true,
       purchase_status TEXT,
       purchase_note TEXT,
       delivery_forecast TIMESTAMPTZ,
       created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE filaments_3d (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      nome TEXT, marca TEXT, preco_kg NUMERIC DEFAULT 0, densidade NUMERIC, cor TEXT,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE printers_3d (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      nome TEXT, valor NUMERIC DEFAULT 0, vida_horas NUMERIC DEFAULT 15000,
+      potencia_w NUMERIC DEFAULT 350, manutencao_ano NUMERIC DEFAULT 0, horas_ano NUMERIC DEFAULT 4000,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE config_3d (
+      id INT PRIMARY KEY DEFAULT 1,
+      energia_kwh NUMERIC DEFAULT 0.92, imposto_perc NUMERIC DEFAULT 6, margem_perc NUMERIC DEFAULT 45,
+      mao_obra_hora NUMERIC DEFAULT 28, perda_perc NUMERIC DEFAULT 5
     );
 
     CREATE TABLE stock (

@@ -177,7 +177,11 @@ const loadCostContext = async () => {
   const config = cfgRes.rows[0] || { energia_kwh: 0, imposto_perc: 0, margem_perc: 0, mao_obra_hora: 0, perda_perc: 0 };
   const filaments = new Map(filRes.rows.map((f: any) => [String(f.id), f]));
   const printers = new Map(prtRes.rows.map((p: any) => [String(p.id), p]));
-  return { config, filaments, printers };
+  // Padrão = primeiro cadastrado. Peças sem vínculo usam este padrão para já
+  // terem um custo real (com o peso/tempo que a peça já tem), como no protótipo.
+  const defaultFilament = filRes.rows[0] || null;
+  const defaultPrinter = prtRes.rows[0] || null;
+  return { config, filaments, printers, defaultFilament, defaultPrinter };
 };
 
 // -----------------------------------------------------------------------------
@@ -185,20 +189,24 @@ const loadCostContext = async () => {
 // -----------------------------------------------------------------------------
 export const getPartsCosting = async (_req: Request, res: Response) => {
   try {
-    const { config, filaments, printers } = await loadCostContext();
+    const { config, filaments, printers, defaultFilament, defaultPrinter } = await loadCostContext();
     const { rows } = await pool.query(`
       SELECT id, sku, name, image_url, production_minutes, filament_grams,
              finishing_minutes, filament_id, printer_id, unit_price
       FROM products WHERE is_3d = true ORDER BY name ASC
     `);
     const out = rows.map((p: any) => {
-      const fil = p.filament_id ? filaments.get(String(p.filament_id)) : null;
-      const prt = p.printer_id ? printers.get(String(p.printer_id)) : null;
+      const filVinc = p.filament_id ? filaments.get(String(p.filament_id)) : null;
+      const prtVinc = p.printer_id ? printers.get(String(p.printer_id)) : null;
+      const fil = filVinc || defaultFilament; // fallback para o padrão
+      const prt = prtVinc || defaultPrinter;
       const c = computeCost(p, fil, prt, config);
       return {
         ...p,
         filament_nome: fil?.nome || null,
         printer_nome: prt?.nome || null,
+        usando_filamento_padrao: !filVinc && !!fil,
+        usando_impressora_padrao: !prtVinc && !!prt,
         custo: c.custoTotal,
         preco_venda: c.precoVenda,
         lucro: c.lucro,
@@ -243,7 +251,7 @@ export const updatePartCosting = async (req: Request, res: Response) => {
 export const getFinancialReport = async (req: Request, res: Response) => {
   try {
     const { from, to } = req.query as { from?: string; to?: string };
-    const { config, filaments, printers } = await loadCostContext();
+    const { config, filaments, printers, defaultFilament, defaultPrinter } = await loadCostContext();
 
     // Produções + dados de custo da peça (uma linha por produção registrada)
     const params: any[] = [];
@@ -266,8 +274,8 @@ export const getFinancialReport = async (req: Request, res: Response) => {
     const porPeca: Record<string, { name: string; sku: string; q: number; lucro: number; receita: number; custo: number }> = {};
 
     for (const r of rows) {
-      const fil = r.filament_id ? filaments.get(String(r.filament_id)) : null;
-      const prt = r.printer_id ? printers.get(String(r.printer_id)) : null;
+      const fil = (r.filament_id ? filaments.get(String(r.filament_id)) : null) || defaultFilament;
+      const prt = (r.printer_id ? printers.get(String(r.printer_id)) : null) || defaultPrinter;
       const c = computeCost(r, fil, prt, config);
       const q = n(r.quantity);
 

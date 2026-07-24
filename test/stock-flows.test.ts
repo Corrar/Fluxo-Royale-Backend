@@ -43,7 +43,7 @@ import { createSeparation, authorizeSeparation } from '../src/controllers/separa
 import { createProduction, updateDemandStatus, getProductions } from '../src/controllers/producao3d.controller';
 import { createReplenishment, authorizeReplenishment } from '../src/controllers/replenishments.controller';
 import { createTravelOrder, reconcileTravelOrder } from '../src/controllers/travels.controller';
-import { computeCost } from '../src/controllers/producao3dCosts.controller';
+import { computeCost, getFinancialReport, getPartsCosting } from '../src/controllers/producao3dCosts.controller';
 
 const pool = testDb.pool;
 
@@ -420,5 +420,45 @@ describe('Custos e precificação 3D', () => {
     const semPerda = computeCost({ filament_grams: 100, production_minutes: 0, finishing_minutes: 0 }, filament, null, { ...config, perda_perc: 0 });
     const comPerda = computeCost({ filament_grams: 100, production_minutes: 0, finishing_minutes: 0 }, filament, null, { ...config, perda_perc: 10 });
     expect(comPerda.custoFilamento).toBeCloseTo(semPerda.custoFilamento * 1.1, 4);
+  });
+});
+
+// =========================================================================
+// CUSTOS 3D — precificação e relatório financeiro com dados reais (fallback)
+// =========================================================================
+describe('Precificação e financeiro 3D (integração)', () => {
+  const seedCostBase = async () => {
+    await pool.query(`INSERT INTO config_3d (id, energia_kwh, imposto_perc, margem_perc, mao_obra_hora, perda_perc) VALUES (1, 0.92, 6, 45, 28, 5)`);
+    await pool.query(`INSERT INTO filaments_3d (nome, preco_kg) VALUES ('PETG', 114)`);
+    await pool.query(`INSERT INTO printers_3d (nome, valor, vida_horas, potencia_w, manutencao_ano, horas_ano) VALUES ('H2S', 22000, 15000, 350, 1800, 4000)`);
+  };
+
+  it('peça SEM vínculo usa filamento/impressora padrão e tem custo real', async () => {
+    await seedCostBase();
+    const pid = await seedProduct(pool, { onHand: 0, is3d: true, name: 'Talisca' });
+    await pool.query('UPDATE products SET filament_grams = 42, production_minutes = 90 WHERE id = $1', [pid]);
+
+    const res = await run(getPartsCosting, mockReq({}));
+    const peca = res.body.find((p: any) => p.id === pid);
+    expect(peca.usando_filamento_padrao).toBe(true);
+    expect(peca.usando_impressora_padrao).toBe(true);
+    expect(Number(peca.custo)).toBeCloseTo(8.3854, 2);
+    expect(Number(peca.preco_venda)).toBeCloseTo(17.113, 2);
+    expect(Number(peca.margem_real)).toBeCloseTo(45, 1);
+  });
+
+  it('relatório financeiro soma custo/faturamento/lucro reais das produções', async () => {
+    await seedCostBase();
+    const pid = await seedProduct(pool, { onHand: 0, is3d: true, name: 'Talisca' });
+    await pool.query('UPDATE products SET filament_grams = 42, production_minutes = 90 WHERE id = $1', [pid]);
+    await run(createProduction, mockReq({ body: { partId: pid, quantity: 10, totalMinutes: 900, filamentGrams: 420, date: '2026-02-01T12:00:00Z' } }));
+
+    const res = await run(getFinancialReport, mockReq({ query: {} }));
+    const t = res.body.totais;
+    expect(t.unidades).toBe(10);
+    expect(t.faturamento).toBeCloseTo(171.13, 1);
+    expect(t.custo).toBeCloseTo(83.854, 1);
+    expect(t.margem).toBeCloseTo(45, 1);
+    expect(res.body.ranking[0].name).toBe('Talisca');
   });
 });
