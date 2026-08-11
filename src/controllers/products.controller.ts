@@ -107,6 +107,10 @@ export const createProduct = async (req: Request, res: Response) => {
 
   try {
     await client.query('BEGIN');
+
+    // 🛑 [NOVO] Identifica o cargo do usuário para a validação da tag
+    const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+    const userRole = userCheck.rows[0]?.role;
     
     // 🔎 Busca Inteligente: Trazemos o nome para mostrar no erro
     const skuCheck = await client.query('SELECT id, active, name FROM products WHERE sku = $1', [sku]);
@@ -123,6 +127,12 @@ export const createProduct = async (req: Request, res: Response) => {
     // 🚀 Usa o Sanitizador na entrada de dados
     const { is3D: detected3D, parsed: parsedTags } = sanitizeTags(tags);
     const finalIs3D = is_3d || detected3D;
+
+    // 🛑 [NOVO] Verifica se a tag MIN-TAI está sendo criada por um não-almoxarife
+    const hasMinTai = parsedTags.some(t => t.toLowerCase() === 'min-tai');
+    if (hasMinTai && userRole !== 'almoxarife') {
+        throw new Error("Acesso negado. Apenas o setor do Almoxarifado pode criar produtos com a tag MIN-TAI.");
+    }
 
     const productRes = await client.query(
       `INSERT INTO products (sku, name, description, unit, min_stock, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url) 
@@ -153,12 +163,15 @@ export const updateProduct = async (req: Request, res: Response) => {
   const userId = (req as any).user.id;
   const { id } = req.params;
   
-  // 🟢 REMOVIDO o campo 'quantity'
   let { sku, name, description, unit, min_stock, unit_price, sales_price, tags, is_3d, production_minutes, filament_grams, image_url } = req.body;
   const client = await pool.connect();
   
   try {
     await client.query('BEGIN');
+
+    // 🛑 [NOVO] Identifica o cargo do usuário 
+    const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+    const userRole = userCheck.rows[0]?.role;
 
     // 🛡️ PROTEÇÃO 1: Limpeza do SKU
     if (typeof sku === 'string') sku = sku.trim();
@@ -171,6 +184,17 @@ export const updateProduct = async (req: Request, res: Response) => {
       }
     }
 
+    // 🛑 [NOVO] Snapshot ANTES da edição movido para cima (Necessário para validar se o item já era MIN-TAI)
+    const oldRes = await client.query('SELECT * FROM products WHERE id = $1', [id]);
+    if (oldRes.rows.length === 0) {
+      throw new Error("Produto não encontrado");
+    }
+    const oldRow = oldRes.rows[0] || {};
+
+    // 🛑 [NOVO] Verifica se o produto já tinha a tag MIN-TAI antes da edição
+    const { parsed: oldParsedTags } = sanitizeTags(oldRow.tags);
+    const oldHasMinTai = oldParsedTags.some(t => t.toLowerCase() === 'min-tai');
+
     let finalIs3D = is_3d;
     let finalTagsForDB = tags ? (typeof tags === 'string' ? tags : JSON.stringify(tags)) : null;
 
@@ -179,10 +203,16 @@ export const updateProduct = async (req: Request, res: Response) => {
       finalIs3D = is_3d !== undefined ? is_3d : detected3D;
       if (detected3D) finalIs3D = true; 
       finalTagsForDB = JSON.stringify(parsedTags);
-    }
 
-    // Snapshot ANTES da edição para a auditoria registar o antes/depois real
-    const oldRes = await client.query('SELECT * FROM products WHERE id = $1', [id]);
+      // 🛑 [NOVO] Verifica se as novas tags contêm MIN-TAI e realiza o bloqueio
+      const newHasMinTai = parsedTags.some(t => t.toLowerCase() === 'min-tai');
+      if ((oldHasMinTai || newHasMinTai) && userRole !== 'almoxarife') {
+          throw new Error("Acesso negado. Apenas o setor do Almoxarifado pode gerenciar a tag MIN-TAI.");
+      }
+    } else if (oldHasMinTai && userRole !== 'almoxarife') {
+      // 🛑 [NOVO] Bloqueia a edição inteira do produto se ele for MIN-TAI e o usuário não for almoxarife
+      throw new Error("Acesso negado. Apenas o setor do Almoxarifado pode editar produtos da categoria MIN-TAI.");
+    }
 
     // 🛡️ PROTEÇÃO 3: Usar "param !== undefined ? param : null" impede que os números zero (0) sejam ignorados!
     const { rows } = await client.query(
@@ -210,12 +240,7 @@ export const updateProduct = async (req: Request, res: Response) => {
       ]
     );
     
-    if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Produto não encontrado' }); }
-    
-    // 🟢 REMOVIDA a query que alterava o estoque diretamente aqui. Edição não mexe no stock!
-
     // Auditoria com antes/depois: só regista os campos que realmente mudaram
-    const oldRow = oldRes.rows[0] || {};
     const newRow = rows[0];
     const auditFields = ['sku', 'name', 'description', 'unit', 'min_stock', 'unit_price', 'sales_price', 'tags', 'is_3d', 'production_minutes', 'filament_grams'];
     const changes: any = { produto: { new: newRow.sku || newRow.name } };
@@ -292,15 +317,25 @@ export const updateProductPrices = async (req: Request, res: Response) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const oldRes = await client.query('SELECT name, sku, unit_price, sales_price FROM products WHERE id = $1', [id]);
-    // Aqui usamos o mesmo princípio, o valor deve poder ser 0
+    
+    // 🛑 [NOVO] Garante que apenas almoxarife altera preços de itens MIN-TAI
+    const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+    const userRole = userCheck.rows[0]?.role;
+
+    const oldRes = await client.query('SELECT name, sku, unit_price, sales_price, tags FROM products WHERE id = $1', [id]);
+    if (oldRes.rows.length === 0) { throw new Error('Produto não encontrado'); }
+    
+    const oldRow = oldRes.rows[0] || {};
+    const { parsed: oldParsedTags } = sanitizeTags(oldRow.tags);
+    if (oldParsedTags.some(t => t.toLowerCase() === 'min-tai') && userRole !== 'almoxarife') {
+       throw new Error("Acesso negado. Apenas o Almoxarifado pode alterar os dados de itens MIN-TAI.");
+    }
+
     const { rows } = await client.query(
       `UPDATE products SET unit_price = COALESCE($1, unit_price), sales_price = COALESCE($2, sales_price) WHERE id = $3 RETURNING *`,
       [parsePriceInput(unit_price), parsePriceInput(sales_price), id]
     );
-    if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Produto não encontrado' }); }
 
-    const oldRow = oldRes.rows[0] || {};
     const priceChanges: any = { produto: { new: oldRow.sku || oldRow.name } };
     if (String(oldRow.unit_price ?? '') !== String(rows[0].unit_price ?? '')) priceChanges.preco_unitario = { old: oldRow.unit_price ?? '—', new: rows[0].unit_price };
     if (String(oldRow.sales_price ?? '') !== String(rows[0].sales_price ?? '')) priceChanges.preco_venda = { old: oldRow.sales_price ?? '—', new: rows[0].sales_price };
@@ -309,6 +344,6 @@ export const updateProductPrices = async (req: Request, res: Response) => {
     res.json(rows[0]);
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch(e) {}
-    res.status(500).json({ error: error.message });
+    res.status(400).json({ error: error.message });
   } finally { client.release(); }
 };
