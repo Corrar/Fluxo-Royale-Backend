@@ -100,11 +100,14 @@ export const createRequest = async (req: Request, res: Response) => {
     validatePositiveItems(items);
     await client.query('BEGIN');
 
+    // 🛑 [NOVO] Consulta o perfil do usuário para saber se ele é almoxarife
+    const userCheck = await client.query('SELECT role FROM profiles WHERE id = $1', [userId]);
+    const userRole = userCheck.rows[0]?.role;
+
     // =========================================================================
-    // 🛡️ 1. REGRA DE NEGÓCIO: VERIFICA SE A OP É OBRIGATÓRIA (BASEADO EM TAGS)
+    // 🛡️ 1. REGRA DE NEGÓCIO: VERIFICA SE A OP É OBRIGATÓRIA E APLICA TRAVA MIN-TAI
     // =========================================================================
     let requiresOp = false;
-    // 👇 AQUI ESTÁ A MUDANÇA: Adicionamos 'feira' na lista de exceções
     const exemptTags = ['camisetas', 'camiseta', 'epi', 'ferramentas', 'ferramenta', 'insumos', 'insumo', 'feira'];
     
     const productIds = items
@@ -134,11 +137,21 @@ export const createRequest = async (req: Request, res: Response) => {
                 }
             }
 
+            // 🛑 [NOVO] Verifica se o item possui a tag restrita
+            const hasMinTaiTag = tags.some((tag: string) => tag === 'min-tai');
+            
+            // 🛑 [NOVO] Se tiver a tag e o usuário NÃO for almoxarife, interrompemos a função com erro
+            if (hasMinTaiTag && userRole !== 'almoxarife') {
+                throw new Error("MIN_TAI_RESTRICTED");
+            }
+
             const isExempt = tags.some((tag: string) => exemptTags.includes(tag));
             
             if (!isExempt) {
                 requiresOp = true;
-                break;
+                // 🛑 [NOVO] O 'break' foi removido propositalmente daqui. 
+                // Precisamos que o 'for' passe por TODOS os itens para ter 
+                // a certeza absoluta de que nenhum deles contém a tag 'min-tai'.
             }
         }
     }
@@ -179,8 +192,6 @@ export const createRequest = async (req: Request, res: Response) => {
     // =========================================================================
     // 🌉 4. A PONTE MÁGICA: RESERVA NORMAL OU ENVIO PARA O KANBAN 3D
     // =========================================================================
-    // Pedidos 100% 3D não vão para o painel do almoxarife (o operador 3D resolve
-    // pelo Quadro). Marcamos se há algum item não-3D/avulso para decidir a notificação.
     let anyNon3D = false;
     for (const item of sortedItems) {
       const isCustom = item.product_id === 'custom' || !item.product_id;
@@ -313,6 +324,9 @@ export const createRequest = async (req: Request, res: Response) => {
     res.status(201).json({ success: true, id: requestId });
   } catch (error: any) {
     try { await client.query('ROLLBACK'); } catch(e) {}
+    
+    // 🛑 [NOVO] Captura o erro personalizado e devolve resposta 403 amigável
+    if (error.message === "MIN_TAI_RESTRICTED") return res.status(403).json({ error: "Acesso negado. Apenas o setor do Almoxarifado pode solicitar itens MIN-TAI." });
     
     if (error.message === "OP_OBRIGATORIA_TAGS") return res.status(400).json({ error: "É obrigatório informar o número da OP para estes tipos de produtos." });
     if (error.message === "OP_NAO_ENCONTRADA") return res.status(404).json({ error: "OP não encontrada no sistema. Verifique o número digitado." });
